@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use std::{env, os::unix::process::parent_id, path::PathBuf};
+use std::{collections::HashMap, env, os::unix::process::parent_id, path::PathBuf};
 
-fn str2envkey(s: &str) -> String {
+pub fn str2envkey(s: &str) -> String {
     // [a-zA-Z_][a-zA-Z0-9_]*
     let mut result = String::new();
     let mut chars = s.chars();
@@ -17,10 +17,18 @@ fn str2envkey(s: &str) -> String {
     result
 }
 
-fn get_session_script_path() -> PathBuf {
+pub fn get_session_script_path() -> PathBuf {
     env::temp_dir()
         .join(env::current_exe().unwrap().file_name().unwrap())
         .join(format!("session{}.sh", parent_id()))
+}
+
+pub fn get_app_path() -> PathBuf {
+    env::current_exe().unwrap()
+}
+
+pub fn get_app_name() -> String {
+    env::args().next().unwrap()
 }
 
 pub fn write_session_script(script: &str) -> Result<()> {
@@ -40,24 +48,26 @@ pub fn write_session_script(script: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn get_setup_script() -> String {
+pub fn get_setup_script(script: &str) -> String {
     format!(
         "\
-        if [ -z ${loaded_flag} ]; then\n\
-            export {loaded_flag}=1\n\
-            function git() {{\n\
-                source \"{session_script_path}\"\n\
-                command git $@\n\
-            }}\n\
+        if [ -z ${{{loaded_flag_key}}} ]; then\n\
+            export {loaded_flag_key}=1\n\
+            rm -f \"{session_script_path}\"\n\
             function {app_name}() {{\n\
-                command {app_path} $@\n\
+                \"{app_path}\" \"$@\"\n\
+                status=$?\n\
+                if [ $status -ne 0 ]; then\n\
+                    return $status\n\
+                fi\n\
                 source \"{session_script_path}\"\n\
             }}\n\
+            {script}\
         fi\n\
         ",
-        loaded_flag = format!("{}_LOADED", str2envkey(env!("CARGO_PKG_NAME"))),
-        app_path = env::current_exe().unwrap().to_string_lossy(),
-        app_name = env::args().next().unwrap(),
+        loaded_flag_key = "GUS_LOADED_FLAG",
+        app_path = get_app_path().to_string_lossy(),
+        app_name = get_app_name(),
         session_script_path = get_session_script_path().to_string_lossy(),
     )
 }

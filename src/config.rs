@@ -8,10 +8,14 @@ use crate::sshkey::SshKeyType;
 static DEFAULT_DATA_DIR: Lazy<PathBuf> = Lazy::new(|| dirs::home_dir().unwrap().join(".gus"));
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct Config {
     pub users_file_path: PathBuf,
     pub default_sshkey_dir: PathBuf,
     pub default_sshkey_type: SshKeyType,
+    pub force_use_gus: bool,
+    pub min_sshkey_passphrase_length: usize,
+    pub sign_commits: bool,
 }
 
 impl Default for Config {
@@ -20,6 +24,9 @@ impl Default for Config {
             users_file_path: DEFAULT_DATA_DIR.join("users.toml"),
             default_sshkey_dir: DEFAULT_DATA_DIR.join("sshkeys/"),
             default_sshkey_type: SshKeyType::Ed25519,
+            force_use_gus: true,
+            min_sshkey_passphrase_length: 10,
+            sign_commits: true,
         }
     }
 }

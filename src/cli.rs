@@ -46,8 +46,17 @@ enum Subcommands {
         id: String,
     },
 
+    /// Show the current user
+    Current,
+
     /// List all users
     List,
+
+    /// Echo a public ssh key
+    Key {
+        /// The ID of the user to get the key for
+        id: String,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -57,7 +66,7 @@ pub fn run() -> Result<()> {
 
     match cli.subcmd {
         Subcommands::Setup => {
-            println!("{}", get_setup_script())
+            println!("{}", gus.get_setup_script())
         }
         Subcommands::Add { user } => {
             ensure!(
@@ -73,9 +82,23 @@ pub fn run() -> Result<()> {
             };
 
             let sshkey_passphrase = if is_required_sshkey_passphrase {
-                print!("Enter new ssh key passphrase (10+ chars recommended): ");
+                let msg_suffix = if gus.config.min_sshkey_passphrase_length > 0 {
+                    format!(
+                        "(at least {} chars required)",
+                        gus.config.min_sshkey_passphrase_length
+                    )
+                } else {
+                    "(10+ chars recommended)".to_string()
+                };
+                print!("Enter new ssh key passphrase {}: ", msg_suffix);
                 io::stdout().flush().unwrap();
-                Some(read_password().context("failed to read ssh key passphrase")?)
+                let pass = read_password().context("failed to read ssh key passphrase")?;
+                ensure!(
+                    pass.len() >= gus.config.min_sshkey_passphrase_length,
+                    "ssh key passphrase must be at least {} characters",
+                    gus.config.min_sshkey_passphrase_length
+                );
+                Some(pass)
             } else {
                 None
             };
@@ -88,10 +111,17 @@ pub fn run() -> Result<()> {
         Subcommands::Set { id } => {
             gus.switch_user(&id)?;
         }
+        Subcommands::Current => {
+            println!("{}", gus.get_current_user().context("no current user")?);
+        }
         Subcommands::List => {
             for user in gus.list_users() {
                 println!("{}", user);
             }
+        }
+        Subcommands::Key { id } => {
+            let pubkey = gus.get_public_sshkey(&id)?;
+            print!("{}", pubkey);
         }
     }
 
