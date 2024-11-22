@@ -110,7 +110,9 @@ impl GitUserSwitcher {
             id
         );
         let user = self.users.get(id).unwrap();
-        let sshkey_path = user.get_sshkey_path(&self.config.default_sshkey_dir);
+        let sshkey_path = user
+            .get_sshkey_path(&self.config.default_sshkey_dir)
+            .with_extension("pub");
         let contents = std::fs::read_to_string(&sshkey_path)
             .with_context(|| format!("failed to read ssh key: {}", sshkey_path.display()))?;
         Ok(contents)
