@@ -28,7 +28,7 @@ impl ToString for SshKeyType {
 }
 
 pub fn generate_ssh_key(
-    key_type: SshKeyType,
+    key_type: &SshKeyType,
     rounds: usize,
     comment: &str,
     passphrase: &str,
