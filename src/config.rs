@@ -15,7 +15,6 @@ pub struct Config {
     pub default_sshkey_type: SshKeyType,
     pub force_use_gus: bool,
     pub min_sshkey_passphrase_length: usize,
-    pub sign_commits: bool,
 }
 
 impl Default for Config {
@@ -26,7 +25,6 @@ impl Default for Config {
             default_sshkey_type: SshKeyType::Ed25519,
             force_use_gus: true,
             min_sshkey_passphrase_length: 10,
-            sign_commits: true,
         }
     }
 }

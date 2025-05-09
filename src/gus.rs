@@ -83,7 +83,7 @@ impl GitUserSwitcher {
             email = user.email,
             sshkey_path = user
                 .get_sshkey_path(&self.config.default_sshkey_dir)
-                .to_string_lossy()
+                .to_string_lossy(),
         );
 
         write_session_script(&script)?;
