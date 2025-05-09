@@ -53,7 +53,7 @@ pub fn get_setup_script(script: &str) -> String {
         "\
         if [ -z ${{{loaded_flag_key}}} ]; then\n\
             export {loaded_flag_key}=1;\n\
-            rm -f \"{session_script_path}\";\n\
+            echo \"\" > \"{session_script_path}\";\n\
             {app_name}() {{\n\
                 \"{app_path}\" \"$@\";\n\
                 status=$?;\n\

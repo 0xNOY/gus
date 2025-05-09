@@ -128,8 +128,10 @@ impl GitUserSwitcher {
             format!(
                 "\
             if [ -z \"$GUS_USER_ID\" ]; then\n\
-                echo Users:;\n\
+                echo The use of GUS is mandatory. Users who have not yet registered their information in GUS should use 'gus add' to register their information.;\n\
+                echo === Available users: ===;\n\
                 {app_name} list;\n\
+                echo ========================;\n\
                 echo -n \"Enter user id: \";\n\
                 read user_id;\n\
                 {app_name} set \"$user_id\";\n\
