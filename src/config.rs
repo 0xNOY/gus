@@ -13,6 +13,7 @@ pub struct Config {
     pub users_file_path: PathBuf,
     pub default_sshkey_dir: PathBuf,
     pub default_sshkey_type: SshKeyType,
+    pub default_sshkey_rounds: usize,
     pub force_use_gus: bool,
     pub min_sshkey_passphrase_length: usize,
 }
@@ -23,6 +24,7 @@ impl Default for Config {
             users_file_path: DEFAULT_DATA_DIR.join("users.toml"),
             default_sshkey_dir: DEFAULT_DATA_DIR.join("sshkeys/"),
             default_sshkey_type: SshKeyType::Ed25519,
+            default_sshkey_rounds: 100,
             force_use_gus: true,
             min_sshkey_passphrase_length: 10,
         }

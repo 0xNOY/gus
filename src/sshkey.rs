@@ -29,6 +29,7 @@ impl ToString for SshKeyType {
 
 pub fn generate_ssh_key(
     key_type: SshKeyType,
+    rounds: usize,
     comment: &str,
     passphrase: &str,
     path: &PathBuf,
@@ -47,6 +48,8 @@ pub fn generate_ssh_key(
     })?;
 
     let mut cmd = Command::new("ssh-keygen");
+    cmd.arg("-o");
+    cmd.arg("-a").arg(rounds.to_string());
     cmd.arg("-t").arg(key_type.to_string());
     cmd.arg("-C").arg(comment);
     cmd.arg("-f").arg(path);

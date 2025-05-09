@@ -39,6 +39,7 @@ impl GitUserSwitcher {
 
             generate_ssh_key(
                 self.config.default_sshkey_type.clone(),
+                self.config.default_sshkey_rounds,
                 &user.get_sshkey_name(),
                 &pass,
                 &sshkey_path,
