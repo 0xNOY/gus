@@ -3,16 +3,16 @@
 ## 概要
 
 GUSはGitのユーザーをターミナル単位で切り替えるためのツールです．
-`user.name`と`user.email`を切り替えるだけでなく，SSH鍵も切り替えます．
+`user.name`と`user.email`を切り替えるだけでなく，`git pull` / `git push` 時のSSH鍵も切り替えます．
 
 ## インストール
 
-1. [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)をインストールしてください．
-2. cargoを使ってGUSをインストールします．  
+1. [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)をインストール
+2. cargoを使ってGUSをインストール  
    ```sh
    cargo install --git https://github.com/0xNOY/gus.git
    ```
-3. `.bashrc`に以下の行を追加してください．  
+3. `.bashrc`に以下の行を追加  
    ```sh
    eval "$(gus setup)"
    ```
