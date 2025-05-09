@@ -52,18 +52,18 @@ pub fn get_setup_script(script: &str) -> String {
     format!(
         "\
         if [ -z ${{{loaded_flag_key}}} ]; then\n\
-            export {loaded_flag_key}=1\n\
-            rm -f \"{session_script_path}\"\n\
-            function {app_name}() {{\n\
-                \"{app_path}\" \"$@\"\n\
-                status=$?\n\
+            export {loaded_flag_key}=1;\n\
+            rm -f \"{session_script_path}\";\n\
+            {app_name}() {{\n\
+                \"{app_path}\" \"$@\";\n\
+                status=$?;\n\
                 if [ $status -ne 0 ]; then\n\
-                    return $status\n\
-                fi\n\
-                source \"{session_script_path}\"\n\
-            }}\n\
+                    return $status;\n\
+                fi;\n\
+                . \"{session_script_path}\";\n\
+            }};\n\
             {script}\
-        fi\n\
+        fi;\n\
         ",
         loaded_flag_key = "GUS_LOADED_FLAG",
         app_path = get_app_path().to_string_lossy(),

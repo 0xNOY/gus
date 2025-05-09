@@ -92,7 +92,8 @@ impl GitUserSwitcher {
     }
 
     pub fn get_current_user(&self) -> Option<&User> {
-        self.users.get(env::var("GUS_USER_ID").unwrap().as_str())
+        self.users
+            .get(env::var("GUS_USER_ID").unwrap_or_default().as_str())
     }
 
     pub fn list_users(&self) -> Vec<&User> {
@@ -127,16 +128,16 @@ impl GitUserSwitcher {
             format!(
                 "\
             if [ -z \"$GUS_USER_ID\" ]; then\n\
-                echo Users:\n\
-                {app_name} list\n\
-                echo -n \"Enter user id: \"\n\
-                read user_id\n\
-                {app_name} set \"$user_id\"\n\
-                status=$?\n\
+                echo Users:;\n\
+                {app_name} list;\n\
+                echo -n \"Enter user id: \";\n\
+                read user_id;\n\
+                {app_name} set \"$user_id\";\n\
+                status=$?;\n\
                 if [ $status -ne 0 ]; then\n\
-                    return $status\n\
-                fi\n\
-            fi\n\
+                    return $status;\n\
+                fi;\n\
+            fi;\n\
             "
             )
         } else {
@@ -145,9 +146,9 @@ impl GitUserSwitcher {
 
         get_setup_script(&format!(
             "\
-            function git() {{\n\
+            git() {{\n\
                 {force_use_gus_script}\
-                command git \"$@\"\n\
+                command git \"$@\";\n\
             }}\n\
             "
         ))
