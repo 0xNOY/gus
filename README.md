@@ -2,22 +2,20 @@
 
 ## 概要
 
-GUSはGitのユーザーを切り替えるためのツールです。
-`user.name`と`user.email`を切り替えるだけでなく、sshの鍵も切り替えます。
+GUSはGitのユーザーをターミナル単位で切り替えるためのツールです．
+`user.name`と`user.email`を切り替えるだけでなく，SSH鍵も切り替えます．
 
 ## インストール
 
-まず、[cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)をインストールしてください。
-
-次に、cargoを使ってGUSをインストールします。
-```sh
-cargo install --git https://github.com/0xNOY/gus.git
-```
-
-最後に、`.bashrc`に以下の行を追加してください。
-```sh
-eval "$(gus setup)"
-```
+1. [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)をインストールしてください．
+2. cargoを使ってGUSをインストールします．  
+   ```sh
+   cargo install --git https://github.com/0xNOY/gus.git
+   ```
+3. `.bashrc`に以下の行を追加してください．  
+   ```sh
+   eval "$(gus setup)"
+   ```
 
 ## 使い方
 
@@ -25,15 +23,25 @@ eval "$(gus setup)"
 # ユーザーの追加
 # gus add <id> <name> <email>
 gus add noy "Naoya Takenaka" noy@mailaddr.com
-# このとき、SSHの鍵が作成されます。
-# 公開鍵を次のコマンドで取得し、GitHubなどに登録してください。
+# このときSSH鍵が生成されます．
+# 公開鍵を次のコマンドで取得し，GitHubなどに登録してください．
 gus key noy
 
 # ユーザの切り替え
 # gus set <id>
 gus set noy
-# ユーザはターミナル単位で切り替わります。
+# ユーザはターミナル単位で切り替わります．
 
-# 詳細はヘルプを参照してください。
+# 詳細はヘルプを参照してください．
 gus help
 ```
+
+## FAQ
+
+#### Q) gitコマンドを実行時のGUSの利用強制を無効化したい
+
+コンフィグファイルの `force_use_gus` を `false` にしてください．
+
+#### Q) SSH鍵生成時のパスフレーズ最低長を変更したい
+
+コンフィグファイルの `ssh_key_passphrase_min_length` を変更してください．
