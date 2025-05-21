@@ -6,7 +6,6 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::gus::GitUserSwitcher;
-use crate::shell::get_setup_script;
 use crate::user::User;
 
 static DEFAULT_CONFIG_PATH: Lazy<PathBuf> =
@@ -57,6 +56,39 @@ enum Subcommands {
         /// The ID of the user to get the key for
         id: String,
     },
+
+    /// Auto-switch related commands
+    #[clap(subcommand)]
+    AutoSwitch(AutoSwitchCommands),
+}
+
+#[derive(Subcommand)]
+enum AutoSwitchCommands {
+    /// Enable auto-switch feature
+    Enable,
+
+    /// Disable auto-switch feature
+    Disable,
+
+    /// Add a new auto-switch pattern
+    Add {
+        /// The glob pattern to match directories
+        pattern: String,
+        /// The user ID to switch to when pattern matches
+        user_id: String,
+    },
+
+    /// Remove an auto-switch pattern
+    Remove {
+        /// The pattern to remove
+        pattern: String,
+    },
+
+    /// List all auto-switch patterns
+    List,
+
+    /// Check and perform auto-switch based on current directory
+    Check,
 }
 
 pub fn run() -> Result<()> {
@@ -123,6 +155,41 @@ pub fn run() -> Result<()> {
             let pubkey = gus.get_public_sshkey(&id)?;
             print!("{}", pubkey);
         }
+        Subcommands::AutoSwitch(cmd) => match cmd {
+            AutoSwitchCommands::Enable => {
+                gus.enable_auto_switch()?;
+                println!("Auto-switch feature enabled");
+            }
+            AutoSwitchCommands::Disable => {
+                gus.disable_auto_switch()?;
+                println!("Auto-switch feature disabled");
+            }
+            AutoSwitchCommands::Add { pattern, user_id } => {
+                gus.add_auto_switch_pattern(&pattern, &user_id)?;
+                println!("Added auto-switch pattern: {} -> {}", pattern, user_id);
+            }
+            AutoSwitchCommands::Remove { pattern } => {
+                if gus.remove_auto_switch_pattern(&pattern)? {
+                    println!("Removed auto-switch pattern: {}", pattern);
+                } else {
+                    println!("Pattern not found: {}", pattern);
+                }
+            }
+            AutoSwitchCommands::List => {
+                let patterns = gus.list_auto_switch_patterns();
+                if patterns.is_empty() {
+                    println!("No auto-switch patterns configured");
+                } else {
+                    println!("Auto-switch patterns:");
+                    for (pattern, user_id) in patterns {
+                        println!("  {} -> {}", pattern, user_id);
+                    }
+                }
+            }
+            AutoSwitchCommands::Check => {
+                gus.check_auto_switch()?;
+            }
+        },
     }
 
     Ok(())
