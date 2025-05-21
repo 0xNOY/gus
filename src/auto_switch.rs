@@ -67,7 +67,7 @@ impl<'a> AutoSwitcher<'a> {
 mod tests {
     use super::*;
     use crate::config::AutoSwitchPattern;
-    use std::path::PathBuf;
+    
 
     fn create_test_config() -> Config {
         Config {
