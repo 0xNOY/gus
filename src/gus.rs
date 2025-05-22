@@ -200,19 +200,22 @@ impl GitUserSwitcher {
         let force_use_gus_script = if self.config.force_use_gus {
             format!(
                 "\
-            if [ -z \"$GUS_USER_ID\" ]; then\n\
-                echo The use of GUS is mandatory. Users who have not yet registered their information in GUS should use 'gus add' to register their information.;\n\
-                echo === Available users: ===;\n\
-                {app_name} list;\n\
-                echo ========================;\n\
-                echo -n \"Enter user id: \";\n\
-                read user_id;\n\
-                {app_name} set \"$user_id\";\n\
-                status=$?;\n\
-                if [ $status -ne 0 ]; then\n\
-                    return $status;\n\
+            git () {{
+                if [ -z \"$GUS_USER_ID\" ]; then\n\
+                    echo The use of GUS is mandatory. Users who have not yet registered their information in GUS should use 'gus add' to register their information.;\n\
+                    echo === Available users: ===;\n\
+                    {app_name} list;\n\
+                    echo ========================;\n\
+                    echo -n \"Enter user id: \";\n\
+                    read user_id;\n\
+                    {app_name} set \"$user_id\";\n\
+                    status=$?;\n\
+                    if [ $status -ne 0 ]; then\n\
+                        return $status;\n\
+                    fi;\n\
                 fi;\n\
-            fi;\n\
+                command git \"$@\";\n\
+            }};\n\
             "
             )
         } else {
@@ -225,7 +228,7 @@ impl GitUserSwitcher {
             cd() {{
                 command cd \"$@\";
                 {app_name} auto-switch check;
-            }}\n\
+            }};\n\
             "
             )
         } else {
@@ -234,10 +237,7 @@ impl GitUserSwitcher {
 
         get_setup_script(&format!(
             "\
-            git() {{\n\
-                {force_use_gus_script}\
-                command git \"$@\";\n\
-            }}\n\
+            {force_use_gus_script}\
             {auto_switch_script}\
             "
         ))
