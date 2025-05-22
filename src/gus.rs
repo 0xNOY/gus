@@ -1,8 +1,9 @@
 use anyhow::{ensure, Context, Result};
 use std::env;
 use std::path::PathBuf;
+use std::rc::Rc;
 
-use crate::auto_switch::AutoSwitcher;
+use crate::auto_switch::{self, should_switch, validate_pattern, list_patterns};
 use crate::config::Config;
 use crate::shell::{get_app_name, get_setup_script, write_session_script};
 use crate::sshkey::generate_ssh_key;
@@ -11,7 +12,6 @@ use crate::user::{User, Users};
 pub struct GitUserSwitcher {
     pub users: Users,
     pub config: Config,
-    auto_switcher: AutoSwitcher<'static>,
     config_path: PathBuf,
 }
 
@@ -22,26 +22,10 @@ impl From<&PathBuf> for GitUserSwitcher {
         Config::default().save(&org_config);
         let config = Config::open(config_path).unwrap();
         let users = Users::open(&config.users_file_path).unwrap();
-        
-        // Box::leakを使用して'staticライフタイムを取得
-        let config_ref = Box::leak(Box::new(config.clone()));
-        let auto_switcher = AutoSwitcher::new(config_ref, users.clone());
-        
         Self { 
             users, 
             config, 
-            auto_switcher,
             config_path: config_path.to_path_buf(),
-        }
-    }
-}
-
-impl Drop for GitUserSwitcher {
-    fn drop(&mut self) {
-        // Box::leakで作成したメモリを解放
-        unsafe {
-            let ptr = self.auto_switcher.config as *const _ as *mut Config;
-            Box::from_raw(ptr);
         }
     }
 }
@@ -156,12 +140,7 @@ impl GitUserSwitcher {
     }
 
     pub fn add_auto_switch_pattern(&mut self, pattern: &str, user_id: &str) -> Result<()> {
-        if !self.users.exists(user_id) {
-            anyhow::bail!("User '{}' does not exist", user_id);
-        }
-
-        glob::Pattern::new(pattern)
-            .with_context(|| format!("Invalid glob pattern: {}", pattern))?;
+        validate_pattern(pattern, user_id, &self.users)?;
 
         self.config.auto_switch_patterns.push(crate::config::AutoSwitchPattern {
             pattern: pattern.to_string(),
@@ -182,11 +161,11 @@ impl GitUserSwitcher {
     }
 
     pub fn list_auto_switch_patterns(&self) -> Vec<(&str, &str)> {
-        self.auto_switcher.list_patterns()
+        list_patterns(&self.config)
     }
 
     pub fn check_auto_switch(&self) -> Result<()> {
-        if let Some(user_id) = self.auto_switcher.should_switch(&std::env::current_dir()?) {
+        if let Some(user_id) = should_switch(&self.config, &self.users, &std::env::current_dir()?) {
             self.switch_user(&user_id)?;
         }
         Ok(())
