@@ -3,7 +3,7 @@ use std::env;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::auto_switch::{self, should_switch, validate_pattern, list_patterns};
+use crate::auto_switch::{should_switch, validate_pattern, list_patterns};
 use crate::config::Config;
 use crate::shell::{get_app_name, get_setup_script, write_session_script};
 use crate::sshkey::generate_ssh_key;
@@ -181,13 +181,8 @@ impl GitUserSwitcher {
                 "\
             git () {{
                 if [ -z \"$GUS_USER_ID\" ]; then\n\
-                    echo The use of GUS is mandatory. Users who have not yet registered their information in GUS should use 'gus add' to register their information.;\n\
-                    echo === Available users: ===;\n\
-                    {app_name} list;\n\
-                    echo ========================;\n\
-                    echo -n \"Enter user id: \";\n\
-                    read user_id;\n\
-                    {app_name} set \"$user_id\";\n\
+                    echo \"The use of GUS is mandatory. Users who have not yet registered their information in GUS should use '{app_name} add' to register their information.\";\n\
+                    {app_name} set;\n\
                     status=$?;\n\
                     if [ $status -ne 0 ]; then\n\
                         return $status;\n\

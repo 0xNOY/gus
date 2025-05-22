@@ -1,15 +1,20 @@
 use anyhow::{ensure, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt::Display, path::PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::fmt;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Args)]
 pub struct User {
     /// The user's ID (must be unique)
+    #[clap(long, short)]
     pub id: String,
     /// The user's name
+    #[clap(long, short)]
     pub name: String,
     /// The user's email
+    #[clap(long, short)]
     pub email: String,
 
     /// The path to the user's ssh key
@@ -32,6 +37,12 @@ impl User {
         } else {
             default_sshkey_dir.join(&self.get_sshkey_name())
         }
+    }
+}
+
+impl fmt::Display for User {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {} <{}>", self.id, self.name, self.email)
     }
 }
 

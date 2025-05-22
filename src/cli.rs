@@ -8,6 +8,7 @@ use comfy_table::{Table, ContentArrangement};
 
 use crate::gus::GitUserSwitcher;
 use crate::user::User;
+use crate::tui;
 
 static DEFAULT_CONFIG_PATH: Lazy<PathBuf> =
     Lazy::new(|| dirs::home_dir().unwrap().join(".config/gus/config.toml"));
@@ -43,7 +44,8 @@ enum Subcommands {
     /// Switch to a user
     Set {
         /// The ID of the user to switch to
-        id: String,
+        #[clap(required = false)]
+        id: Option<String>,
     },
 
     /// Show the current user
@@ -146,7 +148,16 @@ pub fn run() -> Result<()> {
             gus.remove_user(&id)?;
         }
         Subcommands::Set { id } => {
-            gus.switch_user(&id)?;
+            if let Some(id) = id {
+                gus.switch_user(&id)?;
+            } else {
+                let users = gus.list_users();
+                if let Some(user) = tui::select_user(&users)? {
+                    gus.switch_user(&user.id)?;
+                } else {
+                    println!("No users available");
+                }
+            }
         }
         Subcommands::Current => {
             let user = gus.get_current_user().context("no current user")?;
