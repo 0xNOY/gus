@@ -180,12 +180,16 @@ impl GitUserSwitcher {
             format!(
                 "\
             git () {{
-                if [ -z \"$GUS_USER_ID\" ]; then\n\
-                    echo \"The use of GUS is mandatory. Users who have not yet registered their information in GUS should use '{app_name} add' to register their information.\";\n\
+                if ! {app_name} current >/dev/null 2>&1; then\n\
+                    echo \"The use of GUS is mandatory. Users who have not yet registered their information in GUS should use '{app_name} add' to register their information.\" >&2;\n\
                     {app_name} set;\n\
                     status=$?;\n\
                     if [ $status -ne 0 ]; then\n\
                         return $status;\n\
+                    fi;\n\
+                    if ! {app_name} current >/dev/null 2>&1; then\n\
+                        echo \"Error: Invalid GUS_USER_ID. Please run 'gus set' to select a valid user.\" >&2;\n\
+                        return 1;\n\
                     fi;\n\
                 fi;\n\
                 command git \"$@\";\n\
