@@ -2,19 +2,16 @@ use anyhow::{ensure, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Args)]
 pub struct User {
     /// The user's ID (must be unique)
-    #[clap(long, short)]
     pub id: String,
     /// The user's name
-    #[clap(long, short)]
     pub name: String,
     /// The user's email
-    #[clap(long, short)]
     pub email: String,
 
     /// The path to the user's ssh key
@@ -157,7 +154,7 @@ mod tests {
     #[test]
     fn test_users_operations() {
         let mut users = Users::new();
-        
+
         // Test adding a user
         let user = User {
             id: "test".to_string(),
@@ -166,19 +163,19 @@ mod tests {
             sshkey_path: None,
         };
         assert!(users.add(user.clone()).is_ok());
-        
+
         // Test duplicate user
         assert!(users.add(user.clone()).is_err());
-        
+
         // Test getting a user
         assert!(users.exists("test"));
         let retrieved_user = users.get("test").unwrap();
         assert_eq!(retrieved_user.name, "Test User");
-        
+
         // Test listing users
         let user_list = users.list();
         assert_eq!(user_list.len(), 1);
-        
+
         // Test removing a user
         let removed_user = users.remove("test").unwrap();
         assert_eq!(removed_user.id, "test");
@@ -189,11 +186,11 @@ mod tests {
     fn test_users_file_operations() -> Result<()> {
         let temp_dir = assert_fs::TempDir::new()?;
         let users_file = temp_dir.child("users.toml");
-        
+
         // Test creating new users file
         let users = Users::open(&users_file.path().to_path_buf())?;
         assert_eq!(users.list().len(), 0);
-        
+
         // Test saving and loading users
         let mut users = Users::new();
         let user = User {
@@ -204,12 +201,12 @@ mod tests {
         };
         users.add(user)?;
         users.save(&users_file.path().to_path_buf())?;
-        
+
         let loaded_users = Users::open(&users_file.path().to_path_buf())?;
         assert_eq!(loaded_users.list().len(), 1);
         let loaded_user = loaded_users.get("test").unwrap();
         assert_eq!(loaded_user.name, "Test User");
-        
+
         Ok(())
     }
 }
