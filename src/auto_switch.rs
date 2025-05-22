@@ -24,7 +24,6 @@ pub fn should_switch(config: &Config, users: &Users, current_dir: &Path) -> Opti
         let expanded_pattern = expand_tilde(&pattern.pattern);
         if let Ok(glob_pattern) = Pattern::new(&expanded_pattern) {
             if glob_pattern.matches(&current_dir_str) {
-                // ユーザーが存在することを確認
                 if users.exists(&pattern.user_id) {
                     return Some(pattern.user_id.clone());
                 }
@@ -36,12 +35,10 @@ pub fn should_switch(config: &Config, users: &Users, current_dir: &Path) -> Opti
 }
 
 pub fn validate_pattern(pattern: &str, user_id: &str, users: &Users) -> Result<()> {
-    // ユーザーが存在することを確認
     if !users.exists(user_id) {
         anyhow::bail!("User '{}' does not exist", user_id);
     }
 
-    // パターンの有効性を確認
     Pattern::new(pattern)
         .with_context(|| format!("Invalid glob pattern: {}", pattern))?;
 
@@ -128,13 +125,8 @@ mod tests {
     fn test_validate_pattern() {
         let users = create_test_users();
 
-        // 有効なパターンの追加
         assert!(validate_pattern("~/new/*", "work", &users).is_ok());
-
-        // 無効なユーザーID
         assert!(validate_pattern("~/new/*", "invalid", &users).is_err());
-
-        // 無効なパターン
         assert!(validate_pattern("invalid[", "work", &users).is_err());
     }
 
