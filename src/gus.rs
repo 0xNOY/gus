@@ -1,15 +1,18 @@
 use anyhow::{ensure, Context, Result};
 use std::env;
 use std::path::PathBuf;
+use std::rc::Rc;
 
-use crate::config::{self, Config};
-use crate::shell::{get_app_name, get_app_path, get_setup_script, write_session_script};
+use crate::auto_switch::{should_switch, validate_pattern, list_patterns};
+use crate::config::Config;
+use crate::shell::{get_app_name, get_setup_script, write_session_script};
 use crate::sshkey::generate_ssh_key;
 use crate::user::{User, Users};
 
 pub struct GitUserSwitcher {
     pub users: Users,
     pub config: Config,
+    config_path: PathBuf,
 }
 
 impl From<&PathBuf> for GitUserSwitcher {
@@ -19,7 +22,11 @@ impl From<&PathBuf> for GitUserSwitcher {
         Config::default().save(&org_config);
         let config = Config::open(config_path).unwrap();
         let users = Users::open(&config.users_file_path).unwrap();
-        Self { users, config }
+        Self { 
+            users, 
+            config, 
+            config_path: config_path.to_path_buf(),
+        }
     }
 }
 
@@ -120,6 +127,50 @@ impl GitUserSwitcher {
         Ok(contents)
     }
 
+    pub fn enable_auto_switch(&mut self) -> Result<()> {
+        self.config.auto_switch_enabled = true;
+        self.config.save(&self.config_path)?;
+        Ok(())
+    }
+
+    pub fn disable_auto_switch(&mut self) -> Result<()> {
+        self.config.auto_switch_enabled = false;
+        self.config.save(&self.config_path)?;
+        Ok(())
+    }
+
+    pub fn add_auto_switch_pattern(&mut self, pattern: &str, user_id: &str) -> Result<()> {
+        validate_pattern(pattern, user_id, &self.users)?;
+
+        self.config.auto_switch_patterns.push(crate::config::AutoSwitchPattern {
+            pattern: pattern.to_string(),
+            user_id: user_id.to_string(),
+        });
+        self.config.save(&self.config_path)?;
+        Ok(())
+    }
+
+    pub fn remove_auto_switch_pattern(&mut self, pattern: &str) -> Result<bool> {
+        let initial_len = self.config.auto_switch_patterns.len();
+        self.config.auto_switch_patterns.retain(|p| p.pattern != pattern);
+        let removed = initial_len != self.config.auto_switch_patterns.len();
+        if removed {
+            self.config.save(&self.config_path)?;
+        }
+        Ok(removed)
+    }
+
+    pub fn list_auto_switch_patterns(&self) -> Vec<(&str, &str)> {
+        list_patterns(&self.config)
+    }
+
+    pub fn check_auto_switch(&self) -> Result<()> {
+        if let Some(user_id) = should_switch(&self.config, &self.users, &std::env::current_dir()?) {
+            self.switch_user(&user_id)?;
+        }
+        Ok(())
+    }
+
     pub fn get_setup_script(&self) -> String {
         write_session_script("").unwrap();
 
@@ -128,19 +179,34 @@ impl GitUserSwitcher {
         let force_use_gus_script = if self.config.force_use_gus {
             format!(
                 "\
-            if [ -z \"$GUS_USER_ID\" ]; then\n\
-                echo The use of GUS is mandatory. Users who have not yet registered their information in GUS should use 'gus add' to register their information.;\n\
-                echo === Available users: ===;\n\
-                {app_name} list;\n\
-                echo ========================;\n\
-                echo -n \"Enter user id: \";\n\
-                read user_id;\n\
-                {app_name} set \"$user_id\";\n\
-                status=$?;\n\
-                if [ $status -ne 0 ]; then\n\
-                    return $status;\n\
+            git () {{
+                if ! {app_name} current >/dev/null 2>&1; then\n\
+                    echo \"The use of GUS is mandatory. Users who have not yet registered their information in GUS should use '{app_name} add' to register their information.\" >&2;\n\
+                    {app_name} set;\n\
+                    status=$?;\n\
+                    if [ $status -ne 0 ]; then\n\
+                        return $status;\n\
+                    fi;\n\
+                    if ! {app_name} current >/dev/null 2>&1; then\n\
+                        echo \"Error: Invalid GUS_USER_ID. Please run 'gus set' to select a valid user.\" >&2;\n\
+                        return 1;\n\
+                    fi;\n\
                 fi;\n\
-            fi;\n\
+                command git \"$@\";\n\
+            }};\n\
+            "
+            )
+        } else {
+            "".to_owned()
+        };
+
+        let auto_switch_script = if self.config.auto_switch_enabled {
+            format!(
+                "\
+            cd() {{
+                command cd \"$@\";
+                {app_name} auto-switch check;
+            }};\n\
             "
             )
         } else {
@@ -149,10 +215,8 @@ impl GitUserSwitcher {
 
         get_setup_script(&format!(
             "\
-            git() {{\n\
-                {force_use_gus_script}\
-                command git \"$@\";\n\
-            }}\n\
+            {force_use_gus_script}\
+            {auto_switch_script}\
             "
         ))
     }

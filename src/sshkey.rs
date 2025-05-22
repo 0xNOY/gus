@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, process::Command};
 
-#[derive(Serialize, Deserialize, Debug, Clone, ValueEnum)]
+#[derive(Serialize, Deserialize, Debug, Clone, ValueEnum, PartialEq)]
 pub enum SshKeyType {
     Ed25519,
     Ed25519Sk,

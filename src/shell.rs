@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::{collections::HashMap, env, os::unix::process::parent_id, path::PathBuf};
+use std::{env, os::unix::process::parent_id, path::PathBuf};
 
 pub fn str2envkey(s: &str) -> String {
     // [a-zA-Z_][a-zA-Z0-9_]*
