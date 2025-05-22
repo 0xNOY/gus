@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use glob::Pattern;
 use std::path::Path;
+use std::env;
 
 use crate::{config::Config, user::Users};
 
@@ -14,6 +15,15 @@ impl<'a> AutoSwitcher<'a> {
         Self { config, users }
     }
 
+    fn expand_tilde(path: &str) -> String {
+        if path.starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                return path.replacen('~', &home.to_string_lossy(), 1);
+            }
+        }
+        path.to_string()
+    }
+
     pub fn should_switch(&self, current_dir: &Path) -> Option<String> {
         if !self.config.auto_switch_enabled {
             return None;
@@ -22,7 +32,8 @@ impl<'a> AutoSwitcher<'a> {
         let current_dir_str = current_dir.to_string_lossy();
         
         for pattern in &self.config.auto_switch_patterns {
-            if let Ok(glob_pattern) = Pattern::new(&pattern.pattern) {
+            let expanded_pattern = Self::expand_tilde(&pattern.pattern);
+            if let Ok(glob_pattern) = Pattern::new(&expanded_pattern) {
                 if glob_pattern.matches(&current_dir_str) {
                     // ユーザーが存在することを確認
                     if self.users.exists(&pattern.user_id) {
@@ -67,18 +78,18 @@ impl<'a> AutoSwitcher<'a> {
 mod tests {
     use super::*;
     use crate::config::AutoSwitchPattern;
-    
+    use std::path::PathBuf;
 
     fn create_test_config() -> Config {
         Config {
             auto_switch_enabled: true,
             auto_switch_patterns: vec![
                 AutoSwitchPattern {
-                    pattern: "/home/user/work/*".to_string(),
+                    pattern: "~/work/*".to_string(),
                     user_id: "work".to_string(),
                 },
                 AutoSwitchPattern {
-                    pattern: "/home/user/personal/*".to_string(),
+                    pattern: "~/personal/*".to_string(),
                     user_id: "personal".to_string(),
                 },
             ],
@@ -113,16 +124,21 @@ mod tests {
         let users = create_test_users();
         let switcher = AutoSwitcher::new(&config, users);
 
+        let home = dirs::home_dir().unwrap();
+        let work_path = home.join("work/project");
+        let personal_path = home.join("personal/project");
+        let other_path = home.join("other");
+
         assert_eq!(
-            switcher.should_switch(Path::new("/home/user/work/project")),
+            switcher.should_switch(&work_path),
             Some("work".to_string())
         );
         assert_eq!(
-            switcher.should_switch(Path::new("/home/user/personal/project")),
+            switcher.should_switch(&personal_path),
             Some("personal".to_string())
         );
         assert_eq!(
-            switcher.should_switch(Path::new("/home/user/other")),
+            switcher.should_switch(&other_path),
             None
         );
     }
@@ -135,12 +151,12 @@ mod tests {
 
         // 有効なパターンの追加
         assert!(switcher
-            .add_pattern("/home/user/new/*".to_string(), "work".to_string())
+            .add_pattern("~/new/*".to_string(), "work".to_string())
             .is_ok());
 
         // 無効なユーザーID
         assert!(switcher
-            .add_pattern("/home/user/new/*".to_string(), "invalid".to_string())
+            .add_pattern("~/new/*".to_string(), "invalid".to_string())
             .is_err());
 
         // 無効なパターン
@@ -155,8 +171,8 @@ mod tests {
         let users = create_test_users();
         let mut switcher = AutoSwitcher::new(&config, users);
 
-        assert!(switcher.remove_pattern("/home/user/work/*"));
-        assert!(!switcher.remove_pattern("/home/user/nonexistent/*"));
+        assert!(switcher.remove_pattern("~/work/*"));
+        assert!(!switcher.remove_pattern("~/nonexistent/*"));
     }
 
     #[test]
@@ -167,7 +183,7 @@ mod tests {
 
         let patterns = switcher.list_patterns();
         assert_eq!(patterns.len(), 2);
-        assert!(patterns.contains(&("/home/user/work/*", "work")));
-        assert!(patterns.contains(&("/home/user/personal/*", "personal")));
+        assert!(patterns.contains(&("~/work/*", "work")));
+        assert!(patterns.contains(&("~/personal/*", "personal")));
     }
 } 
