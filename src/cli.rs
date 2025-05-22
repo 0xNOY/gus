@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use rpassword::read_password;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use comfy_table::{Table, ContentArrangement};
 
 use crate::gus::GitUserSwitcher;
 use crate::user::User;
@@ -49,7 +50,11 @@ enum Subcommands {
     Current,
 
     /// List all users
-    List,
+    List {
+        /// Output in a simple, parseable format
+        #[clap(long, short)]
+        simple: bool,
+    },
 
     /// Echo a public ssh key
     Key {
@@ -144,11 +149,36 @@ pub fn run() -> Result<()> {
             gus.switch_user(&id)?;
         }
         Subcommands::Current => {
-            println!("{}", gus.get_current_user().context("no current user")?);
+            let user = gus.get_current_user().context("no current user")?;
+            println!("{}\t{}\t{}\t{}", user.id, user.name, user.email, user.get_sshkey_path(&gus.config.default_sshkey_dir)
+            .to_string_lossy());
         }
-        Subcommands::List => {
-            for user in gus.list_users() {
-                println!("{}", user);
+        Subcommands::List { simple } => {
+            let users = gus.list_users();
+            if simple {
+                for user in users {
+                    println!("{}\t{}\t{}\t{}", user.id, user.name, user.email, user.get_sshkey_path(&gus.config.default_sshkey_dir)
+                    .to_string_lossy());
+                }
+            } else {
+                let mut table = Table::new();
+                table
+                    .set_content_arrangement(ContentArrangement::Dynamic)
+                    .set_header(vec!["ID", "Name", "Email", "SSH Key"])
+                    .load_preset(comfy_table::presets::UTF8_FULL);
+
+                for user in users {
+                    let sshkey = user.get_sshkey_path(&gus.config.default_sshkey_dir)
+                        .to_string_lossy().to_string();
+                    table.add_row(vec![
+                        &user.id,
+                        &user.name,
+                        &user.email,
+                        &sshkey,
+                    ]);
+                }
+
+                println!("{}", table);
             }
         }
         Subcommands::Key { id } => {

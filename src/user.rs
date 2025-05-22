@@ -17,12 +17,6 @@ pub struct User {
     pub sshkey_path: Option<PathBuf>,
 }
 
-impl Display for User {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {} <{}>", self.id, self.name, self.email)
-    }
-}
-
 impl User {
     pub fn get_sshkey_name(&self) -> String {
         if let Some(path) = &self.sshkey_path {
