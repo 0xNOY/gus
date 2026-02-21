@@ -175,12 +175,37 @@ impl GitUserSwitcher {
         write_session_script("").unwrap();
 
         let app_name = get_app_name();
+        let always_prompt_on_git = if self.config.always_prompt_on_git { "true" } else { "false" };
+        let prompt_on_git_commands = if self.config.prompt_on_git_commands.is_empty() {
+            String::new()
+        } else {
+            self.config
+                .prompt_on_git_commands
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+        };
 
         let force_use_gus_script = if self.config.force_use_gus {
             format!(
                 "\
             git () {{
-                if ! {app_name} current >/dev/null 2>&1; then\n\
+                should_prompt=0;\n\
+                if {always_prompt_on_git}; then\n\
+                    should_prompt=1;\n\
+                elif [ -n \"{prompt_on_git_commands}\" ]; then\n\
+                    case \"$1\" in\n\
+                        {prompt_on_git_commands}) should_prompt=1;;\n\
+                    esac;\n\
+                fi;\n\
+                if [ $should_prompt -eq 1 ]; then\n\
+                    {app_name} set;\n\
+                    status=$?;\n\
+                    if [ $status -ne 0 ]; then\n\
+                        return $status;\n\
+                    fi;\n\
+                elif ! {app_name} current >/dev/null 2>&1; then\n\
                     echo \"The use of GUS is mandatory. Users who have not yet registered their information in GUS should use '{app_name} add' to register their information.\" >&2;\n\
                     {app_name} set;\n\
                     status=$?;\n\

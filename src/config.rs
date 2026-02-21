@@ -15,6 +15,8 @@ pub struct Config {
     pub default_sshkey_type: SshKeyType,
     pub default_sshkey_rounds: usize,
     pub force_use_gus: bool,
+    pub always_prompt_on_git: bool,
+    pub prompt_on_git_commands: Vec<String>,
     pub min_sshkey_passphrase_length: usize,
     pub auto_switch_enabled: bool,
     pub auto_switch_patterns: Vec<AutoSwitchPattern>,
@@ -34,6 +36,8 @@ impl Default for Config {
             default_sshkey_type: SshKeyType::Ed25519,
             default_sshkey_rounds: 100,
             force_use_gus: true,
+            always_prompt_on_git: false,
+            prompt_on_git_commands: Vec::new(),
             min_sshkey_passphrase_length: 10,
             auto_switch_enabled: false,
             auto_switch_patterns: Vec::new(),
@@ -82,6 +86,8 @@ mod tests {
         assert_eq!(config.default_sshkey_type, SshKeyType::Ed25519);
         assert_eq!(config.default_sshkey_rounds, 100);
         assert!(config.force_use_gus);
+        assert!(!config.always_prompt_on_git);
+        assert!(config.prompt_on_git_commands.is_empty());
         assert_eq!(config.min_sshkey_passphrase_length, 10);
     }
 
@@ -114,6 +120,8 @@ mod tests {
         assert_eq!(config.default_sshkey_type, deserialized.default_sshkey_type);
         assert_eq!(config.default_sshkey_rounds, deserialized.default_sshkey_rounds);
         assert_eq!(config.force_use_gus, deserialized.force_use_gus);
+        assert_eq!(config.always_prompt_on_git, deserialized.always_prompt_on_git);
+        assert_eq!(config.prompt_on_git_commands, deserialized.prompt_on_git_commands);
         assert_eq!(config.min_sshkey_passphrase_length, deserialized.min_sshkey_passphrase_length);
         
         Ok(())
