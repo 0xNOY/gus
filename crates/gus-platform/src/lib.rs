@@ -35,6 +35,8 @@ mod peer_linux;
 #[cfg(target_os = "macos")]
 mod peer_macos;
 #[cfg(target_os = "windows")]
+mod peer_windows;
+#[cfg(target_os = "windows")]
 mod windows;
 #[cfg(any(target_os = "windows", test))]
 mod windows_model;
@@ -43,6 +45,11 @@ mod windows_model;
 pub use peer_linux::{AuthenticatedUnixStream, PeerAuthenticationError};
 #[cfg(target_os = "macos")]
 pub use peer_macos::{AuthenticatedUnixStream, PeerAuthenticationError};
+#[cfg(target_os = "windows")]
+pub use peer_windows::{
+    AuthenticatedNamedPipe, ConnectedClientPipe, ConnectedServerPipe, NamedPipeListener,
+    PeerAuthenticationError, connect_named_pipe,
+};
 
 const IDENTITY_DIGEST_BYTES: usize = 32;
 
@@ -178,6 +185,20 @@ impl ProcessIdentity {
             user,
         }
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn process_identity_proof_digest(identity: ProcessIdentity) -> [u8; IDENTITY_DIGEST_BYTES] {
+    let mut native = [0_u8; 76];
+    native[0..32].copy_from_slice(&identity.time_domain.0);
+    native[32..36].copy_from_slice(&identity.pid.get().to_le_bytes());
+    native[36..44].copy_from_slice(&identity.start_time.get().to_le_bytes());
+    native[44..76].copy_from_slice(&identity.user.digest);
+    identity_digest(
+        b"gus.platform.peer-process-proof.v1",
+        identity.user.family,
+        &native,
+    )
 }
 
 impl fmt::Debug for ProcessIdentity {

@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     NativeProcessObserver, ObservationError, ObservationResource, OsUserIdentity, PlatformFamily,
-    ProcessIdentity, bsd::ProcessExitMonitor,
+    ProcessIdentity, bsd::ProcessExitMonitor, process_identity_proof_digest,
 };
 
 const AUTH_MAGIC: &[u8; 8] = b"GUSPAUTH";
@@ -512,16 +512,7 @@ fn finish_peer_authentication(
 }
 
 fn process_identity_digest(identity: ProcessIdentity) -> [u8; AUTH_DIGEST_BYTES] {
-    let mut native = [0_u8; 76];
-    native[0..32].copy_from_slice(&identity.time_domain.0);
-    native[32..36].copy_from_slice(&identity.pid.get().to_le_bytes());
-    native[36..44].copy_from_slice(&identity.start_time.get().to_le_bytes());
-    native[44..76].copy_from_slice(&identity.user.digest);
-    crate::identity_digest(
-        b"gus.platform.peer-process-proof.v1",
-        PlatformFamily::MacOs,
-        &native,
-    )
+    process_identity_proof_digest(identity)
 }
 
 fn current_audit_token() -> Result<AuditToken, PeerAuthenticationError> {

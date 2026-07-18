@@ -1,28 +1,35 @@
 use std::{
     ffi::c_void,
-    io,
+    fmt, io,
     mem::{MaybeUninit, size_of},
     num::{NonZeroU32, NonZeroU64},
     ptr,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE,
-        ERROR_NO_MORE_FILES, ERROR_SUCCESS, FILETIME, GetLastError, HANDLE, HWND,
+        ERROR_NO_MORE_FILES, ERROR_NO_TOKEN, ERROR_SUCCESS, FILETIME, GetLastError, HANDLE, HWND,
         INVALID_HANDLE_VALUE, SetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
-    Security::{GetLengthSid, GetTokenInformation, IsValidSid, TOKEN_QUERY, TOKEN_USER, TokenUser},
+    Security::{
+        GetLengthSid, GetTokenInformation, IsValidSid, RevertToSelf, SID_AND_ATTRIBUTES,
+        TOKEN_GROUPS, TOKEN_QUERY, TOKEN_STATISTICS, TOKEN_USER, TokenLogonSid, TokenSessionId,
+        TokenStatistics, TokenUser,
+    },
     System::{
         Console::{GetConsoleProcessList, GetConsoleWindow},
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
             TH32CS_SNAPPROCESS,
         },
+        Pipes::ImpersonateNamedPipeClient,
         RemoteDesktop::ProcessIdToSessionId,
+        SystemServices::SE_GROUP_LOGON_ID,
         Threading::{
-            GetCurrentProcessId, GetProcessTimes, OpenProcess, OpenProcessToken,
-            PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+            GetCurrentProcessId, GetCurrentThread, GetProcessTimes, OpenProcess, OpenProcessToken,
+            OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
         },
     },
     UI::WindowsAndMessaging::GetWindowThreadProcessId,
@@ -48,6 +55,13 @@ const MAX_SID_BYTES: usize = 68;
 const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
 
 struct OwnedHandle(HANDLE);
+
+// SAFETY: Win32 kernel object handles may be used from any thread. Ownership
+// is unique and all mutable operations remain guarded by Rust borrows.
+unsafe impl Send for OwnedHandle {}
+// SAFETY: shared uses in this module are read-only wait/query operations which
+// Windows permits concurrently for these handle types.
+unsafe impl Sync for OwnedHandle {}
 
 impl OwnedHandle {
     fn regular(handle: HANDLE, resource: ObservationResource) -> Result<Self, ObservationError> {
@@ -84,17 +98,141 @@ impl Drop for OwnedHandle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ProcessFacts {
     pid: NonZeroU32,
     start_time: NonZeroU64,
     user_sid: Vec<u8>,
+    logon_sid: Vec<u8>,
+    authentication_id: u64,
+    session_id: u32,
+}
+
+impl fmt::Debug for ProcessFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessFacts")
+            .field("pid", &self.pid)
+            .field("start_time", &self.start_time)
+            .field("user_sid", &"[REDACTED]")
+            .field("logon_sid", &"[REDACTED]")
+            .field("authentication_id", &"[REDACTED]")
+            .field("session_id", &self.session_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowsTokenIdentity {
+    user: OsUserIdentity,
+    logon: [u8; 32],
+    authentication_id: u64,
+    session_id: u32,
+}
+
+impl fmt::Debug for WindowsTokenIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WindowsTokenIdentity([REDACTED])")
+    }
+}
+
+impl WindowsTokenIdentity {
+    pub(crate) fn proof_digest(self) -> [u8; 32] {
+        let mut native = [0_u8; 76];
+        native[0..32].copy_from_slice(&self.user.digest);
+        native[32..64].copy_from_slice(&self.logon);
+        native[64..72].copy_from_slice(&self.authentication_id.to_le_bytes());
+        native[72..76].copy_from_slice(&self.session_id.to_le_bytes());
+        crate::identity_digest(
+            b"gus.platform.windows-peer-token-proof.v1",
+            PlatformFamily::Windows,
+            &native,
+        )
+    }
+}
+
+struct TokenFacts {
+    user_sid: Vec<u8>,
+    logon_sid: Vec<u8>,
+    authentication_id: u64,
     session_id: u32,
 }
 
 struct ObservedProcess {
     handle: OwnedHandle,
     facts: ProcessFacts,
+}
+
+pub(crate) struct RetainedProcess {
+    observed: ObservedProcess,
+    identity: ProcessIdentity,
+    revoked: AtomicBool,
+}
+
+impl RetainedProcess {
+    pub(crate) fn new(pid: NonZeroU32) -> Result<Self, ObservationError> {
+        let time_domain = ProcessTimeDomainIdentity::from_native_bytes(
+            PlatformFamily::Windows,
+            WINDOWS_PROCESS_TIME_DOMAIN,
+        );
+        let observed = observe_process(
+            pid,
+            ObservationResource::TargetProcess,
+            ObservationResource::TargetUser,
+        )?;
+        let second = normalize_target_process_recheck(read_process_facts(
+            &observed.handle,
+            pid,
+            ObservationResource::TargetProcess,
+            ObservationResource::TargetUser,
+        ))?;
+        require_stable_process_facts(&observed.facts, &second)?;
+        let identity = process_identity(time_domain, &observed.facts);
+        let retained = Self {
+            observed,
+            identity,
+            revoked: AtomicBool::new(false),
+        };
+        retained.ensure_live()?;
+        Ok(retained)
+    }
+
+    pub(crate) const fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
+    pub(crate) fn raw_handle(&self) -> HANDLE {
+        self.observed.handle.raw()
+    }
+
+    pub(crate) const fn session_id(&self) -> u32 {
+        self.observed.facts.session_id
+    }
+
+    pub(crate) fn logon_sid(&self) -> &[u8] {
+        &self.observed.facts.logon_sid
+    }
+
+    pub(crate) fn token_identity(&self) -> WindowsTokenIdentity {
+        token_identity(&self.observed.facts)
+    }
+
+    pub(crate) fn ensure_live(&self) -> Result<(), ObservationError> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(ObservationError::ProcessChanged);
+        }
+        let live = handle_liveness(&self.observed.handle, ObservationResource::TargetProcess);
+        if matches!(live, Ok(true)) {
+            Ok(())
+        } else {
+            self.revoked.store(true, Ordering::Release);
+            Err(ObservationError::ProcessChanged)
+        }
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,27 +367,7 @@ pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationEr
 }
 
 pub(super) fn observe_target_process(pid: NonZeroU32) -> Result<ProcessIdentity, ObservationError> {
-    let time_domain = ProcessTimeDomainIdentity::from_native_bytes(
-        PlatformFamily::Windows,
-        WINDOWS_PROCESS_TIME_DOMAIN,
-    );
-    let process = observe_process(
-        pid,
-        ObservationResource::TargetProcess,
-        ObservationResource::TargetUser,
-    )?;
-    let second = normalize_target_process_recheck(read_process_facts(
-        &process.handle,
-        pid,
-        ObservationResource::TargetProcess,
-        ObservationResource::TargetUser,
-    ))?;
-    require_stable_process_facts(&process.facts, &second)?;
-    match handle_liveness(&process.handle, ObservationResource::TargetProcess) {
-        Ok(true) => Ok(process_identity(time_domain, &process.facts)),
-        Ok(false) => Err(ObservationError::ProcessChanged),
-        Err(error) => Err(error),
-    }
+    Ok(RetainedProcess::new(pid)?.identity())
 }
 
 fn require_stable_process_facts(
@@ -317,13 +435,18 @@ fn read_process_facts(
 ) -> Result<ProcessFacts, ObservationError> {
     require_handle_live(handle, process_resource)?;
     let start_time = process_start_time(handle, process_resource)?;
-    let user_sid = process_user_sid(handle, user_resource)?;
+    let token = process_token_facts(handle, user_resource)?;
     let session_id = process_session_id(handle, pid, process_resource)?;
+    if token.session_id != session_id {
+        return Err(ObservationError::ProcessChanged);
+    }
     require_handle_live(handle, process_resource)?;
     Ok(ProcessFacts {
         pid,
         start_time,
-        user_sid,
+        user_sid: token.user_sid,
+        logon_sid: token.logon_sid,
+        authentication_id: token.authentication_id,
         session_id,
     })
 }
@@ -420,22 +543,107 @@ fn open_process_handle(
     OwnedHandle::regular(handle, resource)
 }
 
-fn process_user_sid(
+fn process_token_facts(
     process: &OwnedHandle,
     resource: ObservationResource,
-) -> Result<Vec<u8>, ObservationError> {
+) -> Result<TokenFacts, ObservationError> {
     let mut token = ptr::null_mut();
     // SAFETY: `token` is writable and the process handle is valid.
     if unsafe { OpenProcessToken(process.raw(), TOKEN_QUERY, ptr::addr_of_mut!(token)) } == 0 {
         return Err(last_read_error(resource));
     }
     let token = OwnedHandle::regular(token, resource)?;
+    token_facts(&token, resource)
+}
+
+fn token_facts(
+    token: &OwnedHandle,
+    resource: ObservationResource,
+) -> Result<TokenFacts, ObservationError> {
+    Ok(TokenFacts {
+        user_sid: token_user_sid(token, resource)?,
+        logon_sid: token_logon_sid(token, resource)?,
+        authentication_id: token_authentication_id(token, resource)?,
+        session_id: token_session_id(token, resource)?,
+    })
+}
+
+fn token_user_sid(
+    token: &OwnedHandle,
+    resource: ObservationResource,
+) -> Result<Vec<u8>, ObservationError> {
+    let buffer = token_information(token, TokenUser, resource)?;
+    if buffer.len() < size_of::<TOKEN_USER>() {
+        return Err(ObservationError::Malformed { resource });
+    }
+    // `Vec<u8>` need not satisfy `TOKEN_USER` alignment.
+    // SAFETY: the returned byte count covers a complete `TOKEN_USER` value.
+    let token_user = unsafe { ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    copy_sid_from_token_buffer(&buffer, token_user.User.Sid, resource)
+}
+
+fn token_logon_sid(
+    token: &OwnedHandle,
+    resource: ObservationResource,
+) -> Result<Vec<u8>, ObservationError> {
+    let buffer = token_information(token, TokenLogonSid, resource)?;
+    if buffer.len() < size_of::<TOKEN_GROUPS>() {
+        return Err(ObservationError::Malformed { resource });
+    }
+    // SAFETY: the returned byte count covers the fixed TOKEN_GROUPS prefix and
+    // first SID_AND_ATTRIBUTES entry. Vec alignment is handled by unaligned read.
+    let groups = unsafe { ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_GROUPS>()) };
+    if groups.GroupCount != 1 {
+        return Err(ObservationError::Malformed { resource });
+    }
+    let group: SID_AND_ATTRIBUTES = groups.Groups[0];
+    if i32::from_ne_bytes(group.Attributes.to_ne_bytes()) & SE_GROUP_LOGON_ID != SE_GROUP_LOGON_ID {
+        return Err(ObservationError::Malformed { resource });
+    }
+    copy_sid_from_token_buffer(&buffer, group.Sid, resource)
+}
+
+fn token_authentication_id(
+    token: &OwnedHandle,
+    resource: ObservationResource,
+) -> Result<u64, ObservationError> {
+    let buffer = token_information(token, TokenStatistics, resource)?;
+    if buffer.len() < size_of::<TOKEN_STATISTICS>() {
+        return Err(ObservationError::Malformed { resource });
+    }
+    // SAFETY: the returned bytes cover TOKEN_STATISTICS; unaligned read is used.
+    let statistics = unsafe { ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_STATISTICS>()) };
+    let high = u32::from_ne_bytes(statistics.AuthenticationId.HighPart.to_ne_bytes());
+    Ok((u64::from(high) << 32) | u64::from(statistics.AuthenticationId.LowPart))
+}
+
+fn token_session_id(
+    token: &OwnedHandle,
+    resource: ObservationResource,
+) -> Result<u32, ObservationError> {
+    let buffer = token_information(token, TokenSessionId, resource)?;
+    if buffer.len() != size_of::<u32>() {
+        return Err(ObservationError::Malformed { resource });
+    }
+    Ok(u32::from_ne_bytes(
+        buffer
+            .as_slice()
+            .try_into()
+            .map_err(|_| ObservationError::Malformed { resource })?,
+    ))
+}
+
+fn token_information(
+    token: &OwnedHandle,
+    class: i32,
+    resource: ObservationResource,
+) -> Result<Vec<u8>, ObservationError> {
     let mut required = 0_u32;
     // SAFETY: A null buffer with zero length is the documented size query.
     let first_result = unsafe {
         GetTokenInformation(
             token.raw(),
-            TokenUser,
+            class,
             ptr::null_mut(),
             0,
             ptr::addr_of_mut!(required),
@@ -462,7 +670,7 @@ fn process_user_sid(
     if unsafe {
         GetTokenInformation(
             token.raw(),
-            TokenUser,
+            class,
             buffer.as_mut_ptr().cast::<c_void>(),
             u32::try_from(buffer.len()).map_err(|_| ObservationError::Oversized { resource })?,
             ptr::addr_of_mut!(returned),
@@ -473,17 +681,23 @@ fn process_user_sid(
     }
     let returned =
         usize::try_from(returned).map_err(|_| ObservationError::Oversized { resource })?;
-    if returned < size_of::<TOKEN_USER>() || returned > buffer.len() {
+    if returned == 0 || returned > buffer.len() {
         return Err(ObservationError::Malformed { resource });
     }
-    // `Vec<u8>` need not satisfy `TOKEN_USER` alignment.
-    // SAFETY: The returned byte count covers a complete `TOKEN_USER` value.
-    let token_user = unsafe { ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    buffer.truncate(returned);
+    Ok(buffer)
+}
+
+fn copy_sid_from_token_buffer(
+    buffer: &[u8],
+    sid: *mut c_void,
+    resource: ObservationResource,
+) -> Result<Vec<u8>, ObservationError> {
     let buffer_start = buffer.as_ptr() as usize;
     let buffer_end = buffer_start
-        .checked_add(returned)
+        .checked_add(buffer.len())
         .ok_or(ObservationError::Malformed { resource })?;
-    let sid_start = token_user.User.Sid as usize;
+    let sid_start = sid as usize;
     if sid_start < buffer_start
         || sid_start
             .checked_add(MIN_SID_BYTES)
@@ -504,11 +718,11 @@ fn process_user_sid(
     }
     // SAFETY: The pointer is inside the returned token buffer with enough
     // bytes for the fixed SID header.
-    if unsafe { IsValidSid(token_user.User.Sid) } == 0 {
+    if unsafe { IsValidSid(sid) } == 0 {
         return Err(ObservationError::Malformed { resource });
     }
     // SAFETY: `IsValidSid` accepted this in-buffer SID pointer.
-    let sid_len = usize::try_from(unsafe { GetLengthSid(token_user.User.Sid) })
+    let sid_len = usize::try_from(unsafe { GetLengthSid(sid) })
         .map_err(|_| ObservationError::Malformed { resource })?;
     if sid_len != encoded_sid_len
         || !(MIN_SID_BYTES..=MAX_SID_BYTES).contains(&sid_len)
@@ -519,6 +733,103 @@ fn process_user_sid(
         return Err(ObservationError::Malformed { resource });
     }
     Ok(buffer[sid_offset..sid_offset + sid_len].to_vec())
+}
+
+pub(crate) fn named_pipe_client_token(
+    pipe: HANDLE,
+) -> Result<WindowsTokenIdentity, ObservationError> {
+    let resource = ObservationResource::TargetUser;
+    let mut prior_token = ptr::null_mut();
+    // SAFETY: the current-thread pseudo-handle is always valid and the output
+    // pointer is writable. Authentication is restricted to a thread that is
+    // not already impersonating so `RevertToSelf` cannot destroy caller state.
+    if unsafe {
+        OpenThreadToken(
+            GetCurrentThread(),
+            TOKEN_QUERY,
+            1,
+            ptr::addr_of_mut!(prior_token),
+        )
+    } != 0
+    {
+        let _prior_token = OwnedHandle::regular(prior_token, resource)?;
+        return Err(ObservationError::Read {
+            resource,
+            kind: io::ErrorKind::PermissionDenied,
+        });
+    }
+    // SAFETY: `GetLastError` immediately follows the failed token query.
+    if unsafe { GetLastError() } != ERROR_NO_TOKEN {
+        return Err(last_read_error(resource));
+    }
+    // SAFETY: the caller supplies a connected server-side named-pipe handle.
+    // The function changes only this calling thread's impersonation token.
+    if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
+        return Err(last_read_error(resource));
+    }
+    let guard = ImpersonationGuard { active: true };
+    let result = (|| {
+        let mut token = ptr::null_mut();
+        // SAFETY: the current thread pseudo-handle is valid, `token` is
+        // writable, and OpenAsSelf limits the access check to TOKEN_QUERY.
+        if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, ptr::addr_of_mut!(token)) }
+            == 0
+        {
+            return Err(last_read_error(resource));
+        }
+        let token = OwnedHandle::regular(token, resource)?;
+        let facts = token_facts(&token, resource)?;
+        Ok(WindowsTokenIdentity {
+            user: OsUserIdentity::from_native_bytes(PlatformFamily::Windows, &facts.user_sid),
+            logon: crate::identity_digest(
+                b"gus.platform.windows-logon.v1",
+                PlatformFamily::Windows,
+                &facts.logon_sid,
+            ),
+            authentication_id: facts.authentication_id,
+            session_id: facts.session_id,
+        })
+    })();
+    guard.revert();
+    result
+}
+
+fn token_identity(facts: &ProcessFacts) -> WindowsTokenIdentity {
+    WindowsTokenIdentity {
+        user: OsUserIdentity::from_native_bytes(PlatformFamily::Windows, &facts.user_sid),
+        logon: crate::identity_digest(
+            b"gus.platform.windows-logon.v1",
+            PlatformFamily::Windows,
+            &facts.logon_sid,
+        ),
+        authentication_id: facts.authentication_id,
+        session_id: facts.session_id,
+    }
+}
+
+struct ImpersonationGuard {
+    active: bool,
+}
+
+impl ImpersonationGuard {
+    fn revert(mut self) {
+        // SAFETY: this thread is impersonating because its guard exists.
+        if unsafe { RevertToSelf() } == 0 {
+            std::process::abort();
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: this thread is impersonating while the guard is active.
+            if unsafe { RevertToSelf() } == 0 {
+                std::process::abort();
+            }
+        }
+    }
 }
 
 fn process_session_id(
@@ -547,6 +858,8 @@ fn validate_terminal_chain(
     if &first.facts != caller
         || chain.iter().any(|process| {
             process.facts.user_sid != caller.user_sid
+                || process.facts.logon_sid != caller.logon_sid
+                || process.facts.authentication_id != caller.authentication_id
                 || process.facts.session_id != caller.session_id
         })
         || !creation_order_is_valid(
@@ -874,6 +1187,8 @@ mod tests {
             pid: NonZeroU32::new(pid).expect("nonzero synthetic PID"),
             start_time: NonZeroU64::new(start_time).expect("nonzero synthetic start time"),
             user_sid: vec![user_sid],
+            logon_sid: vec![user_sid, 1],
+            authentication_id: u64::from(user_sid),
             session_id,
         };
         let first = TerminalEvidence {
@@ -898,6 +1213,8 @@ mod tests {
             value.chain_facts[0].start_time = NonZeroU64::new(401).expect("nonzero start time");
         });
         assert_changed(&first, |value| value.chain_facts[0].user_sid = vec![2]);
+        assert_changed(&first, |value| value.chain_facts[0].logon_sid = vec![2]);
+        assert_changed(&first, |value| value.chain_facts[0].authentication_id += 1);
         assert_changed(&first, |value| value.chain_facts[0].session_id = 8);
         assert_changed(&first, |value| {
             value.chain_facts[1].pid = NonZeroU32::new(31).expect("nonzero PID");
@@ -906,6 +1223,8 @@ mod tests {
             value.chain_facts[1].start_time = NonZeroU64::new(301).expect("nonzero start time");
         });
         assert_changed(&first, |value| value.chain_facts[1].user_sid = vec![2]);
+        assert_changed(&first, |value| value.chain_facts[1].logon_sid = vec![2]);
+        assert_changed(&first, |value| value.chain_facts[1].authentication_id += 1);
         assert_changed(&first, |value| value.chain_facts[1].session_id = 8);
         assert_changed(&first, |value| value.console.window_handle = 101);
         assert_changed(&first, |value| {
@@ -932,6 +1251,8 @@ mod tests {
             pid: NonZeroU32::new(40).expect("nonzero synthetic PID"),
             start_time: NonZeroU64::new(400).expect("nonzero synthetic start time"),
             user_sid: vec![1],
+            logon_sid: vec![1, 1],
+            authentication_id: 10,
             session_id: 7,
         };
         assert_eq!(require_stable_process_facts(&first, &first), Ok(()));
@@ -942,6 +1263,8 @@ mod tests {
             value.start_time = NonZeroU64::new(401).expect("nonzero synthetic start time");
         });
         assert_changed(&first, |value| value.user_sid = vec![2]);
+        assert_changed(&first, |value| value.logon_sid = vec![2]);
+        assert_changed(&first, |value| value.authentication_id = 11);
         assert_changed(&first, |value| value.session_id = 8);
     }
 
