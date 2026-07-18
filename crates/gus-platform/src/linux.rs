@@ -45,20 +45,20 @@ pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationEr
             let leader_status_path = format!("/proc/{}/status", caller_first.session_id);
             let leader_first = read_proc_stat(
                 Path::new(&leader_stat_path),
-                ObservationResource::SessionLeaderProcess,
+                ObservationResource::TerminalAnchorProcess,
             )?;
             let leader_uid_first = read_effective_uid(
                 Path::new(&leader_status_path),
-                ObservationResource::SessionLeaderUser,
+                ObservationResource::TerminalAnchorUser,
             )?;
-            let leader_second = read_proc_stat(
+            let leader_second = normalize_anchor_recheck(read_proc_stat(
                 Path::new(&leader_stat_path),
-                ObservationResource::SessionLeaderProcess,
-            )?;
-            let leader_uid_second = read_effective_uid(
+                ObservationResource::TerminalAnchorProcess,
+            ))?;
+            let leader_uid_second = normalize_anchor_recheck(read_effective_uid(
                 Path::new(&leader_status_path),
-                ObservationResource::SessionLeaderUser,
-            )?;
+                ObservationResource::TerminalAnchorUser,
+            ))?;
             Some((
                 device,
                 leader_first,
@@ -88,6 +88,17 @@ pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationEr
     )
 }
 
+fn normalize_anchor_recheck<T>(result: Result<T, ObservationError>) -> Result<T, ObservationError> {
+    match result {
+        Err(ObservationError::Read {
+            resource:
+                ObservationResource::TerminalAnchorProcess | ObservationResource::TerminalAnchorUser,
+            kind: std::io::ErrorKind::NotFound,
+        }) => Err(ObservationError::TerminalAnchorChanged),
+        other => other,
+    }
+}
+
 fn assemble_observation(
     boot: BootIdentity,
     caller_first: ProcStat,
@@ -106,14 +117,14 @@ fn assemble_observation(
     let terminal = match terminal {
         Some((device, leader_first, leader_uid_first, leader_second, leader_uid_second)) => {
             if leader_first != leader_second || leader_uid_first != leader_uid_second {
-                return Err(ObservationError::SessionLeaderChanged);
+                return Err(ObservationError::TerminalAnchorChanged);
             }
             if leader_first.pid != caller_first.session_id
                 || leader_first.session_id != caller_first.session_id
                 || leader_first.terminal_device != Some(device)
                 || leader_uid_first != caller_uid_first
             {
-                return Err(ObservationError::SessionLeaderBindingMismatch);
+                return Err(ObservationError::TerminalBindingMismatch);
             }
             let leader = ProcessIdentity::from_observation(
                 boot,
@@ -280,17 +291,17 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::File,
         os::{
             fd::{AsRawFd, FromRawFd, OwnedFd},
             unix::process::CommandExt,
         },
-        process::{Command, Stdio},
+        process::{Command, Output, Stdio},
     };
 
     use super::*;
 
     const NATIVE_PROBE_EXPECTATION: &str = "GUS_PLATFORM_NATIVE_PROBE_EXPECTATION";
+    const NATIVE_PROBE_MARKER: &str = "GUS_PLATFORM_NATIVE_PROBE_MARKER";
 
     fn stat(pid: u32, parent: u32, session: u32, tty: i32, start: u64) -> ProcStat {
         ProcStat {
@@ -355,14 +366,14 @@ mod tests {
             1000,
         )
         .expect("observation");
-        assert!(observation.has_controlling_terminal());
+        assert!(observation.has_terminal_session());
         assert_eq!(observation.caller().pid().get(), 42);
         assert_eq!(observation.parent_pid().expect("parent").get(), 7);
         assert_eq!(
             observation
-                .terminal()
+                .terminal_session()
                 .expect("terminal")
-                .session_leader()
+                .anchor_process()
                 .pid()
                 .get(),
             9
@@ -402,7 +413,7 @@ mod tests {
                     caller,
                     1000,
                 ),
-                Err(ObservationError::SessionLeaderBindingMismatch)
+                Err(ObservationError::TerminalBindingMismatch)
             );
         }
         assert_eq!(
@@ -420,7 +431,7 @@ mod tests {
                 caller,
                 1000,
             ),
-            Err(ObservationError::SessionLeaderChanged)
+            Err(ObservationError::TerminalAnchorChanged)
         );
     }
 
@@ -434,8 +445,8 @@ mod tests {
         let observation = assemble_observation(boot(), parsed, 1000, None, parsed, 1000)
             .expect("headless PID 1 observation");
         assert_eq!(observation.parent_pid(), None);
-        assert_eq!(observation.terminal(), None);
-        assert!(!observation.has_controlling_terminal());
+        assert_eq!(observation.terminal_session(), None);
+        assert!(!observation.has_terminal_session());
     }
 
     #[test]
@@ -450,25 +461,26 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "internal child process for native session smoke tests"]
     fn native_observation_child_probe() {
-        let Ok(expectation) = std::env::var(NATIVE_PROBE_EXPECTATION) else {
-            return;
-        };
+        let expectation = std::env::var(NATIVE_PROBE_EXPECTATION).expect("probe expectation");
+        let marker = std::env::var_os(NATIVE_PROBE_MARKER).expect("probe marker");
         let observation = crate::CurrentSessionObserver::new()
             .observe()
             .expect("child native observation");
-        assert_eq!(observation.has_controlling_terminal(), expectation == "tty");
+        assert_eq!(observation.has_terminal_session(), expectation == "tty");
+        std::fs::write(marker, b"observed").expect("write probe marker");
     }
 
     #[test]
     fn native_observation_distinguishes_detached_and_pty_sessions() {
         let executable = std::env::current_exe().expect("current test executable");
+        let directory = tempfile::tempdir().expect("probe marker directory");
+        let detached_marker = directory.path().join("detached.marker");
+        let attached_marker = directory.path().join("attached.marker");
 
-        let mut detached = native_probe_command(&executable, "headless");
-        detached
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        let mut detached = native_probe_command(&executable, "headless", &detached_marker);
+        detached.stdin(Stdio::null());
         // SAFETY: the callback invokes only async-signal-safe `setsid` and
         // constructs an `io::Error` if it fails. It does not allocate on the
         // success path between fork and exec.
@@ -480,20 +492,13 @@ mod tests {
                 Ok(())
             });
         }
-        assert!(detached.status().expect("detached probe status").success());
+        let detached_output = detached.output().expect("detached probe output");
+        assert_native_probe(&detached_output, &detached_marker, "detached");
 
         let (master, slave) = open_pty().expect("open PTY");
         let slave_fd = slave.as_raw_fd();
-        let slave_file = File::from(slave);
-        let mut attached = native_probe_command(&executable, "tty");
-        attached
-            .stdin(Stdio::from(
-                slave_file.try_clone().expect("clone PTY stdin"),
-            ))
-            .stdout(Stdio::from(
-                slave_file.try_clone().expect("clone PTY stdout"),
-            ))
-            .stderr(Stdio::from(slave_file));
+        let mut attached = native_probe_command(&executable, "tty", &attached_marker);
+        attached.stdin(Stdio::null());
         // SAFETY: `slave_fd` is an inherited descriptor returned by `openpty`.
         // `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe system calls;
         // no non-signal-safe work occurs on their success paths.
@@ -508,18 +513,40 @@ mod tests {
                 Ok(())
             });
         }
-        assert!(attached.status().expect("PTY probe status").success());
+        let attached_output = attached.output().expect("PTY probe output");
+        assert_native_probe(&attached_output, &attached_marker, "PTY");
         drop(master);
+        drop(slave);
     }
 
-    fn native_probe_command(executable: &Path, expectation: &str) -> Command {
+    fn native_probe_command(executable: &Path, expectation: &str, marker: &Path) -> Command {
         let mut command = Command::new(executable);
         command
             .arg("--exact")
             .arg("linux::tests::native_observation_child_probe")
-            .arg("--nocapture")
-            .env(NATIVE_PROBE_EXPECTATION, expectation);
+            .arg("--ignored")
+            .env(NATIVE_PROBE_EXPECTATION, expectation)
+            .env(NATIVE_PROBE_MARKER, marker);
         command
+    }
+
+    fn assert_native_probe(output: &Output, marker: &Path, label: &str) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{label} native probe failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        let marker_contents = std::fs::read(marker).unwrap_or_else(|error| {
+            panic!(
+                "{label} native probe did not create its marker: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )
+        });
+        assert_eq!(
+            marker_contents, b"observed",
+            "{label} native probe did not execute its exact child test\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
     }
 
     fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd)> {
@@ -544,7 +571,23 @@ mod tests {
         // SAFETY: ownership of the distinct slave descriptor is transferred
         // exactly once.
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        set_close_on_exec(master.as_raw_fd())?;
+        set_close_on_exec(slave.as_raw_fd())?;
         Ok((master, slave))
+    }
+
+    fn set_close_on_exec(descriptor: std::os::fd::RawFd) -> std::io::Result<()> {
+        // SAFETY: `descriptor` is a live descriptor owned by the caller.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if flags == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: F_SETFD updates flags on the same live descriptor and does
+        // not take ownership of it.
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     #[test]
@@ -560,7 +603,33 @@ mod tests {
                 caller,
                 1000,
             ),
-            Err(ObservationError::SessionLeaderChanged)
+            Err(ObservationError::TerminalAnchorChanged)
+        );
+    }
+
+    #[test]
+    fn vanished_anchor_recheck_is_classified_as_a_changed_anchor() {
+        for resource in [
+            ObservationResource::TerminalAnchorProcess,
+            ObservationResource::TerminalAnchorUser,
+        ] {
+            assert_eq!(
+                normalize_anchor_recheck::<()>(Err(ObservationError::Read {
+                    resource,
+                    kind: std::io::ErrorKind::NotFound,
+                })),
+                Err(ObservationError::TerminalAnchorChanged)
+            );
+        }
+        assert_eq!(
+            normalize_anchor_recheck::<()>(Err(ObservationError::Read {
+                resource: ObservationResource::TerminalAnchorProcess,
+                kind: std::io::ErrorKind::PermissionDenied,
+            })),
+            Err(ObservationError::Read {
+                resource: ObservationResource::TerminalAnchorProcess,
+                kind: std::io::ErrorKind::PermissionDenied,
+            })
         );
     }
 
@@ -578,9 +647,9 @@ mod tests {
 
         let missing = directory.path().join("missing");
         assert_eq!(
-            read_bounded(&missing, 4, ObservationResource::SessionLeaderUser),
+            read_bounded(&missing, 4, ObservationResource::TerminalAnchorUser),
             Err(ObservationError::Read {
-                resource: ObservationResource::SessionLeaderUser,
+                resource: ObservationResource::TerminalAnchorUser,
                 kind: std::io::ErrorKind::NotFound,
             })
         );

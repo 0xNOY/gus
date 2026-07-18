@@ -163,11 +163,11 @@ impl fmt::Debug for TerminalIdentity {
     }
 }
 
-/// A controlling-terminal session anchored to its live session leader.
+/// A terminal or console session anchored to its live native root process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TerminalSessionIdentity {
     terminal: TerminalIdentity,
-    session_leader: ProcessIdentity,
+    anchor_process: ProcessIdentity,
 }
 
 impl TerminalSessionIdentity {
@@ -177,14 +177,14 @@ impl TerminalSessionIdentity {
     }
 
     #[must_use]
-    pub const fn session_leader(self) -> ProcessIdentity {
-        self.session_leader
+    pub const fn anchor_process(self) -> ProcessIdentity {
+        self.anchor_process
     }
 
-    const fn from_observation(terminal: TerminalIdentity, session_leader: ProcessIdentity) -> Self {
+    const fn from_observation(terminal: TerminalIdentity, anchor_process: ProcessIdentity) -> Self {
         Self {
             terminal,
-            session_leader,
+            anchor_process,
         }
     }
 }
@@ -209,12 +209,12 @@ impl LocalSessionObservation {
     }
 
     #[must_use]
-    pub const fn terminal(self) -> Option<TerminalSessionIdentity> {
+    pub const fn terminal_session(self) -> Option<TerminalSessionIdentity> {
         self.terminal
     }
 
     #[must_use]
-    pub const fn has_controlling_terminal(self) -> bool {
+    pub const fn has_terminal_session(self) -> bool {
         self.terminal.is_some()
     }
 
@@ -241,13 +241,13 @@ impl CurrentSessionObserver {
         Self
     }
 
-    /// Observes the current process and its controlling-terminal anchor.
+    /// Observes the current process and its native terminal-session anchor.
     ///
     /// # Errors
     ///
     /// Fails closed if the backend is unavailable, kernel data is malformed,
-    /// the process changes during observation, or a terminal session leader
-    /// cannot be bound to the same user and terminal.
+    /// the process changes during observation, or a terminal anchor cannot be
+    /// bound to the same user and terminal session.
     pub fn observe(self) -> Result<LocalSessionObservation, ObservationError> {
         #[cfg(target_os = "linux")]
         {
@@ -267,8 +267,8 @@ pub enum ObservationResource {
     BootIdentity,
     CallerProcess,
     CallerUser,
-    SessionLeaderProcess,
-    SessionLeaderUser,
+    TerminalAnchorProcess,
+    TerminalAnchorUser,
 }
 
 impl fmt::Display for ObservationResource {
@@ -277,8 +277,8 @@ impl fmt::Display for ObservationResource {
             Self::BootIdentity => "boot identity",
             Self::CallerProcess => "caller process",
             Self::CallerUser => "caller user",
-            Self::SessionLeaderProcess => "session leader process",
-            Self::SessionLeaderUser => "session leader user",
+            Self::TerminalAnchorProcess => "terminal anchor process",
+            Self::TerminalAnchorUser => "terminal anchor user",
         };
         formatter.write_str(name)
     }
@@ -300,10 +300,10 @@ pub enum ObservationError {
     Malformed { resource: ObservationResource },
     #[error("caller process changed during observation")]
     ProcessChanged,
-    #[error("session leader changed during observation")]
-    SessionLeaderChanged,
-    #[error("controlling terminal is not bound to the observed user and session leader")]
-    SessionLeaderBindingMismatch,
+    #[error("terminal anchor changed during observation")]
+    TerminalAnchorChanged,
+    #[error("terminal is not bound to the observed user and anchor process")]
+    TerminalBindingMismatch,
 }
 
 fn identity_digest(
