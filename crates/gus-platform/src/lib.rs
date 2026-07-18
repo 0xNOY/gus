@@ -5,15 +5,31 @@
 //! arguments. Their constructors are deliberately private. The identities are
 //! suitable for equality and hashing, but they do not make processes sharing
 //! one OS user into mutually distrustful security principals.
+//! FreeBSD observations are scoped to one prison: the kernel reports the
+//! observer's current prison as JID zero, so brokers, sockets, and stored
+//! session authority must never be shared across prison boundaries.
 
 use std::{fmt, num::NonZeroU32, num::NonZeroU64};
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+mod bsd;
+#[cfg(any(target_os = "macos", target_os = "freebsd", test))]
+mod bsd_model;
+#[cfg(target_os = "freebsd")]
+mod freebsd;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(any(target_os = "windows", test))]
@@ -32,7 +48,8 @@ pub enum PlatformFamily {
     Other,
 }
 
-/// Opaque identity for one local OS user.
+/// Opaque identity for one local OS user in this observer's native isolation
+/// boundary.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OsUserIdentity {
     family: PlatformFamily,
@@ -45,7 +62,13 @@ impl OsUserIdentity {
         self.family
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
         Self {
             family,
@@ -66,7 +89,7 @@ impl fmt::Debug for OsUserIdentity {
 
 /// Opaque identity for the native time domain of a process start value.
 ///
-/// Linux uses the host boot ID because `/proc` reports ticks since boot.
+/// Linux and FreeBSD bind a host boot ID to boot-relative process time.
 /// Platforms whose process creation time has an absolute epoch bind that epoch
 /// instead. Consumers compare this value together with `start_time` and never
 /// interpret either field in isolation.
@@ -74,7 +97,13 @@ impl fmt::Debug for OsUserIdentity {
 pub struct ProcessTimeDomainIdentity([u8; IDENTITY_DIGEST_BYTES]);
 
 impl ProcessTimeDomainIdentity {
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
         Self(identity_digest(
             b"gus.platform.process-time-domain.v1",
@@ -120,7 +149,13 @@ impl ProcessIdentity {
         self.time_domain
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     const fn from_observation(
         time_domain: ProcessTimeDomainIdentity,
         pid: NonZeroU32,
@@ -161,7 +196,13 @@ impl TerminalIdentity {
         self.family
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
         Self {
             family,
@@ -198,7 +239,13 @@ impl TerminalSessionIdentity {
         self.anchor_process
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     const fn from_observation(terminal: TerminalIdentity, anchor_process: ProcessIdentity) -> Self {
         Self {
             terminal,
@@ -236,7 +283,13 @@ impl LocalSessionObservation {
         self.terminal.is_some()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     const fn from_observation(
         caller: ProcessIdentity,
         parent_pid: Option<NonZeroU32>,
@@ -276,7 +329,20 @@ impl CurrentSessionObserver {
         {
             windows::observe_current()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(target_os = "macos")]
+        {
+            macos::observe_current()
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            freebsd::observe_current()
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "windows"
+        )))]
         {
             Err(ObservationError::UnsupportedPlatform)
         }
@@ -333,7 +399,13 @@ pub enum ObservationError {
     TerminalBindingMismatch,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows",
+    test
+))]
 fn identity_digest(
     domain: &[u8],
     family: PlatformFamily,

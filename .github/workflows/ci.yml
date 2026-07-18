@@ -113,5 +113,42 @@ jobs:
         run: cargo +stable doc --workspace --all-features --no-deps
 
       - name: Exercise managed native session probes
-        if: runner.os != 'macOS'
         run: cargo +stable test -p gus-platform --all-targets --all-features -- --include-ignored
+
+  freebsd-cross:
+    name: FreeBSD ABI ${{ matrix.abi }} cross-check
+    strategy:
+      fail-fast: false
+      matrix:
+        abi:
+          - "12"
+          - "14"
+          - "15"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUST_LIBC_UNSTABLE_FREEBSD_VERSION: ${{ matrix.abi }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          components: clippy
+          targets: x86_64-unknown-freebsd
+
+      - name: Install MSRV Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+          targets: x86_64-unknown-freebsd
+
+      - name: Lint FreeBSD target
+        run: cargo +stable clippy --target x86_64-unknown-freebsd -p gus-platform --all-targets --all-features -- -D warnings
+
+      - name: Check FreeBSD target MSRV
+        run: cargo +1.85.0 check --target x86_64-unknown-freebsd -p gus-platform --all-targets --all-features
