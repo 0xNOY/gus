@@ -134,6 +134,7 @@ dependencies = [
 name = "gus-platform"
 version = "0.2.0"
 dependencies = [
+ "getrandom",
  "libc",
  "sha2",
  "tempfile",

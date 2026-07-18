@@ -32,6 +32,8 @@ mod linux;
 mod macos;
 #[cfg(target_os = "linux")]
 mod peer_linux;
+#[cfg(target_os = "macos")]
+mod peer_macos;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(any(target_os = "windows", test))]
@@ -39,6 +41,8 @@ mod windows_model;
 
 #[cfg(target_os = "linux")]
 pub use peer_linux::{AuthenticatedUnixStream, PeerAuthenticationError};
+#[cfg(target_os = "macos")]
+pub use peer_macos::{AuthenticatedUnixStream, PeerAuthenticationError};
 
 const IDENTITY_DIGEST_BYTES: usize = 32;
 
@@ -360,8 +364,8 @@ impl CurrentSessionObserver {
 /// process start time, OS user, and platform time domain so a recycled PID does
 /// not compare equal to the original process. This observer does **not** prove
 /// that a PID came from a particular socket or pipe; IPC authority must be
-/// created by a platform transport which atomically binds its peer credentials
-/// and process-liveness handle before decoding a frame.
+/// created by a platform transport which binds kernel peer credentials to a
+/// process-liveness handle or challenge proof before decoding a frame.
 #[derive(Debug, Clone, Copy)]
 pub struct NativeProcessObserver {
     pid: NonZeroU32,

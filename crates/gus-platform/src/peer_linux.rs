@@ -29,7 +29,28 @@ pub struct AuthenticatedUnixStream {
 }
 
 impl AuthenticatedUnixStream {
-    /// Authenticates an already-accepted Unix stream.
+    /// Authenticates a broker-side accepted stream.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::authenticate`].
+    pub fn authenticate_incoming(stream: UnixStream) -> Result<Self, PeerAuthenticationError> {
+        Self::authenticate(stream)
+    }
+
+    /// Authenticates a connector-side stream.
+    ///
+    /// Linux kernel peer credentials are symmetric, so this performs the same
+    /// checks as the incoming path without transferring handshake bytes.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::authenticate`].
+    pub fn authenticate_outgoing(stream: UnixStream) -> Result<Self, PeerAuthenticationError> {
+        Self::authenticate(stream)
+    }
+
+    /// Authenticates a connected Unix stream using symmetric kernel evidence.
     ///
     /// `SO_PEERPIDFD` retains a handle to the original socket peer while the
     /// numeric PID is observed. `SO_PEERCRED` and the process observer must

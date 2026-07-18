@@ -3,6 +3,7 @@ use std::{
     mem::MaybeUninit,
     num::NonZeroU32,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
@@ -131,17 +132,28 @@ fn normalize_process_recheck<T>(
     }
 }
 
-struct ProcessExitMonitor {
+pub(crate) struct ProcessExitMonitor {
     queue: OwnedFd,
     resource: ObservationResource,
     changed: ObservationError,
+    notifications: u32,
+    revoked: AtomicBool,
 }
 
 impl ProcessExitMonitor {
-    fn new(
+    pub(crate) fn new(
         pid: NonZeroU32,
         resource: ObservationResource,
         changed: ObservationError,
+    ) -> Result<Self, ObservationError> {
+        Self::new_with_notifications(pid, resource, changed, libc::NOTE_EXIT)
+    }
+
+    pub(crate) fn new_with_notifications(
+        pid: NonZeroU32,
+        resource: ObservationResource,
+        changed: ObservationError,
+        notifications: u32,
     ) -> Result<Self, ObservationError> {
         // SAFETY: `kqueue` has no arguments and returns a new descriptor.
         let raw = unsafe { libc::kqueue() };
@@ -155,14 +167,21 @@ impl ProcessExitMonitor {
             queue,
             resource,
             changed,
+            notifications,
+            revoked: AtomicBool::new(false),
         };
-        let change = process_event(pid, libc::EV_ADD | libc::EV_ENABLE, libc::NOTE_EXIT);
+        let change = process_event(pid, libc::EV_ADD | libc::EV_ENABLE, notifications);
         monitor.poll(Some(&change))?;
         Ok(monitor)
     }
 
-    fn ensure_live(&self) -> Result<(), ObservationError> {
-        self.poll(None)
+    pub(crate) fn ensure_live(&self) -> Result<(), ObservationError> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(self.changed);
+        }
+        self.poll(None).inspect_err(|_| {
+            self.revoked.store(true, Ordering::Release);
+        })
     }
 
     fn poll(&self, change: Option<&libc::kevent>) -> Result<(), ObservationError> {
@@ -206,7 +225,8 @@ impl ProcessExitMonitor {
                 kind: io::Error::from_raw_os_error(i32::try_from(data).unwrap_or(i32::MAX)).kind(),
             });
         }
-        if event_filter(&event) == libc::EVFILT_PROC && event_fflags(&event) & libc::NOTE_EXIT != 0
+        if event_filter(&event) == libc::EVFILT_PROC
+            && event_fflags(&event) & self.notifications != 0
         {
             return Err(self.changed);
         }
