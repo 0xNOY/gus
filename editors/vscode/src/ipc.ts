@@ -242,6 +242,11 @@ export type ProviderResponseFrame = WireFrame<
   BrokerProviderMessage
 >;
 
+declare const encodableProviderRequestBrand: unique symbol;
+export type EncodableProviderRequestFrame = ProviderRequestFrame & {
+  readonly [encodableProviderRequestBrand]: true;
+};
+
 type JsonObject = Record<string, unknown>;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -380,7 +385,8 @@ function isPresentationText(value: unknown, minimumCharacters = 1): value is str
   ) {
     return false;
   }
-  return !/[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f-\u1160\u17b4-\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\u{1bca0}-\u{1bca3}\u{1d173}-\u{1d17a}\u{e0000}-\u{e0fff}]/u.test(value);
+  // Unicode 17.0 Default_Ignorable_Code_Point plus every assigned Cf.
+  return !/[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2\u115f-\u1160\u17b4-\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb\u{110bd}\u{110cd}\u{13430}-\u{1343f}\u{1bca0}-\u{1bca3}\u{1d173}-\u{1d17a}\u{e0000}-\u{e0fff}]/u.test(value);
 }
 
 function isUniqueArray<T>(
@@ -1093,8 +1099,18 @@ function decodeRecord<F extends MessageFamily, M>(
   const parsed = parseStrictJson(textDecoder.decode(record.subarray(FRAME_HEADER_BYTES)));
   if (
     !isObject(parsed) ||
+    !Object.hasOwn(parsed, "protocol_version") ||
+    !Number.isInteger(parsed.protocol_version) ||
+    Number(parsed.protocol_version) < 0 ||
+    Number(parsed.protocol_version) > 65_535
+  ) {
+    throw new Error("invalid GUS IPC protocol version");
+  }
+  if (parsed.protocol_version !== PROTOCOL_VERSION) {
+    throw new Error(`unsupported GUS IPC protocol version ${String(parsed.protocol_version)}`);
+  }
+  if (
     !hasExactKeys(parsed, ["protocol_version", "message_family", "request_id", "message"]) ||
-    parsed.protocol_version !== PROTOCOL_VERSION ||
     parsed.message_family !== expectedFamily ||
     !isRequestId(parsed.request_id) ||
     !messageGuard(parsed.message)
@@ -1162,7 +1178,26 @@ function cloneCanonicalJson(value: unknown, depth = 0): unknown {
   return copy;
 }
 
-export function encodeFrame(
+function deepFreezeJson<T>(value: T): T {
+  if (typeof value === "object" && value !== null) {
+    for (const entry of Object.values(value)) deepFreezeJson(entry);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+const authorizedProviderRequests = new WeakSet<object>();
+
+function authorizeProviderRequest(frame: ProviderRequestFrame): EncodableProviderRequestFrame {
+  const canonical = cloneCanonicalJson(frame);
+  if (!isObject(canonical)) throw new Error("cannot authorize invalid provider request");
+  encodeFrame(canonical as unknown as ProviderRequestFrame);
+  const authorized = deepFreezeJson(canonical) as unknown as EncodableProviderRequestFrame;
+  authorizedProviderRequests.add(authorized);
+  return authorized;
+}
+
+function encodeFrame(
   frame:
     | ShimRequestFrame
     | ShimResponseFrame
@@ -1205,27 +1240,34 @@ export function encodeFrame(
   return record;
 }
 
-export function newRequestId(): RequestId {
+function newRequestId(): RequestId {
   return randomUUID();
+}
+
+export function encodeProviderRequest(frame: EncodableProviderRequestFrame): Uint8Array {
+  if (!authorizedProviderRequests.has(frame)) {
+    throw new Error("provider request was not created by a GUS role factory");
+  }
+  return encodeFrame(frame);
 }
 
 export function createProviderRegistrationFrame(
   registration: ProviderRegistrationRequest,
-): ProviderRequestFrame {
+): EncodableProviderRequestFrame {
   if (!isProviderRegistration(registration)) {
     throw new Error("cannot create invalid provider registration");
   }
-  return {
+  return authorizeProviderRequest({
     protocol_version: PROTOCOL_VERSION,
     message_family: "provider_request",
     request_id: newRequestId(),
     message: { type: "register", body: registration },
-  };
+  });
 }
 
 export function createProviderControlFrame(
   message: ProviderControlMessage,
-): ProviderRequestFrame {
+): EncodableProviderRequestFrame {
   const candidate: unknown = message;
   if (
     !isProviderRequest(candidate) ||
@@ -1234,18 +1276,18 @@ export function createProviderControlFrame(
   ) {
     throw new Error("cannot create invalid provider control command");
   }
-  return {
+  return authorizeProviderRequest({
     protocol_version: PROTOCOL_VERSION,
     message_family: "provider_request",
     request_id: newRequestId(),
     message,
-  };
+  });
 }
 
 export function createProviderSelectionResponseFrame(
   promptFrame: ProviderResponseFrame,
   decision: ProviderDecision,
-): ProviderRequestFrame {
+): EncodableProviderRequestFrame {
   if (
     promptFrame.protocol_version !== PROTOCOL_VERSION ||
     promptFrame.message_family !== "provider_response" ||
@@ -1257,7 +1299,7 @@ export function createProviderSelectionResponseFrame(
     throw new Error("selection response requires a valid broker prompt");
   }
   const prompt = promptFrame.message.body;
-  return {
+  return authorizeProviderRequest({
     protocol_version: PROTOCOL_VERSION,
     message_family: "provider_request",
     request_id: promptFrame.request_id,
@@ -1270,5 +1312,5 @@ export function createProviderSelectionResponseFrame(
         decision,
       },
     },
-  };
+  });
 }

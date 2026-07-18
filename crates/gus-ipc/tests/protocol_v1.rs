@@ -78,9 +78,15 @@ fn provider_correlation(
         capabilities,
     )
     .expect("registration");
+    let registration_frame =
+        ProviderRequestFrame::registration(registration).expect("registration frame");
     let accepted = RegistrationAccepted::new(registration_id, provider_generation, 15_000)
         .expect("accepted registration");
-    ProviderCorrelation::from_registration(&registration, &accepted)
+    let response_frame =
+        ProviderResponseFrame::registration_response(registration_frame.request_id(), accepted)
+            .expect("registration response frame");
+    ProviderCorrelation::from_registration(&registration_frame, &response_frame)
+        .expect("correlated registration")
 }
 
 fn prompt(
@@ -259,6 +265,34 @@ fn request_ids_and_generations_have_cross_language_safe_canonical_forms() {
     assert_eq!(
         serde_json::to_string(&ProviderKind::JetBrains).expect("provider serializes"),
         "\"jet_brains\""
+    );
+}
+
+#[test]
+fn provider_control_factory_rejects_registration_and_selection_roles() {
+    let registration = ProviderRegistrationRequest::new(
+        ProviderKind::Vscode,
+        "test-editor-session".into(),
+        digest(1),
+        Vec::new(),
+        vec![ProviderCapability::ProfileQuickPick],
+    )
+    .expect("registration");
+    assert_eq!(
+        ProviderRequestFrame::control(ProviderRequest::Register(registration)),
+        Err(gus_ipc::ProtocolError::InvalidMessageRole)
+    );
+
+    let decision = ProviderSelectionDecision::new(
+        request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac"),
+        generation(1),
+        generation(1),
+        ProviderDecision::Cancelled,
+    )
+    .expect("decision");
+    assert_eq!(
+        ProviderRequestFrame::control(ProviderRequest::SelectionDecision(decision)),
+        Err(gus_ipc::ProtocolError::InvalidMessageRole)
     );
 }
 
@@ -509,6 +543,35 @@ fn provider_correlation_consumes_one_exact_prompt_and_rejects_replay() {
 }
 
 #[test]
+fn provider_registration_state_requires_the_exact_response_id() {
+    let registration = ProviderRegistrationRequest::new(
+        ProviderKind::Vscode,
+        "test-editor-session".into(),
+        digest(1),
+        vec![digest(2)],
+        vec![ProviderCapability::ProfileQuickPick],
+    )
+    .expect("registration");
+    let request_frame =
+        ProviderRequestFrame::registration(registration).expect("registration frame");
+    let accepted = RegistrationAccepted::new(
+        request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac"),
+        generation(3),
+        15_000,
+    )
+    .expect("accepted registration");
+    let mismatched_response = ProviderResponseFrame::registration_response(
+        request_id("cfac2219-d065-4602-a26a-26b5bfa33c51"),
+        accepted,
+    )
+    .expect("mismatched response");
+    assert!(matches!(
+        ProviderCorrelation::from_registration(&request_frame, &mismatched_response),
+        Err(ProviderCorrelationError::RegistrationResponseMismatch)
+    ));
+}
+
+#[test]
 fn provider_membership_change_revokes_prompts_and_unoffered_profiles() {
     let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
     let provider_generation = generation(3);
@@ -642,6 +705,138 @@ fn provider_prompt_lifecycle_releases_timeout_failure_and_disconnect_waiters() {
 }
 
 #[test]
+fn provider_unregister_consumes_state_and_returns_every_waiter() {
+    let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
+    let provider_generation = generation(3);
+    let now = Instant::now();
+    let mut correlation = provider_correlation(
+        registration_id,
+        provider_generation,
+        vec![digest(0x33)],
+        vec![ProviderCapability::ProfileQuickPick],
+    );
+    let prompt_frame = ProviderResponseFrame::selection_prompt(prompt(
+        registration_id,
+        provider_generation,
+        generation(1),
+    ))
+    .expect("prompt frame");
+    correlation
+        .track_prompt(&prompt_frame, now)
+        .expect("tracked prompt");
+    let unregister = ProviderRequestFrame::control(ProviderRequest::Unregister(
+        ProviderControlRequest::new(registration_id, provider_generation),
+    ))
+    .expect("unregister frame");
+    assert_eq!(
+        correlation.validate_control(&unregister),
+        Err(ProviderCorrelationError::UnexpectedMessageRole)
+    );
+    assert_eq!(
+        correlation
+            .accept_unregister(&unregister)
+            .expect("accepted unregister"),
+        vec![prompt_frame.request_id()]
+    );
+}
+
+#[test]
+fn provider_cancel_and_unavailable_each_consume_one_live_prompt() {
+    let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
+    let provider_generation = generation(3);
+    let now = Instant::now();
+    let mut correlation = provider_correlation(
+        registration_id,
+        provider_generation,
+        vec![digest(0x33)],
+        vec![ProviderCapability::ProfileQuickPick],
+    );
+    for (index, decision) in [ProviderDecision::Cancelled, ProviderDecision::Unavailable]
+        .into_iter()
+        .enumerate()
+    {
+        let selection_generation = generation(u64::try_from(index + 1).expect("small index"));
+        let prompt_frame = ProviderResponseFrame::selection_prompt(prompt(
+            registration_id,
+            provider_generation,
+            selection_generation,
+        ))
+        .expect("prompt frame");
+        correlation
+            .track_prompt(&prompt_frame, now)
+            .expect("tracked prompt");
+        let response = ProviderSelectionDecision::new(
+            registration_id,
+            provider_generation,
+            selection_generation,
+            decision.clone(),
+        )
+        .expect("selection response");
+        let response_frame =
+            ProviderRequestFrame::selection_response(prompt_frame.request_id(), response)
+                .expect("response frame");
+        assert_eq!(
+            correlation
+                .accept_selection(&response_frame, now)
+                .expect("accepted decision"),
+            &decision
+        );
+        assert_eq!(
+            correlation.accept_selection(&response_frame, now),
+            Err(ProviderCorrelationError::UnknownPrompt)
+        );
+    }
+}
+
+#[test]
+fn provider_prompt_capacity_recovers_all_expired_waiters() {
+    let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
+    let provider_generation = generation(3);
+    let now = Instant::now();
+    let mut correlation = provider_correlation(
+        registration_id,
+        provider_generation,
+        vec![digest(0x33)],
+        vec![ProviderCapability::ProfileQuickPick],
+    );
+    let mut prompt_ids = Vec::new();
+    for _ in 0..32 {
+        let frame = ProviderResponseFrame::selection_prompt(prompt(
+            registration_id,
+            provider_generation,
+            generation(1),
+        ))
+        .expect("bounded prompt");
+        correlation
+            .track_prompt(&frame, now)
+            .expect("within capacity");
+        prompt_ids.push(frame.request_id());
+    }
+    let overflow = ProviderResponseFrame::selection_prompt(prompt(
+        registration_id,
+        provider_generation,
+        generation(1),
+    ))
+    .expect("overflow prompt");
+    assert_eq!(
+        correlation.track_prompt(&overflow, now),
+        Err(ProviderCorrelationError::PromptCapacity)
+    );
+    prompt_ids.sort_unstable();
+    assert_eq!(
+        correlation.expire_prompts(now + Duration::from_secs(30)),
+        prompt_ids
+    );
+    assert_eq!(correlation.outstanding_prompt_count(), 0);
+    assert!(
+        correlation
+            .track_prompt(&overflow, now + Duration::from_secs(30))
+            .expect("capacity recovered")
+            .is_empty()
+    );
+}
+
+#[test]
 fn provider_capabilities_and_repository_membership_are_enforced() {
     let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
     let provider_generation = generation(3);
@@ -770,23 +965,44 @@ fn decoded_values_are_readable_without_reserializing_and_debug_is_redacted() {
 
 #[test]
 fn presentation_text_rejects_line_break_and_default_ignorable_spoofing() {
-    for forbidden in ['\u{00ad}', '\u{180e}', '\u{2028}', '\u{2029}'] {
-        let display_name = format!("Work{forbidden}Profile");
-        assert_eq!(
-            ProfilePresentation::new(profile_id("work"), display_name, None),
-            Err(gus_ipc::ProtocolError::InvalidField {
-                field: "profile.display_name"
-            })
-        );
+    let policy: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "fixtures/presentation-forbidden-unicode17.json"
+    ))
+    .expect("valid Unicode presentation policy");
+    assert_eq!(policy["unicode_version"], "17.0.0");
+    let ranges = policy["ranges"].as_array().expect("policy ranges");
+    assert_eq!(ranges.len(), 27);
+    let mut tested_code_points = 0;
+    for range in ranges {
+        let start = u32::from_str_radix(range["start"].as_str().expect("range start"), 16)
+            .expect("hex start");
+        let end =
+            u32::from_str_radix(range["end"].as_str().expect("range end"), 16).expect("hex end");
+        for code_point in start..=end {
+            tested_code_points += 1;
+            let forbidden = char::from_u32(code_point).expect("Unicode scalar range");
+            let display_name = format!("Work{forbidden}Profile");
+            assert!(
+                ProfilePresentation::new(profile_id("work"), display_name, None).is_err(),
+                "accepted forbidden presentation character U+{code_point:04X}"
+            );
+        }
     }
+    assert_eq!(tested_code_points, 4_273);
 }
 
 #[test]
 fn unsupported_version_is_reported_before_decoding_its_message_schema() {
-    let future = br#"{"protocol_version":2,"message_family":"shim_request","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"future_v2","body":{"unknown":true}}}"#;
+    let future = br#"{"protocol_version":2,"message_family":"future_event","request_id":{"future":"id"},"message":{"type":"future_v2","body":{"unknown":true}},"future_envelope_field":true}"#;
     assert_eq!(
         decode_shim_request(&record(future)),
         Err(gus_ipc::ProtocolError::UnsupportedVersion { received: 2 })
+    );
+
+    let duplicate_version = br#"{"protocol_version":2,"protocol_version":3,"future":true}"#;
+    assert_eq!(
+        decode_shim_request(&record(duplicate_version)),
+        Err(gus_ipc::ProtocolError::InvalidJson)
     );
 }
 

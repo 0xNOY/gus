@@ -9,8 +9,7 @@ use thiserror::Error;
 
 use crate::{
     BrokerProviderMessage, Digest32, Generation, ProviderCapability, ProviderDecision,
-    ProviderRegistrationRequest, ProviderRequest, ProviderRequestFrame, ProviderResponseFrame,
-    RegistrationAccepted, RequestId,
+    ProviderRequest, ProviderRequestFrame, ProviderResponseFrame, RequestId,
 };
 
 const MAX_OUTSTANDING_PROMPTS: usize = 32;
@@ -39,25 +38,37 @@ struct OutstandingPrompt {
 }
 
 impl ProviderCorrelation {
-    /// Creates state bound to one successfully accepted registration.
-    #[must_use]
+    /// Creates state bound to one successfully accepted registration exchange.
+    ///
+    /// # Errors
+    ///
+    /// Rejects wrong message roles and registration responses whose request ID
+    /// does not echo the registration command ID.
     pub fn from_registration(
-        registration: &ProviderRegistrationRequest,
-        accepted: &RegistrationAccepted,
-    ) -> Self {
-        Self {
+        request_frame: &ProviderRequestFrame,
+        response_frame: &ProviderResponseFrame,
+    ) -> Result<Self, ProviderCorrelationError> {
+        let ProviderRequest::Register(registration) = request_frame.message() else {
+            return Err(ProviderCorrelationError::UnexpectedMessageRole);
+        };
+        let BrokerProviderMessage::Registered(accepted) = response_frame.message() else {
+            return Err(ProviderCorrelationError::UnexpectedMessageRole);
+        };
+        if request_frame.request_id() != response_frame.request_id() {
+            return Err(ProviderCorrelationError::RegistrationResponseMismatch);
+        }
+        Ok(Self {
             registration_id: accepted.registration_id(),
             provider_generation: accepted.provider_generation(),
             capabilities: registration.capabilities().to_vec(),
             repositories: registration.repositories().iter().copied().collect(),
             outstanding_prompts: BTreeMap::new(),
             membership_generation: None,
-        }
+        })
     }
 
-    /// Validates a provider-originated heartbeat, status subscription,
-    /// or unregister command against this connection and its negotiated
-    /// capabilities.
+    /// Validates a provider-originated heartbeat or status subscription against
+    /// this connection and its negotiated capabilities.
     ///
     /// # Errors
     ///
@@ -68,7 +79,7 @@ impl ProviderCorrelation {
         frame: &ProviderRequestFrame,
     ) -> Result<(), ProviderCorrelationError> {
         let (registration_id, provider_generation) = match frame.message() {
-            ProviderRequest::Heartbeat(request) | ProviderRequest::Unregister(request) => {
+            ProviderRequest::Heartbeat(request) => {
                 (request.registration_id(), request.provider_generation())
             }
             ProviderRequest::SubscribeStatus(request) => {
@@ -77,7 +88,8 @@ impl ProviderCorrelation {
             }
             ProviderRequest::Register(_)
             | ProviderRequest::UpdateRepositories(_)
-            | ProviderRequest::SelectionDecision(_) => {
+            | ProviderRequest::SelectionDecision(_)
+            | ProviderRequest::Unregister(_) => {
                 return Err(ProviderCorrelationError::UnexpectedMessageRole);
             }
         };
@@ -253,6 +265,25 @@ impl ProviderCorrelation {
         self.outstanding_prompts.remove(&request_id).is_some()
     }
 
+    /// Validates an unregister command, consumes the registration state, and
+    /// returns every waiter that must become provider-unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-unregister messages and stale registration bindings. The
+    /// state is consumed on both success and error, so an invalid unregister
+    /// fails the connection closed.
+    pub fn accept_unregister(
+        mut self,
+        frame: &ProviderRequestFrame,
+    ) -> Result<Vec<RequestId>, ProviderCorrelationError> {
+        let ProviderRequest::Unregister(request) = frame.message() else {
+            return Err(ProviderCorrelationError::UnexpectedMessageRole);
+        };
+        self.validate_binding(request.registration_id(), request.provider_generation())?;
+        Ok(self.drain_prompts())
+    }
+
     /// Consumes the connection state and returns every waiter that must be
     /// completed as provider-unavailable on disconnect.
     #[must_use]
@@ -332,6 +363,8 @@ pub enum ProviderCorrelationError {
     UnexpectedMessageRole,
     #[error("provider registration does not belong to this connection")]
     RegistrationMismatch,
+    #[error("registration response does not correlate to its request")]
+    RegistrationResponseMismatch,
     #[error("provider generation is stale")]
     ProviderGenerationMismatch,
     #[error("provider capability was not negotiated")]

@@ -17,12 +17,13 @@
 //! | provider | selection decision | prompt ID, consumed once |
 //! | broker | status snapshot | fresh broker ID |
 //!
-//! [`ProviderCorrelation`] additionally binds capabilities, repository
-//! membership, selection decisions, and broker-owned monotonic deadlines to a
-//! live registration generation. Timeout, membership replacement, write
-//! failure, and disconnect APIs return the exact outstanding IDs the broker
-//! must complete. Reconnect creates a new correlation instance and invalidates
-//! all prior outstanding IDs.
+//! [`ProviderCorrelation`] is created only from a registration command and its
+//! exact request-ID-correlated response. It additionally binds capabilities,
+//! repository membership, selection decisions, and broker-owned monotonic
+//! deadlines to that live registration generation. Timeout, membership
+//! replacement, write failure, unregister, and disconnect APIs return the
+//! exact outstanding IDs the broker must complete. Reconnect creates a new
+//! correlation instance and invalidates all prior outstanding IDs.
 
 mod codec;
 mod ids;

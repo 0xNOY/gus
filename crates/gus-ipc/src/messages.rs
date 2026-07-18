@@ -2095,12 +2095,21 @@ fn validate_text(
 }
 
 fn is_forbidden_presentation_character(value: char) -> bool {
+    // Pinned to Unicode 17.0 Default_Ignorable_Code_Point plus all assigned
+    // General_Category=Format (Cf) characters. Presentation labels are
+    // identifiers in security-sensitive choice UI, so unsupported formatting
+    // semantics are rejected rather than rendered ambiguously.
     value.is_control()
         || matches!(
             value,
             '\u{00ad}'
                 | '\u{034f}'
+                | '\u{0600}'..='\u{0605}'
                 | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
                 | '\u{115f}'..='\u{1160}'
                 | '\u{17b4}'..='\u{17b5}'
                 | '\u{180b}'..='\u{180f}'
@@ -2112,6 +2121,10 @@ fn is_forbidden_presentation_character(value: char) -> bool {
                 | '\u{fe00}'..='\u{fe0f}'
                 | '\u{feff}'
                 | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
                 | '\u{1bca0}'..='\u{1bca3}'
                 | '\u{1d173}'..='\u{1d17a}'
                 | '\u{e0000}'..='\u{e0fff}'

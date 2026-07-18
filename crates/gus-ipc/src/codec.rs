@@ -1,4 +1,9 @@
-use serde::{Deserialize, Serialize, de::DeserializeOwned, de::IgnoredAny};
+use std::fmt;
+
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, DeserializeOwned, IgnoredAny, MapAccess, Visitor},
+};
 
 use crate::messages::{
     BrokerProviderMessage, BrokerShimMessage, PROTOCOL_VERSION, ProtocolError, ProviderRequest,
@@ -20,16 +25,45 @@ struct RawWireFrame<M> {
     message: M,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawEnvelopeProbe {
-    protocol_version: u16,
-    #[serde(rename = "message_family")]
-    _message_family: crate::MessageFamily,
-    #[serde(rename = "request_id")]
-    _request_id: crate::RequestId,
-    #[serde(rename = "message")]
-    _message: IgnoredAny,
+struct VersionProbe(u16);
+
+impl<'de> Deserialize<'de> for VersionProbe {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(VersionProbeVisitor)
+    }
+}
+
+struct VersionProbeVisitor;
+
+impl<'de> Visitor<'de> for VersionProbeVisitor {
+    type Value = VersionProbe;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a GUS IPC envelope containing one protocol_version")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut protocol_version = None;
+        while let Some(field) = map.next_key::<String>()? {
+            if field == "protocol_version" {
+                if protocol_version.is_some() {
+                    return Err(de::Error::duplicate_field("protocol_version"));
+                }
+                protocol_version = Some(map.next_value()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        protocol_version
+            .map(VersionProbe)
+            .ok_or_else(|| de::Error::missing_field("protocol_version"))
+    }
 }
 
 /// Decodes and validates a shim-to-broker protocol frame.
@@ -145,15 +179,13 @@ where
     }
     let payload = &record[FRAME_HEADER_BYTES..];
     let mut probe_deserializer = serde_json::Deserializer::from_slice(payload);
-    let probe = RawEnvelopeProbe::deserialize(&mut probe_deserializer)
+    let probe = VersionProbe::deserialize(&mut probe_deserializer)
         .map_err(|_| ProtocolError::InvalidJson)?;
     probe_deserializer
         .end()
         .map_err(|_| ProtocolError::InvalidJson)?;
-    if probe.protocol_version != PROTOCOL_VERSION {
-        return Err(ProtocolError::UnsupportedVersion {
-            received: probe.protocol_version,
-        });
+    if probe.0 != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedVersion { received: probe.0 });
     }
 
     let mut deserializer = serde_json::Deserializer::from_slice(payload);
