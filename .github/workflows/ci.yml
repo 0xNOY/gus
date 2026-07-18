@@ -112,6 +112,6 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo +stable doc --workspace --all-features --no-deps
 
-      - name: Exercise Linux PTY and detached-session probes
-        if: runner.os == 'Linux'
+      - name: Exercise managed native session probes
+        if: runner.os != 'macOS'
         run: cargo +stable test -p gus-platform --all-targets --all-features -- --include-ignored
