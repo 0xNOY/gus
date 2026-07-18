@@ -18,7 +18,8 @@ pub use model::{
     SnapshotGenerations, Transport,
 };
 pub use resolver::{
-    EffectiveConfigEntry, EndpointObservation, GitCredentialProtocolAdmission,
-    GitCredentialProtocolProbeBehavior, GitCredentialProtocolRuleset, GitResolver,
+    EffectiveConfigEntry, EndpointObservation, GitCredentialProbeAction,
+    GitCredentialProbeExchange, GitCredentialProtocolAdmission,
+    GitCredentialProtocolProbeTranscript, GitCredentialProtocolRuleset, GitResolver,
     GitSemanticRuleset, HttpPreflightObservation, ResolverSnapshot, VerifiedGitSemantics,
 };

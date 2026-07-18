@@ -33,9 +33,10 @@ pub struct EndpointObservation {
     identity_digest: [u8; 32],
 }
 
-/// Raw HTTP preflight observation captured from the same effective
-/// config/environment/network snapshot as its endpoint. It is not policy
-/// evidence until [`GitResolver`] binds it to a resolution request.
+/// Opaque HTTP preflight observation captured by the trusted platform probe.
+/// There is deliberately no public constructor: an IPC/config caller cannot
+/// assert `HelperCompatible`. Until a platform probe is implemented inside
+/// the resolver TCB, HTTP snapshots therefore fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpPreflightObservation {
     role: EndpointRole,
@@ -44,8 +45,8 @@ pub struct HttpPreflightObservation {
 }
 
 impl HttpPreflightObservation {
-    #[must_use]
-    pub const fn new(
+    #[cfg(test)]
+    const fn from_verified_probe(
         role: EndpointRole,
         endpoint_identity_digest: [u8; 32],
         disposition: HttpPreflightDisposition,
@@ -79,19 +80,59 @@ pub enum GitCredentialProtocolRuleset {
     Unsupported,
 }
 
-/// Behavior observed by an executable credential-protocol probe. A nearby
-/// semantic version is never used as a substitute for one of these complete
-/// observations.
+/// One process interaction captured by the exact-build credential probe.
+/// Core validates the complete wire transcript; callers cannot select a
+/// ruleset or provide its digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitCredentialProtocolProbeBehavior {
-    LegacySerial {
-        unknown_state_was_discarded: bool,
-        retry_sequence_was_serial: bool,
-    },
-    Stateful {
-        state_capability_was_advertised: bool,
-        state_was_round_tripped: bool,
-    },
+pub enum GitCredentialProbeAction {
+    Capability,
+    Get,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCredentialProbeExchange {
+    action: GitCredentialProbeAction,
+    input: Vec<u8>,
+    output: Vec<u8>,
+    exit_code: i32,
+    started_order: u32,
+    finished_order: u32,
+}
+
+impl GitCredentialProbeExchange {
+    #[must_use]
+    pub fn new(
+        action: GitCredentialProbeAction,
+        input: Vec<u8>,
+        output: Vec<u8>,
+        exit_code: i32,
+        started_order: u32,
+        finished_order: u32,
+    ) -> Self {
+        Self {
+            action,
+            input,
+            output,
+            exit_code,
+            started_order,
+            finished_order,
+        }
+    }
+}
+
+/// Raw, bounded process transcript emitted by the fixed probe harness. The
+/// transcript contains no live credential: it uses only the reserved
+/// `gus-probe.invalid` endpoint and fixed sentinel material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCredentialProtocolProbeTranscript {
+    exchanges: Vec<GitCredentialProbeExchange>,
+}
+
+impl GitCredentialProtocolProbeTranscript {
+    #[must_use]
+    pub fn new(exchanges: Vec<GitCredentialProbeExchange>) -> Self {
+        Self { exchanges }
+    }
 }
 
 /// Sealed receipt for one exact real-Git executable/version observation and
@@ -110,29 +151,19 @@ impl GitCredentialProtocolAdmission {
     ///
     /// # Errors
     ///
-    /// Rejects incomplete behavior observations, malformed build identity, or
-    /// a missing transcript digest.
-    pub fn from_probe(
+    /// Rejects malformed, overlapping, incomplete, or self-contradictory wire
+    /// transcripts. The ruleset and transcript digest are derived by core.
+    pub fn from_transcript(
         executable_identity: [u8; 32],
         version_output: &str,
-        behavior: GitCredentialProtocolProbeBehavior,
-        probe_transcript_digest: [u8; 32],
+        transcript: &GitCredentialProtocolProbeTranscript,
     ) -> Result<Self, ResolutionError> {
-        if executable_identity == [0; 32] || probe_transcript_digest == [0; 32] {
+        if executable_identity == [0; 32] {
             return Err(ResolutionError::InvalidSnapshot);
         }
         let version_output = validated_version_output(version_output)?;
-        let ruleset = match behavior {
-            GitCredentialProtocolProbeBehavior::LegacySerial {
-                unknown_state_was_discarded: true,
-                retry_sequence_was_serial: true,
-            } => GitCredentialProtocolRuleset::LegacySerial,
-            GitCredentialProtocolProbeBehavior::Stateful {
-                state_capability_was_advertised: true,
-                state_was_round_tripped: true,
-            } => GitCredentialProtocolRuleset::Stateful,
-            _ => return Err(ResolutionError::InvalidSnapshot),
-        };
+        let ruleset = validate_credential_probe_transcript(transcript)?;
+        let probe_transcript_digest = credential_probe_transcript_digest(transcript);
         Ok(Self {
             executable_identity,
             version_output: version_output.to_owned(),
@@ -140,6 +171,217 @@ impl GitCredentialProtocolAdmission {
             probe_transcript_digest,
         })
     }
+}
+
+const PROBE_PROTOCOL: &[u8] = b"https";
+const PROBE_HOST: &[u8] = b"gus-probe.invalid";
+const PROBE_STATE: &[u8] = b"gus-probe-state-v1";
+const MAX_PROBE_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+type CredentialAttributes<'a> = Vec<(&'a [u8], &'a [u8])>;
+
+fn validate_credential_probe_transcript(
+    transcript: &GitCredentialProtocolProbeTranscript,
+) -> Result<GitCredentialProtocolRuleset, ResolutionError> {
+    let [capability, first, second] = transcript.exchanges.as_slice() else {
+        return Err(ResolutionError::InvalidSnapshot);
+    };
+    let total_bytes = transcript
+        .exchanges
+        .iter()
+        .try_fold(0usize, |total, exchange| {
+            total
+                .checked_add(exchange.input.len())?
+                .checked_add(exchange.output.len())
+        });
+    if total_bytes.is_none_or(|total| total > MAX_PROBE_TRANSCRIPT_BYTES)
+        || capability.action != GitCredentialProbeAction::Capability
+        || !capability.input.is_empty()
+        || first.action != GitCredentialProbeAction::Get
+        || second.action != GitCredentialProbeAction::Get
+        || first.exit_code != 0
+        || second.exit_code != 0
+        || !(capability.started_order < capability.finished_order
+            && capability.finished_order < first.started_order
+            && first.started_order < first.finished_order
+            && first.finished_order < second.started_order
+            && second.started_order < second.finished_order)
+    {
+        return Err(ResolutionError::InvalidSnapshot);
+    }
+
+    let first_input = parse_credential_attributes(&first.input)?;
+    let first_output = parse_credential_attributes(&first.output)?;
+    let second_input = parse_credential_attributes(&second.input)?;
+    let second_output = parse_credential_attributes(&second.output)?;
+    if !is_probe_endpoint(&first_input) || !is_probe_endpoint(&second_input) {
+        return Err(ResolutionError::InvalidSnapshot);
+    }
+
+    let capability_state = capability.exit_code == 0
+        && parse_capability_output(&capability.output)
+            .is_some_and(|capabilities| capabilities.iter().any(|value| value == b"state"));
+    let first_announces_state = attribute_precedes(
+        &first_output,
+        (b"capability[]", b"state"),
+        (b"state[]", PROBE_STATE),
+    );
+    let first_input_supports_state = has_attribute(&first_input, b"capability[]", b"state");
+    let second_input_supports_state = has_attribute(&second_input, b"capability[]", b"state");
+    let first_returns_state = has_attribute(&first_output, b"state[]", PROBE_STATE);
+    let second_receives_state = has_attribute(&second_input, b"state[]", PROBE_STATE);
+    let first_continues = has_attribute(&first_output, b"continue", b"true");
+
+    if capability_state
+        && first_input_supports_state
+        && second_input_supports_state
+        && attribute_count(&first_input, b"capability[]", b"state") == 1
+        && attribute_count(&second_input, b"capability[]", b"state") == 1
+        && first_announces_state
+        && attribute_count(&first_output, b"capability[]", b"state") == 1
+        && first_returns_state
+        && attribute_count(&first_output, b"state[]", PROBE_STATE) == 1
+        && second_receives_state
+        && attribute_count(&second_input, b"state[]", PROBE_STATE) == 1
+        && first_continues
+        && !has_key(&second_output, b"continue")
+    {
+        return Ok(GitCredentialProtocolRuleset::Stateful);
+    }
+    if capability.exit_code != 0
+        && !first_input_supports_state
+        && !second_input_supports_state
+        && !has_key(&first_input, b"state[]")
+        && !has_key(&second_input, b"state[]")
+        && !has_key(&first_output, b"capability[]")
+        && first_returns_state
+        && attribute_count(&first_output, b"state[]", PROBE_STATE) == 1
+        && !second_receives_state
+        && !has_key(&first_output, b"continue")
+    {
+        return Ok(GitCredentialProtocolRuleset::LegacySerial);
+    }
+    Err(ResolutionError::InvalidSnapshot)
+}
+
+fn parse_credential_attributes(input: &[u8]) -> Result<CredentialAttributes<'_>, ResolutionError> {
+    if input.contains(&0) {
+        return Err(ResolutionError::InvalidSnapshot);
+    }
+    let mut attributes = Vec::new();
+    let mut terminated = false;
+    for line in input.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            terminated = true;
+            break;
+        }
+        if line.len() > u16::MAX as usize {
+            return Err(ResolutionError::InvalidSnapshot);
+        }
+        let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
+            return Err(ResolutionError::InvalidSnapshot);
+        };
+        if separator == 0 {
+            return Err(ResolutionError::InvalidSnapshot);
+        }
+        attributes.push((&line[..separator], &line[separator + 1..]));
+    }
+    if terminated {
+        let terminator = input
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .map_or(input.len(), |index| index + 2);
+        if input[terminator..]
+            .iter()
+            .any(|byte| !matches!(*byte, b'\n' | b'\r'))
+        {
+            return Err(ResolutionError::InvalidSnapshot);
+        }
+    }
+    Ok(attributes)
+}
+
+fn parse_capability_output(input: &[u8]) -> Option<Vec<&[u8]>> {
+    if input.contains(&0) {
+        return None;
+    }
+    let mut lines = input
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty());
+    if lines.next()? != b"version 0" {
+        return None;
+    }
+    let mut capabilities = Vec::new();
+    for line in lines {
+        if line.len() > u16::MAX as usize {
+            return None;
+        }
+        if let Some(value) = line.strip_prefix(b"capability ") {
+            capabilities.push(value);
+        }
+    }
+    Some(capabilities)
+}
+
+fn is_probe_endpoint(attributes: &[(&[u8], &[u8])]) -> bool {
+    attribute_count(attributes, b"protocol", PROBE_PROTOCOL) == 1
+        && attribute_count(attributes, b"host", PROBE_HOST) == 1
+        && attributes
+            .iter()
+            .filter(|(key, _)| *key == b"protocol" || *key == b"host")
+            .count()
+            == 2
+        && !has_key(attributes, b"url")
+}
+
+fn has_attribute(attributes: &[(&[u8], &[u8])], key: &[u8], value: &[u8]) -> bool {
+    attributes
+        .iter()
+        .any(|(observed_key, observed_value)| *observed_key == key && *observed_value == value)
+}
+
+fn has_key(attributes: &[(&[u8], &[u8])], key: &[u8]) -> bool {
+    attributes
+        .iter()
+        .any(|(observed_key, _)| *observed_key == key)
+}
+
+fn attribute_count(attributes: &[(&[u8], &[u8])], key: &[u8], value: &[u8]) -> usize {
+    attributes
+        .iter()
+        .filter(|(observed_key, observed_value)| *observed_key == key && *observed_value == value)
+        .count()
+}
+
+fn attribute_precedes(
+    attributes: &[(&[u8], &[u8])],
+    first: (&[u8], &[u8]),
+    second: (&[u8], &[u8]),
+) -> bool {
+    let first_index = attributes.iter().position(|value| *value == first);
+    let second_index = attributes.iter().position(|value| *value == second);
+    matches!((first_index, second_index), (Some(first), Some(second)) if first < second)
+}
+
+fn credential_probe_transcript_digest(
+    transcript: &GitCredentialProtocolProbeTranscript,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"gus.git-credential-probe-transcript.v1\0");
+    digest.update((transcript.exchanges.len() as u64).to_le_bytes());
+    for exchange in &transcript.exchanges {
+        digest.update([match exchange.action {
+            GitCredentialProbeAction::Capability => 1,
+            GitCredentialProbeAction::Get => 2,
+        }]);
+        digest.update(exchange.exit_code.to_le_bytes());
+        digest.update(exchange.started_order.to_le_bytes());
+        digest.update(exchange.finished_order.to_le_bytes());
+        digest.update((exchange.input.len() as u64).to_le_bytes());
+        digest.update(&exchange.input);
+        digest.update((exchange.output.len() as u64).to_le_bytes());
+        digest.update(&exchange.output);
+    }
+    digest.finalize().into()
 }
 
 /// Identity and semantic version of the fixed real Git selected by the
@@ -759,6 +1001,53 @@ mod tests {
             .expect("valid fixture Git semantics")
     }
 
+    fn credential_probe(stateful: bool) -> GitCredentialProtocolProbeTranscript {
+        let (capability_output, capability_exit, first_input, first_output, second_input) =
+            if stateful {
+                (
+                    b"version 0\ncapability authtype\ncapability state\n".to_vec(),
+                    0,
+                    b"capability[]=state\nprotocol=https\nhost=gus-probe.invalid\n\n".to_vec(),
+                    b"capability[]=state\nstate[]=gus-probe-state-v1\ncontinue=true\nusername=probe\npassword=probe\n\n".to_vec(),
+                    b"capability[]=state\nprotocol=https\nhost=gus-probe.invalid\nstate[]=gus-probe-state-v1\n\n".to_vec(),
+                )
+            } else {
+                (
+                    b"git: 'credential capability' is not supported\n".to_vec(),
+                    129,
+                    b"protocol=https\nhost=gus-probe.invalid\n\n".to_vec(),
+                    b"state[]=gus-probe-state-v1\nusername=probe\npassword=probe\n\n".to_vec(),
+                    b"protocol=https\nhost=gus-probe.invalid\n\n".to_vec(),
+                )
+            };
+        GitCredentialProtocolProbeTranscript::new(vec![
+            GitCredentialProbeExchange::new(
+                GitCredentialProbeAction::Capability,
+                Vec::new(),
+                capability_output,
+                capability_exit,
+                1,
+                2,
+            ),
+            GitCredentialProbeExchange::new(
+                GitCredentialProbeAction::Get,
+                first_input,
+                first_output,
+                0,
+                3,
+                4,
+            ),
+            GitCredentialProbeExchange::new(
+                GitCredentialProbeAction::Get,
+                second_input,
+                b"username=probe\npassword=probe\n\n".to_vec(),
+                0,
+                5,
+                6,
+            ),
+        ])
+    }
+
     fn resolve_pull_invocation(
         version: &str,
         args: &[&str],
@@ -995,14 +1284,10 @@ mod tests {
             GitCredentialProtocolRuleset::Unsupported
         );
 
-        let admission = GitCredentialProtocolAdmission::from_probe(
+        let admission = GitCredentialProtocolAdmission::from_transcript(
             [8; 32],
             version,
-            GitCredentialProtocolProbeBehavior::LegacySerial {
-                unknown_state_was_discarded: true,
-                retry_sequence_was_serial: true,
-            },
-            [7; 32],
+            &credential_probe(false),
         )
         .expect("complete exact-build probe");
         let admitted = unadmitted
@@ -1019,17 +1304,29 @@ mod tests {
             other_build.with_credential_protocol_admission(&admission),
             Err(ResolutionError::BindingMismatch)
         );
+        let mut forged_stateful = credential_probe(true);
+        forged_stateful.exchanges[2].input =
+            b"capability[]=state\nprotocol=https\nhost=gus-probe.invalid\n\n".to_vec();
         assert_eq!(
-            GitCredentialProtocolAdmission::from_probe(
-                [8; 32],
-                version,
-                GitCredentialProtocolProbeBehavior::Stateful {
-                    state_capability_was_advertised: true,
-                    state_was_round_tripped: false,
-                },
-                [7; 32],
-            ),
-            Err(ResolutionError::InvalidSnapshot)
+            GitCredentialProtocolAdmission::from_transcript([8; 32], version, &forged_stateful,),
+            Err(ResolutionError::InvalidSnapshot),
+            "stateful admission requires an observed state round trip"
+        );
+        let mut overlapping = credential_probe(false);
+        overlapping.exchanges[2].started_order = overlapping.exchanges[1].finished_order;
+        assert_eq!(
+            GitCredentialProtocolAdmission::from_transcript([8; 32], version, &overlapping),
+            Err(ResolutionError::InvalidSnapshot),
+            "legacy retries must be observed serially"
+        );
+        let mut trailing_record = credential_probe(true);
+        trailing_record.exchanges[1]
+            .output
+            .extend_from_slice(b"protocol=https\n");
+        assert_eq!(
+            GitCredentialProtocolAdmission::from_transcript([8; 32], version, &trailing_record),
+            Err(ResolutionError::InvalidSnapshot),
+            "bytes after a terminated credential record are not ignored"
         );
         assert_eq!(
             VerifiedGitSemantics::from_version_output(
@@ -1059,7 +1356,7 @@ mod tests {
                     Transport::Http,
                     [2; 32],
                 )],
-                vec![HttpPreflightObservation::new(
+                vec![HttpPreflightObservation::from_verified_probe(
                     EndpointRole::Fetch,
                     [2; 32],
                     observed,

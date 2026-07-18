@@ -6,9 +6,10 @@
 //! treating a multi-process HTTP credential flow as a single-use capability.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fmt,
     sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant},
 };
 
 use gus_core::{GitCredentialProtocolRuleset, VerifiedGitSemantics};
@@ -22,6 +23,10 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 const RANDOM_ISSUANCE_ATTEMPTS: usize = 32;
+#[cfg(not(test))]
+const MAX_ACTIVE_CAPABILITIES: usize = 4096;
+#[cfg(test)]
+const MAX_ACTIVE_CAPABILITIES: usize = 32;
 
 struct Secret32(Zeroizing<[u8; 32]>);
 
@@ -44,7 +49,30 @@ struct IssuerState {
     instance: Secret32,
     handle_key: Secret32,
     attempt_key: Secret32,
-    active_handle_tags: Mutex<HashSet<[u8; 32]>>,
+    clock: Arc<dyn MonotonicClock>,
+    active_handle_tags: Mutex<HashMap<[u8; 32], MonotonicInstant>>,
+}
+
+trait MonotonicClock: Send + Sync {
+    fn now(&self) -> MonotonicInstant;
+}
+
+struct SystemMonotonicClock {
+    origin: Instant,
+}
+
+impl SystemMonotonicClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn now(&self) -> MonotonicInstant {
+        MonotonicInstant(u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
 }
 
 /// Owner of all capability issuance secrets for one live broker instance.
@@ -69,12 +97,17 @@ impl BrokerIssuer {
     ///
     /// Fails closed when secure random bytes are unavailable.
     pub fn new() -> Result<Self, CapabilityError> {
+        Self::with_clock(Arc::new(SystemMonotonicClock::new()))
+    }
+
+    fn with_clock(clock: Arc<dyn MonotonicClock>) -> Result<Self, CapabilityError> {
         Ok(Self {
             state: Arc::new(IssuerState {
                 instance: Secret32::random()?,
                 handle_key: Secret32::random()?,
                 attempt_key: Secret32::random()?,
-                active_handle_tags: Mutex::new(HashSet::new()),
+                clock,
+                active_handle_tags: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -93,10 +126,9 @@ impl BrokerIssuer {
         parent: ProcessIdentity,
         helper_identity: [u8; 32],
         subject: SingleUseSubject,
-        issued_at: MonotonicInstant,
-        expires_at: MonotonicInstant,
+        ttl: Duration,
     ) -> Result<SingleUseCapability, CapabilityError> {
-        let (handle, issuance) = self.reserve_issuance()?;
+        let (handle, issuance, issued_at, expires_at) = self.reserve_issuance(ttl)?;
         SingleUseCapability::issue(
             handle,
             issuance,
@@ -125,8 +157,7 @@ impl BrokerIssuer {
         git_semantics: &VerifiedGitSemantics,
         endpoints: Vec<CanonicalCredentialRequest>,
         max_get_attempts: u16,
-        issued_at: MonotonicInstant,
-        expires_at: MonotonicInstant,
+        ttl: Duration,
     ) -> Result<HttpCredentialCapability, CapabilityError> {
         self.issue_http(
             plan_digest,
@@ -136,8 +167,7 @@ impl BrokerIssuer {
             HttpProfileState::Deferred,
             endpoints,
             max_get_attempts,
-            issued_at,
-            expires_at,
+            ttl,
         )
     }
 
@@ -156,8 +186,7 @@ impl BrokerIssuer {
         profile: ProfileBinding,
         endpoints: Vec<CanonicalCredentialRequest>,
         max_get_attempts: u16,
-        issued_at: MonotonicInstant,
-        expires_at: MonotonicInstant,
+        ttl: Duration,
     ) -> Result<HttpCredentialCapability, CapabilityError> {
         self.issue_http(
             plan_digest,
@@ -167,8 +196,7 @@ impl BrokerIssuer {
             HttpProfileState::Bound(profile),
             endpoints,
             max_get_attempts,
-            issued_at,
-            expires_at,
+            ttl,
         )
     }
 
@@ -182,10 +210,9 @@ impl BrokerIssuer {
         profile: HttpProfileState,
         endpoints: Vec<CanonicalCredentialRequest>,
         max_get_attempts: u16,
-        issued_at: MonotonicInstant,
-        expires_at: MonotonicInstant,
+        ttl: Duration,
     ) -> Result<HttpCredentialCapability, CapabilityError> {
-        let (handle, issuance) = self.reserve_issuance()?;
+        let (handle, issuance, issued_at, expires_at) = self.reserve_issuance(ttl)?;
         HttpCredentialCapability::issue(
             handle,
             issuance,
@@ -202,7 +229,22 @@ impl BrokerIssuer {
         )
     }
 
-    fn reserve_issuance(&self) -> Result<(Secret32, IssuanceLease), CapabilityError> {
+    fn reserve_issuance(
+        &self,
+        ttl: Duration,
+    ) -> Result<(Secret32, IssuanceLease, MonotonicInstant, MonotonicInstant), CapabilityError>
+    {
+        let ttl = u64::try_from(ttl.as_millis()).map_err(|_| CapabilityError::InvalidClaim)?;
+        if ttl == 0 || ttl > MAX_CAPABILITY_TTL_MILLIS {
+            return Err(CapabilityError::InvalidClaim);
+        }
+        let issued_at = self.state.clock.now();
+        let expires_at = MonotonicInstant(
+            issued_at
+                .0
+                .checked_add(ttl)
+                .ok_or(CapabilityError::InvalidClaim)?,
+        );
         for _ in 0..RANDOM_ISSUANCE_ATTEMPTS {
             let handle = Secret32::random()?;
             let tag = keyed_digest(
@@ -215,14 +257,21 @@ impl BrokerIssuer {
                 .active_handle_tags
                 .lock()
                 .map_err(|_| CapabilityError::IssuerUnavailable)?;
-            if active.insert(tag) {
+            active.retain(|_, expiry| issued_at < *expiry);
+            if active.len() >= MAX_ACTIVE_CAPABILITIES {
+                return Err(CapabilityError::IssuanceLimitReached);
+            }
+            if active.insert(tag, expires_at).is_none() {
                 drop(active);
                 return Ok((
                     handle,
                     IssuanceLease {
                         state: Arc::downgrade(&self.state),
                         handle_tag: tag,
+                        released: false,
                     },
+                    issued_at,
+                    expires_at,
                 ));
             }
         }
@@ -231,39 +280,52 @@ impl BrokerIssuer {
 
     #[cfg(test)]
     fn active_issuance_count(&self) -> usize {
-        self.state
+        let now = self.state.clock.now();
+        let mut active = self
+            .state
             .active_handle_tags
             .lock()
-            .expect("test issuer lock")
-            .len()
+            .expect("test issuer lock");
+        active.retain(|_, expiry| now < *expiry);
+        active.len()
     }
 }
 
 struct IssuanceLease {
     state: Weak<IssuerState>,
     handle_tag: [u8; 32],
+    released: bool,
 }
 
 impl IssuanceLease {
-    fn validate(&self) -> Result<Arc<IssuerState>, CapabilityError> {
+    fn validate(&self) -> Result<(Arc<IssuerState>, MonotonicInstant), CapabilityError> {
+        if self.released {
+            return Err(CapabilityError::Revoked);
+        }
         let state = self
             .state
             .upgrade()
             .ok_or(CapabilityError::IssuerUnavailable)?;
-        let is_active = state
+        let now = state.clock.now();
+        let mut active = state
             .active_handle_tags
             .lock()
-            .map_err(|_| CapabilityError::IssuerUnavailable)?
-            .contains(&self.handle_tag);
-        if !is_active {
+            .map_err(|_| CapabilityError::IssuerUnavailable)?;
+        let Some(expires_at) = active.get(&self.handle_tag).copied() else {
             return Err(CapabilityError::Revoked);
+        };
+        if now >= expires_at {
+            active.remove(&self.handle_tag);
+            return Err(CapabilityError::Expired);
         }
-        Ok(state)
+        drop(active);
+        Ok((state, now))
     }
-}
 
-impl Drop for IssuanceLease {
-    fn drop(&mut self) {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
         if let Some(state) = self.state.upgrade() {
             match state.active_handle_tags.lock() {
                 Ok(mut active) => {
@@ -274,6 +336,13 @@ impl Drop for IssuanceLease {
                 }
             }
         }
+        self.released = true;
+    }
+}
+
+impl Drop for IssuanceLease {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -312,17 +381,8 @@ pub struct ProfileBinding {
     generation: u64,
 }
 
-/// Milliseconds from an OS monotonic clock. Wall-clock timestamps must never
-/// be converted into this type by a platform adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MonotonicInstant(u64);
-
-impl MonotonicInstant {
-    #[must_use]
-    pub const fn from_millis(value: u64) -> Self {
-        Self(value)
-    }
-}
+struct MonotonicInstant(u64);
 
 pub const MAX_CAPABILITY_TTL_MILLIS: u64 = 5 * 60 * 1_000;
 
@@ -566,17 +626,17 @@ impl CommonClaims {
     }
 
     fn validate_call(
-        &self,
+        &mut self,
         parent: ProcessIdentity,
         plan_digest: [u8; 32],
         helper_identity: [u8; 32],
-        now: MonotonicInstant,
     ) -> Result<(), CapabilityError> {
-        self.issuance.validate()?;
+        let (_, now) = self.issuance.validate()?;
         if now < self.not_before {
             return Err(CapabilityError::NotYetValid);
         }
         if now >= self.expires_at {
+            self.issuance.release();
             return Err(CapabilityError::Expired);
         }
         if parent != self.parent {
@@ -589,6 +649,10 @@ impl CommonClaims {
             return Err(CapabilityError::HelperMismatch);
         }
         Ok(())
+    }
+
+    fn release(&mut self) {
+        self.issuance.release();
     }
 }
 
@@ -652,15 +716,15 @@ impl SingleUseCapability {
         plan_digest: [u8; 32],
         helper_identity: [u8; 32],
         subject: &SingleUseSubject,
-        now: MonotonicInstant,
     ) -> Result<(), CapabilityError> {
         self.require_active()?;
         if let Err(error) = self
             .claims
-            .validate_call(parent, plan_digest, helper_identity, now)
+            .validate_call(parent, plan_digest, helper_identity)
         {
             if error == CapabilityError::Expired {
                 self.status = CapabilityStatus::Revoked;
+                self.claims.release();
             }
             return Err(error);
         }
@@ -672,11 +736,13 @@ impl SingleUseCapability {
             });
         }
         self.status = CapabilityStatus::Completed;
+        self.claims.release();
         Ok(())
     }
 
     pub fn revoke(&mut self) {
         self.status = CapabilityStatus::Revoked;
+        self.claims.release();
     }
 
     #[must_use]
@@ -719,13 +785,51 @@ impl From<&CanonicalCredentialRequest> for CredentialRoute {
     }
 }
 
-/// Exact profile/backend selected by the immutable execution plan. The
-/// selected binding itself can only be produced by `gus-profile` from a
-/// validated profile.
+/// Opaque lease for the exact open adapter artifact verified by the broker
+/// loader. Construction remains inside the broker TCB.
+#[derive(PartialEq, Eq)]
+pub struct VerifiedBackendAdapterLease {
+    configured_backend: CredentialBackend,
+    selected_binding_digest: [u8; 32],
+    adapter_identity: [u8; 32],
+    artifact_lease_digest: [u8; 32],
+}
+
+impl fmt::Debug for VerifiedBackendAdapterLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedBackendAdapterLease")
+            .field("configured_backend", &"<redacted>")
+            .field("selected_binding_digest", &"<redacted>")
+            .field("adapter_identity", &"<redacted>")
+            .field("artifact_lease_digest", &"<redacted>")
+            .finish()
+    }
+}
+
+impl VerifiedBackendAdapterLease {
+    #[cfg(test)]
+    fn for_test(
+        configured_backend: CredentialBackend,
+        selected_binding_digest: [u8; 32],
+        adapter_identity: [u8; 32],
+        artifact_lease_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            configured_backend,
+            selected_binding_digest,
+            adapter_identity,
+            artifact_lease_digest,
+        }
+    }
+}
+
+/// Exact profile/backend and adapter artifact selected by the immutable
+/// execution plan.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CredentialBackendPlan {
     selection: SelectedCredentialBinding,
-    adapter_identity: [u8; 32],
+    adapter: Arc<VerifiedBackendAdapterLease>,
     execution_plan_digest: [u8; 32],
 }
 
@@ -734,30 +838,37 @@ impl fmt::Debug for CredentialBackendPlan {
         formatter
             .debug_struct("CredentialBackendPlan")
             .field("selection", &"<redacted>")
-            .field("adapter_identity", &"<redacted>")
+            .field("adapter", &"<verified lease redacted>")
             .field("execution_plan_digest", &"<redacted>")
             .finish()
     }
 }
 
 impl CredentialBackendPlan {
-    /// Binds a profile-selected credential backend to the verified adapter
-    /// artifact and immutable execution plan.
+    /// Binds selection to an opaque adapter artifact lease produced by the
+    /// broker loader. The lease has no public constructor, so an IPC/config
+    /// caller cannot mint a plan from self-reported identity bytes.
     ///
     /// # Errors
     ///
-    /// Rejects missing adapter or plan identities.
-    pub fn new(
+    /// Rejects a lease for another selected binding/backend or missing
+    /// artifact/execution identities.
+    pub fn from_verified_adapter(
         selection: SelectedCredentialBinding,
-        adapter_identity: [u8; 32],
+        adapter: VerifiedBackendAdapterLease,
         execution_plan_digest: [u8; 32],
     ) -> Result<Self, CapabilityError> {
-        if adapter_identity == [0; 32] || execution_plan_digest == [0; 32] {
+        if adapter.adapter_identity == [0; 32]
+            || adapter.artifact_lease_digest == [0; 32]
+            || execution_plan_digest == [0; 32]
+            || selection.backend() != &adapter.configured_backend
+            || selection.digest() != adapter.selected_binding_digest
+        {
             return Err(CapabilityError::InvalidClaim);
         }
         Ok(Self {
             selection,
-            adapter_identity,
+            adapter: Arc::new(adapter),
             execution_plan_digest,
         })
     }
@@ -770,11 +881,16 @@ impl CredentialBackendPlan {
     }
 }
 
+mod credential_backend_sealed {
+    pub trait Sealed {}
+}
+
 /// Security-sensitive backend adapter boundary. Broker code verifies both the
 /// selected backend configuration and the loaded adapter artifact identity
-/// before invoking this trait. Implementations belong to the trusted computing
-/// base and must obtain the response from the supplied binding only.
-pub trait TrustedCredentialBackend {
+/// before invoking this trait. The private sealing module prevents downstream
+/// crates and IPC DTOs from implementing the trait by self-reporting those
+/// values; concrete adapters must live in the broker TCB.
+pub trait TrustedCredentialBackend: credential_backend_sealed::Sealed {
     fn configured_backend(&self) -> &CredentialBackend;
 
     fn adapter_identity(&self) -> [u8; 32];
@@ -1016,7 +1132,6 @@ impl HttpCredentialCapability {
         endpoint: &CanonicalCredentialRequest,
         backend_plan: &CredentialBackendPlan,
         previous_state: Option<CredentialAttemptId>,
-        now: MonotonicInstant,
     ) -> Result<CredentialAttemptId, CapabilityError> {
         if self.ruleset != GitCredentialProtocolRuleset::Stateful {
             return Err(CapabilityError::StateTokenUnsupported);
@@ -1028,7 +1143,6 @@ impl HttpCredentialCapability {
             endpoint,
             backend_plan,
             previous_state,
-            now,
         )
     }
 
@@ -1047,7 +1161,6 @@ impl HttpCredentialCapability {
         helper_identity: [u8; 32],
         endpoint: &CanonicalCredentialRequest,
         backend_plan: &CredentialBackendPlan,
-        now: MonotonicInstant,
     ) -> Result<(), CapabilityError> {
         if self.ruleset != GitCredentialProtocolRuleset::LegacySerial {
             return Err(CapabilityError::StateTokenRequired);
@@ -1059,7 +1172,6 @@ impl HttpCredentialCapability {
             endpoint,
             backend_plan,
             None,
-            now,
         )?;
         Ok(())
     }
@@ -1073,9 +1185,8 @@ impl HttpCredentialCapability {
         endpoint: &CanonicalCredentialRequest,
         backend_plan: &CredentialBackendPlan,
         previous_state: Option<CredentialAttemptId>,
-        now: MonotonicInstant,
     ) -> Result<CredentialAttemptId, CapabilityError> {
-        self.validate_call(parent, plan_digest, helper_identity, now)?;
+        self.validate_call(parent, plan_digest, helper_identity)?;
         let endpoint_index = self.endpoint_index(endpoint)?;
         if backend_plan.execution_plan_digest != plan_digest
             || CredentialRoute::from(backend_plan.selection.request())
@@ -1166,7 +1277,6 @@ impl HttpCredentialCapability {
         backend_plan: &CredentialBackendPlan,
         attempt: CredentialAttemptId,
         backend: &mut B,
-        now: MonotonicInstant,
     ) -> Result<CredentialBackendResponse, CapabilityError> {
         if self.ruleset != GitCredentialProtocolRuleset::Stateful {
             return Err(CapabilityError::StateTokenUnsupported);
@@ -1179,7 +1289,6 @@ impl HttpCredentialCapability {
             backend_plan,
             Some(attempt),
             backend,
-            now,
         )
     }
 
@@ -1199,7 +1308,6 @@ impl HttpCredentialCapability {
         endpoint: &CanonicalCredentialRequest,
         backend_plan: &CredentialBackendPlan,
         backend: &mut B,
-        now: MonotonicInstant,
     ) -> Result<CredentialBackendResponse, CapabilityError> {
         if self.ruleset != GitCredentialProtocolRuleset::LegacySerial {
             return Err(CapabilityError::StateTokenRequired);
@@ -1212,7 +1320,6 @@ impl HttpCredentialCapability {
             backend_plan,
             None,
             backend,
-            now,
         )
     }
 
@@ -1226,12 +1333,11 @@ impl HttpCredentialCapability {
         backend_plan: &CredentialBackendPlan,
         expected_attempt: Option<CredentialAttemptId>,
         backend: &mut B,
-        now: MonotonicInstant,
     ) -> Result<CredentialBackendResponse, CapabilityError> {
-        self.validate_call(parent, plan_digest, helper_identity, now)?;
+        self.validate_call(parent, plan_digest, helper_identity)?;
         if backend_plan.execution_plan_digest != plan_digest
             || backend.configured_backend() != backend_plan.selection.backend()
-            || backend.adapter_identity() != backend_plan.adapter_identity
+            || backend.adapter_identity() != backend_plan.adapter.adapter_identity
         {
             return Err(CapabilityError::BackendBindingMismatch);
         }
@@ -1284,9 +1390,8 @@ impl HttpCredentialCapability {
         backend_plan: &CredentialBackendPlan,
         attempt: CredentialAttemptId,
         observation: &CredentialObservation<'_>,
-        now: MonotonicInstant,
     ) -> Result<(), CapabilityError> {
-        self.validate_call(parent, plan_digest, helper_identity, now)?;
+        self.validate_call(parent, plan_digest, helper_identity)?;
         if self.ruleset != GitCredentialProtocolRuleset::Stateful {
             return Err(CapabilityError::StateTokenUnsupported);
         }
@@ -1326,9 +1431,8 @@ impl HttpCredentialCapability {
         backend_plan: &CredentialBackendPlan,
         attempt: CredentialAttemptId,
         observation: &CredentialObservation<'_>,
-        now: MonotonicInstant,
     ) -> Result<(), CapabilityError> {
-        self.validate_call(parent, plan_digest, helper_identity, now)?;
+        self.validate_call(parent, plan_digest, helper_identity)?;
         if self.ruleset != GitCredentialProtocolRuleset::Stateful {
             return Err(CapabilityError::StateTokenUnsupported);
         }
@@ -1371,9 +1475,8 @@ impl HttpCredentialCapability {
         endpoint: &CanonicalCredentialRequest,
         backend_plan: &CredentialBackendPlan,
         observation: &CredentialObservation<'_>,
-        now: MonotonicInstant,
     ) -> Result<(), CapabilityError> {
-        self.validate_call(parent, plan_digest, helper_identity, now)?;
+        self.validate_call(parent, plan_digest, helper_identity)?;
         self.require_legacy()?;
         self.validate_backend_plan(backend_plan, plan_digest)?;
         let endpoint_index = self.endpoint_index(endpoint)?;
@@ -1411,9 +1514,8 @@ impl HttpCredentialCapability {
         endpoint: &CanonicalCredentialRequest,
         backend_plan: &CredentialBackendPlan,
         observation: &CredentialObservation<'_>,
-        now: MonotonicInstant,
     ) -> Result<(), CapabilityError> {
-        self.validate_call(parent, plan_digest, helper_identity, now)?;
+        self.validate_call(parent, plan_digest, helper_identity)?;
         self.require_legacy()?;
         self.validate_backend_plan(backend_plan, plan_digest)?;
         let endpoint_index = self.endpoint_index(endpoint)?;
@@ -1440,6 +1542,7 @@ impl HttpCredentialCapability {
 
     pub fn revoke(&mut self) {
         self.status = CapabilityStatus::Revoked;
+        self.claims.release();
     }
 
     #[must_use]
@@ -1460,7 +1563,6 @@ impl HttpCredentialCapability {
         parent: ProcessIdentity,
         plan_digest: [u8; 32],
         helper_identity: [u8; 32],
-        now: MonotonicInstant,
     ) -> Result<(), CapabilityError> {
         match self.status {
             CapabilityStatus::Active => {}
@@ -1469,10 +1571,11 @@ impl HttpCredentialCapability {
         }
         if let Err(error) = self
             .claims
-            .validate_call(parent, plan_digest, helper_identity, now)
+            .validate_call(parent, plan_digest, helper_identity)
         {
             if error == CapabilityError::Expired {
                 self.status = CapabilityStatus::Revoked;
+                self.claims.release();
             }
             return Err(error);
         }
@@ -1594,6 +1697,7 @@ impl HttpCredentialCapability {
             .all(|state| state.status != EndpointStatus::Ready)
         {
             self.status = CapabilityStatus::Completed;
+            self.claims.release();
         }
     }
 }
@@ -1605,7 +1709,7 @@ fn derive_attempt(
     profile: &ProfileBinding,
     route: &CredentialRoute,
 ) -> Result<CredentialAttemptId, CapabilityError> {
-    let issuer = claims.issuance.validate()?;
+    let (issuer, _) = claims.issuance.validate()?;
     let endpoint_index = (endpoint_index as u64).to_le_bytes();
     let attempt = attempt.to_le_bytes();
     let generation = profile.generation().to_le_bytes();
@@ -1653,7 +1757,8 @@ fn backend_binding_tag(
         b"gus.credential-backend-binding.v1\0",
         &[
             &backend_plan.selection.digest(),
-            &backend_plan.adapter_identity,
+            &backend_plan.adapter.adapter_identity,
+            &backend_plan.adapter.artifact_lease_digest,
             &backend_plan.execution_plan_digest,
         ],
     )
@@ -1733,6 +1838,8 @@ pub enum CapabilityError {
     EntropyUnavailable,
     #[error("capability issuer instance is unavailable or inconsistent")]
     IssuerUnavailable,
+    #[error("active capability issuance limit reached")]
+    IssuanceLimitReached,
     #[error("capability claim is incomplete or invalid")]
     InvalidClaim,
     #[error("capability has expired")]
@@ -1786,9 +1893,31 @@ pub enum CapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gus_core::{GitCredentialProtocolAdmission, GitCredentialProtocolProbeBehavior};
+    use gus_core::{
+        GitCredentialProbeAction, GitCredentialProbeExchange, GitCredentialProtocolAdmission,
+        GitCredentialProtocolProbeTranscript,
+    };
     use gus_profile::{CredentialBinding, HttpIdentity, PersonIdentity, Profile};
     use sha2::Digest as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestClock(AtomicU64);
+
+    impl TestClock {
+        fn new(millis: u64) -> Self {
+            Self(AtomicU64::new(millis))
+        }
+
+        fn advance(&self, millis: u64) {
+            self.0.fetch_add(millis, Ordering::SeqCst);
+        }
+    }
+
+    impl MonotonicClock for TestClock {
+        fn now(&self) -> MonotonicInstant {
+            MonotonicInstant(self.0.load(Ordering::SeqCst))
+        }
+    }
 
     fn process(pid: u32) -> ProcessIdentity {
         ProcessIdentity::new(pid, 100, Sha256::digest(pid.to_le_bytes()).into())
@@ -1850,24 +1979,63 @@ mod tests {
             .select_credential_binding(request)
             .expect("valid profile")
             .expect("matching binding");
-        CredentialBackendPlan::new(selection, [adapter_identity; 32], [3; 32])
+        let adapter = VerifiedBackendAdapterLease::for_test(
+            selection.backend().clone(),
+            selection.digest(),
+            [adapter_identity; 32],
+            [adapter_identity.wrapping_add(1); 32],
+        );
+        CredentialBackendPlan::from_verified_adapter(selection, adapter, [3; 32])
             .expect("valid backend plan")
     }
 
     fn admitted_semantics(version: &str, stateful: bool) -> VerifiedGitSemantics {
-        let behavior = if stateful {
-            GitCredentialProtocolProbeBehavior::Stateful {
-                state_capability_was_advertised: true,
-                state_was_round_tripped: true,
-            }
-        } else {
-            GitCredentialProtocolProbeBehavior::LegacySerial {
-                unknown_state_was_discarded: true,
-                retry_sequence_was_serial: true,
-            }
-        };
+        let (capability_output, capability_exit, first_input, first_output, second_input) =
+            if stateful {
+                (
+                b"version 0\ncapability authtype\ncapability state\n".to_vec(),
+                0,
+                b"capability[]=state\nprotocol=https\nhost=gus-probe.invalid\n\n".to_vec(),
+                b"capability[]=state\nstate[]=gus-probe-state-v1\ncontinue=true\nusername=probe\npassword=probe\n\n".to_vec(),
+                b"capability[]=state\nprotocol=https\nhost=gus-probe.invalid\nstate[]=gus-probe-state-v1\n\n".to_vec(),
+            )
+            } else {
+                (
+                    b"git: 'credential capability' is not supported\n".to_vec(),
+                    129,
+                    b"protocol=https\nhost=gus-probe.invalid\n\n".to_vec(),
+                    b"state[]=gus-probe-state-v1\nusername=probe\npassword=probe\n\n".to_vec(),
+                    b"protocol=https\nhost=gus-probe.invalid\n\n".to_vec(),
+                )
+            };
+        let transcript = GitCredentialProtocolProbeTranscript::new(vec![
+            GitCredentialProbeExchange::new(
+                GitCredentialProbeAction::Capability,
+                Vec::new(),
+                capability_output,
+                capability_exit,
+                1,
+                2,
+            ),
+            GitCredentialProbeExchange::new(
+                GitCredentialProbeAction::Get,
+                first_input,
+                first_output,
+                0,
+                3,
+                4,
+            ),
+            GitCredentialProbeExchange::new(
+                GitCredentialProbeAction::Get,
+                second_input,
+                b"username=probe\npassword=probe\n\n".to_vec(),
+                0,
+                5,
+                6,
+            ),
+        ]);
         let admission =
-            GitCredentialProtocolAdmission::from_probe([6; 32], version, behavior, [7; 32])
+            GitCredentialProtocolAdmission::from_transcript([6; 32], version, &transcript)
                 .expect("complete probe");
         VerifiedGitSemantics::from_version_output([6; 32], version)
             .expect("valid Git build")
@@ -1882,6 +2050,24 @@ mod tests {
         endpoints: Vec<CanonicalCredentialRequest>,
         max_get_attempts: u16,
     ) -> HttpCredentialCapability {
+        http_with_ttl(
+            issuer,
+            version,
+            stateful,
+            endpoints,
+            max_get_attempts,
+            Duration::from_secs(60),
+        )
+    }
+
+    fn http_with_ttl(
+        issuer: &BrokerIssuer,
+        version: &str,
+        stateful: bool,
+        endpoints: Vec<CanonicalCredentialRequest>,
+        max_get_attempts: u16,
+        ttl: Duration,
+    ) -> HttpCredentialCapability {
         issuer
             .issue_http_deferred(
                 [3; 32],
@@ -1890,14 +2076,9 @@ mod tests {
                 &admitted_semantics(version, stateful),
                 endpoints,
                 max_get_attempts,
-                time(10),
-                time(100),
+                ttl,
             )
             .expect("valid HTTP capability")
-    }
-
-    const fn time(millis: u64) -> MonotonicInstant {
-        MonotonicInstant::from_millis(millis)
     }
 
     fn signing_subject(profile: ProfileBinding, payload: u8) -> SingleUseSubject {
@@ -1935,7 +2116,7 @@ mod tests {
         fn for_plan(plan: &CredentialBackendPlan, secret: &[u8], record: u8) -> Self {
             Self {
                 configured: plan.selection.backend().clone(),
-                adapter_identity: plan.adapter_identity,
+                adapter_identity: plan.adapter.adapter_identity,
                 username: plan.selection.username().to_owned(),
                 secret: secret.to_vec(),
                 record_identity: [record; 32],
@@ -1943,6 +2124,8 @@ mod tests {
             }
         }
     }
+
+    impl credential_backend_sealed::Sealed for FakeBackend {}
 
     impl TrustedCredentialBackend for FakeBackend {
         fn configured_backend(&self) -> &CredentialBackend {
@@ -1983,8 +2166,7 @@ mod tests {
                 process(10),
                 [4; 32],
                 expected.clone(),
-                time(10),
-                time(100),
+                Duration::from_secs(60),
             )
             .expect("valid capability");
         assert_eq!(issuer.active_issuance_count(), 1);
@@ -1994,7 +2176,6 @@ mod tests {
                 [3; 32],
                 [4; 32],
                 &ssh_subject(selected.clone()),
-                time(20),
             ),
             Err(CapabilityError::RoleMismatch)
         );
@@ -2004,15 +2185,15 @@ mod tests {
                 [3; 32],
                 [4; 32],
                 &signing_subject(selected, 12),
-                time(20),
             ),
             Err(CapabilityError::SubjectMismatch)
         );
         capability
-            .claim(process(10), [3; 32], [4; 32], &expected, time(20))
+            .claim(process(10), [3; 32], [4; 32], &expected)
             .expect("first matching claim succeeds");
+        assert_eq!(issuer.active_issuance_count(), 0);
         assert_eq!(
-            capability.claim(process(10), [3; 32], [4; 32], &expected, time(21)),
+            capability.claim(process(10), [3; 32], [4; 32], &expected),
             Err(CapabilityError::AlreadyUsed)
         );
         drop(capability);
@@ -2024,15 +2205,56 @@ mod tests {
                 process(10),
                 [4; 32],
                 expected.clone(),
-                time(10),
-                time(100),
+                Duration::from_secs(60),
             )
             .expect("valid capability");
         drop(issuer);
         assert_eq!(
-            orphaned.claim(process(10), [3; 32], [4; 32], &expected, time(20)),
+            orphaned.claim(process(10), [3; 32], [4; 32], &expected),
             Err(CapabilityError::IssuerUnavailable)
         );
+    }
+
+    #[test]
+    fn issuer_bounds_active_capabilities_and_releases_revocation_immediately() {
+        let issuer = BrokerIssuer::new().expect("OS entropy");
+        let subject = signing_subject(profile_binding("signer", 3), 11);
+        let mut capabilities = (0..MAX_ACTIVE_CAPABILITIES)
+            .map(|_| {
+                issuer
+                    .issue_single_use(
+                        [3; 32],
+                        process(10),
+                        [4; 32],
+                        subject.clone(),
+                        Duration::from_secs(60),
+                    )
+                    .expect("within active issuance bound")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(issuer.active_issuance_count(), MAX_ACTIVE_CAPABILITIES);
+        assert!(matches!(
+            issuer.issue_single_use(
+                [3; 32],
+                process(10),
+                [4; 32],
+                subject.clone(),
+                Duration::from_secs(60),
+            ),
+            Err(CapabilityError::IssuanceLimitReached)
+        ));
+
+        capabilities[0].revoke();
+        assert_eq!(issuer.active_issuance_count(), MAX_ACTIVE_CAPABILITIES - 1);
+        issuer
+            .issue_single_use(
+                [3; 32],
+                process(10),
+                [4; 32],
+                subject,
+                Duration::from_secs(60),
+            )
+            .expect("released slot is reusable");
     }
 
     #[test]
@@ -2051,15 +2273,7 @@ mod tests {
         );
 
         let first = capability
-            .get_stateful(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &get_endpoint,
-                &plan,
-                None,
-                time(20),
-            )
+            .get_stateful(process(10), [3; 32], [4; 32], &get_endpoint, &plan, None)
             .expect("first get");
         let mut first_backend = FakeBackend::for_plan(&plan, b"first secret", 10);
         let first_response = capability
@@ -2071,20 +2285,11 @@ mod tests {
                 &plan,
                 first,
                 &mut first_backend,
-                time(20),
             )
             .expect("first backend response");
 
         assert_eq!(
-            capability.get_stateful(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &get_endpoint,
-                &plan,
-                None,
-                time(21),
-            ),
+            capability.get_stateful(process(10), [3; 32], [4; 32], &get_endpoint, &plan, None,),
             Err(CapabilityError::StateTokenRequired)
         );
         assert_eq!(
@@ -2095,7 +2300,6 @@ mod tests {
                 &get_endpoint,
                 &plan,
                 Some(CredentialAttemptId::from_bytes([99; 32])),
-                time(21),
             ),
             Err(CapabilityError::AttemptMismatch)
         );
@@ -2108,7 +2312,6 @@ mod tests {
                 &get_endpoint,
                 &plan,
                 Some(first),
-                time(21),
             )
             .expect("authenticated retry");
         let mut second_backend = FakeBackend::for_plan(&plan, b"second secret", 20);
@@ -2121,7 +2324,6 @@ mod tests {
                 &plan,
                 second,
                 &mut second_backend,
-                time(21),
             )
             .expect("second backend response");
 
@@ -2134,7 +2336,6 @@ mod tests {
                 &plan,
                 first,
                 &observation(&first_response),
-                time(22),
             ),
             Err(CapabilityError::AttemptMismatch)
         );
@@ -2147,7 +2348,6 @@ mod tests {
                 &plan,
                 second,
                 &observation(&first_response),
-                time(22),
             ),
             Err(CapabilityError::CredentialMaterialMismatch)
         );
@@ -2160,10 +2360,10 @@ mod tests {
                 &plan,
                 second,
                 &observation(&second_response),
-                time(22),
             )
             .expect("latest store");
         assert_eq!(capability.status(), CapabilityStatus::Completed);
+        assert_eq!(issuer.active_issuance_count(), 0);
     }
 
     #[test]
@@ -2186,14 +2386,7 @@ mod tests {
         );
 
         capability
-            .get_legacy(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &get_endpoint,
-                &plan,
-                time(20),
-            )
+            .get_legacy(process(10), [3; 32], [4; 32], &get_endpoint, &plan)
             .expect("first get");
         let mut first_backend = FakeBackend::for_plan(&plan, b"first legacy secret", 30);
         let first_response = capability
@@ -2204,18 +2397,10 @@ mod tests {
                 &get_endpoint,
                 &plan,
                 &mut first_backend,
-                time(20),
             )
             .expect("first backend response");
         assert_eq!(
-            capability.get_legacy(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &get_endpoint,
-                &plan,
-                time(21),
-            ),
+            capability.get_legacy(process(10), [3; 32], [4; 32], &get_endpoint, &plan,),
             Err(CapabilityError::AmbiguousLegacyAttempt)
         );
         capability
@@ -2226,19 +2411,11 @@ mod tests {
                 &response_endpoint,
                 &plan,
                 &observation(&first_response),
-                time(22),
             )
             .expect("erase reopens endpoint");
 
         capability
-            .get_legacy(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &get_endpoint,
-                &plan,
-                time(23),
-            )
+            .get_legacy(process(10), [3; 32], [4; 32], &get_endpoint, &plan)
             .expect("bounded retry");
         let mut second_backend = FakeBackend::for_plan(&plan, b"second legacy secret", 40);
         let second_response = capability
@@ -2249,7 +2426,6 @@ mod tests {
                 &get_endpoint,
                 &plan,
                 &mut second_backend,
-                time(23),
             )
             .expect("second backend response");
         assert_eq!(
@@ -2260,7 +2436,6 @@ mod tests {
                 &response_endpoint,
                 &plan,
                 &observation(&first_response),
-                time(24),
             ),
             Err(CapabilityError::CredentialMaterialMismatch)
         );
@@ -2272,7 +2447,6 @@ mod tests {
                 &response_endpoint,
                 &plan,
                 &observation(&second_response),
-                time(24),
             )
             .expect("latest legacy store");
         assert_eq!(capability.status(), CapabilityStatus::Completed);
@@ -2299,7 +2473,6 @@ mod tests {
                 &get_endpoint,
                 &work_plan,
                 None,
-                time(20),
             )
             .expect("first get");
 
@@ -2313,7 +2486,6 @@ mod tests {
                 &work_plan,
                 attempt,
                 &mut wrong_backend,
-                time(20),
             ),
             Err(CapabilityError::BackendBindingMismatch)
         ));
@@ -2329,7 +2501,6 @@ mod tests {
                 &work_plan,
                 attempt,
                 &mut wrong_adapter,
-                time(20),
             ),
             Err(CapabilityError::BackendBindingMismatch)
         ));
@@ -2342,7 +2513,6 @@ mod tests {
                 &get_endpoint,
                 &personal_plan,
                 Some(attempt),
-                time(21),
             ),
             Err(CapabilityError::ProfileMismatch)
         );
@@ -2362,15 +2532,7 @@ mod tests {
             1,
         );
         let attempt = capability
-            .get_stateful(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &get_endpoint,
-                &plan,
-                None,
-                time(20),
-            )
+            .get_stateful(process(10), [3; 32], [4; 32], &get_endpoint, &plan, None)
             .expect("pending attempt");
         let observed = CredentialObservation::new("git-user", b"unissued").expect("observation");
         assert_eq!(
@@ -2382,7 +2544,6 @@ mod tests {
                 &plan,
                 attempt,
                 &observed,
-                time(21),
             ),
             Err(CapabilityError::CredentialNotRegistered)
         );
@@ -2432,15 +2593,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                capability.get_stateful(
-                    parent,
-                    plan,
-                    helper,
-                    requested_endpoint,
-                    &selected,
-                    None,
-                    time(20),
-                ),
+                capability.get_stateful(parent, plan, helper, requested_endpoint, &selected, None,),
                 Err(expected)
             );
         }
@@ -2448,29 +2601,23 @@ mod tests {
 
     #[test]
     fn multiple_endpoints_complete_independently_and_ttl_revokes_access() {
-        let issuer = BrokerIssuer::new().expect("OS entropy");
+        let clock = Arc::new(TestClock::new(10));
+        let issuer = BrokerIssuer::with_clock(clock.clone()).expect("OS entropy");
         let one = endpoint("one.example.test", "/one.git", None);
         let one_response = endpoint("one.example.test", "/one.git", Some("git-user"));
         let two = endpoint("two.example.test", "/two.git", None);
         let one_plan = backend_plan("work", 7, &one, "git-user", 20);
         let two_plan = backend_plan("work", 7, &two, "git-user", 20);
-        let mut capability = http(
+        let mut capability = http_with_ttl(
             &issuer,
             "git version 2.55.0",
             true,
             vec![one.clone(), two.clone()],
             2,
+            Duration::from_millis(50),
         );
         let attempt = capability
-            .get_stateful(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &one,
-                &one_plan,
-                None,
-                time(20),
-            )
+            .get_stateful(process(10), [3; 32], [4; 32], &one, &one_plan, None)
             .expect("first endpoint");
         let mut backend = FakeBackend::for_plan(&one_plan, b"first endpoint secret", 60);
         let response = capability
@@ -2482,7 +2629,6 @@ mod tests {
                 &one_plan,
                 attempt,
                 &mut backend,
-                time(20),
             )
             .expect("backend response");
         capability
@@ -2494,28 +2640,22 @@ mod tests {
                 &one_plan,
                 attempt,
                 &observation(&response),
-                time(21),
             )
             .expect("store first endpoint");
         assert_eq!(capability.status(), CapabilityStatus::Active);
+        clock.advance(50);
         assert_eq!(
-            capability.get_stateful(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &two,
-                &two_plan,
-                None,
-                time(100),
-            ),
+            capability.get_stateful(process(10), [3; 32], [4; 32], &two, &two_plan, None,),
             Err(CapabilityError::Expired)
         );
         assert_eq!(capability.status(), CapabilityStatus::Revoked);
+        assert_eq!(issuer.active_issuance_count(), 0);
     }
 
     #[test]
-    fn capabilities_enforce_monotonic_not_before_and_maximum_ttl() {
-        let issuer = BrokerIssuer::new().expect("OS entropy");
+    fn broker_owned_clock_enforces_expiry_and_maximum_ttl() {
+        let clock = Arc::new(TestClock::new(10));
+        let issuer = BrokerIssuer::with_clock(clock.clone()).expect("OS entropy");
         let expected = signing_subject(profile_binding("signer", 3), 11);
         let mut capability = issuer
             .issue_single_use(
@@ -2523,23 +2663,23 @@ mod tests {
                 process(10),
                 [4; 32],
                 expected.clone(),
-                time(10),
-                time(100),
+                Duration::from_millis(90),
             )
             .expect("valid bounded capability");
+        clock.advance(90);
         assert_eq!(
-            capability.claim(process(10), [3; 32], [4; 32], &expected, time(9)),
-            Err(CapabilityError::NotYetValid)
+            capability.claim(process(10), [3; 32], [4; 32], &expected),
+            Err(CapabilityError::Expired)
         );
-        assert_eq!(capability.status(), CapabilityStatus::Active);
+        assert_eq!(capability.status(), CapabilityStatus::Revoked);
+        assert_eq!(issuer.active_issuance_count(), 0);
         assert!(matches!(
             issuer.issue_single_use(
                 [3; 32],
                 process(10),
                 [4; 32],
                 expected,
-                time(10),
-                time(10 + MAX_CAPABILITY_TTL_MILLIS + 1),
+                Duration::from_millis(MAX_CAPABILITY_TTL_MILLIS + 1),
             ),
             Err(CapabilityError::InvalidClaim)
         ));
@@ -2559,8 +2699,7 @@ mod tests {
                 &semantics,
                 vec![endpoint("example.test", "/repository.git", None)],
                 1,
-                time(10),
-                time(100),
+                Duration::from_secs(60),
             ),
             Err(CapabilityError::UnsupportedGitCredentialProtocol)
         ));
@@ -2579,14 +2718,7 @@ mod tests {
             1,
         );
         capability
-            .get_legacy(
-                process(10),
-                [3; 32],
-                [4; 32],
-                &get_endpoint,
-                &plan,
-                time(20),
-            )
+            .get_legacy(process(10), [3; 32], [4; 32], &get_endpoint, &plan)
             .expect("legacy attempt");
         let rendered = format!("{capability:?}");
         assert!(rendered.contains("handle: \"<redacted>\""));
@@ -2604,8 +2736,7 @@ mod tests {
                 process(10),
                 [4; 32],
                 signing_subject(profile_binding("signer", 3), 11),
-                time(10),
-                time(100),
+                Duration::from_secs(60),
             )
             .expect("single-use capability");
         let rendered = format!("{single:?}");
