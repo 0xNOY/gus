@@ -42,6 +42,17 @@ pub enum GitSemanticRuleset {
     Unsupported,
 }
 
+/// Credential-helper wire protocol verified for the fixed real Git. This is
+/// intentionally separate from identity-creation semantics: a vendor Git may
+/// be admitted for legacy credential exchange while identity-free merge proof
+/// remains unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitCredentialProtocolRuleset {
+    LegacySerial,
+    Stateful,
+    Unsupported,
+}
+
 /// Identity and semantic version of the fixed real Git selected by the
 /// platform resolver. The digest binds proofs to both the executable identity
 /// and the complete, non-lossy `git --version` observation.
@@ -50,6 +61,7 @@ pub struct VerifiedGitSemantics {
     executable_identity: [u8; 32],
     version_output: String,
     ruleset: GitSemanticRuleset,
+    credential_ruleset: GitCredentialProtocolRuleset,
     digest: [u8; 32],
 }
 
@@ -89,6 +101,11 @@ impl VerifiedGitSemantics {
             (2, 55) => GitSemanticRuleset::Git2_55,
             _ => GitSemanticRuleset::Unsupported,
         };
+        let credential_ruleset = match (major, minor) {
+            (2, 39..=45) => GitCredentialProtocolRuleset::LegacySerial,
+            (2, 46 | 55) => GitCredentialProtocolRuleset::Stateful,
+            _ => GitCredentialProtocolRuleset::Unsupported,
+        };
         let mut digest = Sha256::new();
         digest.update(b"gus.git-semantics.v1\0");
         digest.update(executable_identity);
@@ -99,10 +116,16 @@ impl VerifiedGitSemantics {
             GitSemanticRuleset::Git2_55 => 2,
             GitSemanticRuleset::Unsupported => 0,
         }]);
+        digest.update([match credential_ruleset {
+            GitCredentialProtocolRuleset::LegacySerial => 1,
+            GitCredentialProtocolRuleset::Stateful => 2,
+            GitCredentialProtocolRuleset::Unsupported => 0,
+        }]);
         Ok(Self {
             executable_identity,
             version_output: version_output.to_owned(),
             ruleset,
+            credential_ruleset,
             digest: digest.finalize().into(),
         })
     }
@@ -120,6 +143,11 @@ impl VerifiedGitSemantics {
     #[must_use]
     pub const fn ruleset(&self) -> GitSemanticRuleset {
         self.ruleset
+    }
+
+    #[must_use]
+    pub const fn credential_ruleset(&self) -> GitCredentialProtocolRuleset {
+        self.credential_ruleset
     }
 
     #[must_use]
@@ -703,5 +731,31 @@ mod tests {
                 .expect("valid fixture Git semantics");
         assert_ne!(base.digest(), other_version.digest());
         assert_ne!(base.digest(), other_executable.digest());
+    }
+
+    #[test]
+    fn credential_protocol_ruleset_is_derived_from_verified_git_version() {
+        for version in [
+            "git version 2.39.5",
+            "git version 2.43.0",
+            "git version 2.45.4",
+        ] {
+            assert_eq!(
+                semantics(version).credential_ruleset(),
+                GitCredentialProtocolRuleset::LegacySerial,
+                "{version}"
+            );
+        }
+        for version in ["git version 2.46.0", "git version 2.55.0"] {
+            assert_eq!(
+                semantics(version).credential_ruleset(),
+                GitCredentialProtocolRuleset::Stateful,
+                "{version}"
+            );
+        }
+        assert_eq!(
+            semantics("git version 2.54.0").credential_ruleset(),
+            GitCredentialProtocolRuleset::Unsupported
+        );
     }
 }

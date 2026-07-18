@@ -17,6 +17,6 @@ pub use model::{
     ResolvedEndpoint, ResolvedInvocation, SnapshotGenerations, Transport,
 };
 pub use resolver::{
-    EffectiveConfigEntry, EndpointObservation, GitResolver, GitSemanticRuleset, ResolverSnapshot,
-    VerifiedGitSemantics,
+    EffectiveConfigEntry, EndpointObservation, GitCredentialProtocolRuleset, GitResolver,
+    GitSemanticRuleset, ResolverSnapshot, VerifiedGitSemantics,
 };

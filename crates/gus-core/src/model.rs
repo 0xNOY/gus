@@ -13,6 +13,9 @@ pub enum ProfileRequirement {
     /// profile only if Git actually requests credentials.
     Deferred(RequirementReason),
     Required(RequirementReason),
+    /// The operation cannot be made safe by selecting a profile in this
+    /// release and must be rejected before real Git starts.
+    Unsupported(RequirementReason),
 }
 
 /// Identity environment selected before real Git starts. Identity-free and
@@ -22,6 +25,7 @@ pub enum ProfileRequirement {
 pub enum GitIdentityDisposition {
     NeutralReflog,
     SelectedProfile,
+    Rejected,
 }
 
 pub const NEUTRAL_REFLOG_NAME: &str = "GUS Reflog";
@@ -33,6 +37,7 @@ impl ProfileRequirement {
         match self {
             Self::NotRequired | Self::Deferred(_) => GitIdentityDisposition::NeutralReflog,
             Self::Required(_) => GitIdentityDisposition::SelectedProfile,
+            Self::Unsupported(_) => GitIdentityDisposition::Rejected,
         }
     }
 }
@@ -44,6 +49,8 @@ pub enum RequirementReason {
     SigningIdentity,
     SshTransport,
     HttpCredential,
+    PreHandshakeHttpIdentity,
+    ProxyTransport,
     PublishAuthentication,
     UnresolvedTransport,
     AmbiguousConfiguration,
