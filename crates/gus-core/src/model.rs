@@ -1,4 +1,7 @@
-use std::ffi::{OsStr, OsString};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt,
+};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -28,6 +31,58 @@ pub enum GitIdentityDisposition {
     Rejected,
 }
 
+/// Opaque binding issued before a resolver captures filesystem, config, and
+/// endpoint observations for one exact invocation.
+#[derive(PartialEq, Eq)]
+pub struct ResolutionIntent {
+    invocation_digest: [u8; 32],
+    request_nonce: [u8; 32],
+}
+
+impl fmt::Debug for ResolutionIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolutionIntent")
+            .field("invocation", &"<bound>")
+            .field("request_nonce", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One invocation instance retained while its trusted snapshot is captured.
+/// It can be paired only with the unique [`ResolutionIntent`] issued beside it.
+#[derive(PartialEq, Eq)]
+pub struct ResolutionTarget {
+    invocation: InvocationContext,
+    request_nonce: [u8; 32],
+}
+
+impl fmt::Debug for ResolutionTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolutionTarget")
+            .field("operation", &self.invocation.operation())
+            .field("request_nonce", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ResolutionTarget {
+    #[must_use]
+    pub fn invocation(&self) -> &InvocationContext {
+        &self.invocation
+    }
+
+    pub(crate) fn matches_intent(&self, intent: &ResolutionIntent) -> bool {
+        self.request_nonce == intent.request_nonce
+            && digest_invocation(&self.invocation.normalized().raw_args) == intent.invocation_digest
+    }
+
+    pub(crate) fn into_invocation(self) -> InvocationContext {
+        self.invocation
+    }
+}
+
 pub const NEUTRAL_REFLOG_NAME: &str = "GUS Reflog";
 pub const NEUTRAL_REFLOG_EMAIL: &str = "reflog@gus.invalid";
 
@@ -53,6 +108,8 @@ pub enum RequirementReason {
     ProxyTransport,
     PublishAuthentication,
     UnresolvedTransport,
+    UnresolvedIdentityCreation,
+    UnverifiedCredentialProtocol,
     AmbiguousConfiguration,
     AmbiguousInvocation,
     UnknownOrExternalCommand,
@@ -241,6 +298,7 @@ pub struct ResolutionBinding {
     invocation_digest: [u8; 32],
     repository_identity: [u8; 32],
     git_semantics_digest: [u8; 32],
+    credential_protocol_admitted: bool,
     config_snapshot_digest: [u8; 32],
     head_state_digest: Option<[u8; 32]>,
     generations: SnapshotGenerations,
@@ -260,6 +318,11 @@ impl ResolutionBinding {
     #[must_use]
     pub const fn git_semantics_digest(self) -> [u8; 32] {
         self.git_semantics_digest
+    }
+
+    #[must_use]
+    pub const fn credential_protocol_admitted(self) -> bool {
+        self.credential_protocol_admitted
     }
 
     #[must_use]
@@ -288,6 +351,8 @@ pub enum ResolutionError {
     EndpointSetMismatch,
     #[error("resolver snapshot is missing a required file or endpoint identity")]
     InvalidSnapshot,
+    #[error("a unique resolver capture intent could not be issued")]
+    IntentUnavailable,
 }
 
 /// Output of the trusted resolver after fixed Git has expanded configuration,
@@ -461,6 +526,35 @@ impl InvocationContext {
         policy::unresolved_profile_requirement(self)
     }
 
+    /// Splits this invocation into a retained target and a unique one-shot
+    /// binding that a resolver snapshot must consume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolutionError::IntentUnavailable`] if the operating system
+    /// cannot provide a fresh nonce. No resolver observation should start in
+    /// that case.
+    pub fn begin_resolution_capture(
+        self,
+    ) -> Result<(ResolutionTarget, ResolutionIntent), ResolutionError> {
+        let mut request_nonce = [0_u8; 32];
+        getrandom::fill(&mut request_nonce).map_err(|_| ResolutionError::IntentUnavailable)?;
+        if request_nonce == [0; 32] {
+            return Err(ResolutionError::IntentUnavailable);
+        }
+        let invocation_digest = digest_invocation(&self.invocation.raw_args);
+        Ok((
+            ResolutionTarget {
+                invocation: self,
+                request_nonce,
+            },
+            ResolutionIntent {
+                invocation_digest,
+                request_nonce,
+            },
+        ))
+    }
+
     /// Start a resolver-owned request bound to one repository/config/HEAD
     /// snapshot. Resolver evidence can only be constructed by consuming this
     /// request, preventing evidence produced for another invocation from being
@@ -470,6 +564,7 @@ impl InvocationContext {
         self,
         repository_identity: [u8; 32],
         git_semantics_digest: [u8; 32],
+        credential_protocol_admitted: bool,
         config_snapshot_digest: [u8; 32],
         head_state_digest: Option<[u8; 32]>,
         generations: SnapshotGenerations,
@@ -478,6 +573,7 @@ impl InvocationContext {
             invocation_digest: digest_invocation(&self.invocation.raw_args),
             repository_identity,
             git_semantics_digest,
+            credential_protocol_admitted,
             config_snapshot_digest,
             head_state_digest,
             generations,

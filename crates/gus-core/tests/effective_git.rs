@@ -107,7 +107,12 @@ fn resolved_requirement(
         &git_version,
     )
     .expect("supported or conservative real-Git semantics");
+    let invocation = InvocationContext::parse(args);
+    let (target, intent) = invocation
+        .begin_resolution_capture()
+        .expect("unique fixture capture");
     let snapshot = ResolverSnapshot::new(
+        intent,
         digest(git_dir.as_os_str().as_encoded_bytes()),
         git_semantics,
         Some(head_state),
@@ -119,7 +124,7 @@ fn resolved_requirement(
     )
     .expect("valid real-Git snapshot");
     GitResolver
-        .resolve(InvocationContext::parse(args), snapshot)
+        .resolve(target, snapshot)
         .expect("snapshot matches invocation")
         .profile_requirement()
 }

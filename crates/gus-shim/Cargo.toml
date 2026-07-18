@@ -1,5 +1,5 @@
 [package]
-name = "gus-core"
+name = "gus-shim"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,9 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
-[lib]
-path = "src/lib.rs"
-
 [dependencies]
-getrandom.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+gus-core = { path = "../gus-core" }
+gus-ipc = { path = "../gus-ipc" }
 
 [lints]
 workspace = true

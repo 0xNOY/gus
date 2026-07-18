@@ -6,6 +6,7 @@ members = [
     "crates/gus-ipc",
     "crates/gus-platform",
     "crates/gus-profile",
+    "crates/gus-shim",
 ]
 default-members = [
     "crates/gus-broker",
@@ -13,6 +14,7 @@ default-members = [
     "crates/gus-ipc",
     "crates/gus-platform",
     "crates/gus-profile",
+    "crates/gus-shim",
 ]
 
 [workspace.package]

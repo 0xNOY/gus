@@ -236,10 +236,12 @@ fn classify_operation(command: &str, args: &[OsString]) -> Operation {
         "help" => Operation::Informational,
         "status" | "diff" | "log" | "show" | "blame" | "rev-parse" | "rev-list" | "ls-files"
         | "cat-file" | "for-each-ref" | "show-ref" | "merge-base" | "name-rev" | "check-ignore"
-        | "check-attr" | "count-objects" => Operation::ReadOnly,
+        | "check-attr" | "count-objects" | "grep" | "describe" => Operation::ReadOnly,
         "symbolic-ref" => classify_symbolic_ref(args),
         "remote" => classify_remote(args),
         "branch" => classify_branch(args),
+        "worktree" => classify_worktree(args),
+        "submodule" => classify_submodule(args),
         "add" | "restore" | "checkout" | "switch" | "init" | "reset" | "clean" | "rm" | "mv"
         | "update-index" => Operation::WorkingTree,
         "config" => classify_config(args),
@@ -309,6 +311,9 @@ fn classify_remote(args: &[OsString]) -> Operation {
     match args {
         [] => Operation::ReadOnly,
         [flag] if matches_ascii(flag, &["-v", "--verbose"]) => Operation::ReadOnly,
+        [action, remainder @ ..] if action == "get-url" && remote_get_url_is_read(remainder) => {
+            Operation::ReadOnly
+        }
         [action, ..]
             if matches_ascii(
                 action,
@@ -324,6 +329,48 @@ fn classify_remote(args: &[OsString]) -> Operation {
         {
             Operation::WorkingTree
         }
+        _ => Operation::Unknown,
+    }
+}
+
+fn remote_get_url_is_read(args: &[OsString]) -> bool {
+    let mut remote_names = 0;
+    for argument in args {
+        match argument.to_str() {
+            Some("--push" | "--all") => {}
+            Some(value) if value.starts_with('-') => return false,
+            _ => remote_names += 1,
+        }
+    }
+    remote_names == 1
+}
+
+fn classify_worktree(args: &[OsString]) -> Operation {
+    match args {
+        [] => Operation::ReadOnly,
+        [action, remainder @ ..]
+            if action == "list"
+                && remainder.iter().all(|argument| {
+                    matches_ascii(argument, &["--porcelain", "-z", "--verbose", "-v"])
+                }) =>
+        {
+            Operation::ReadOnly
+        }
+        [action, ..]
+            if matches_ascii(
+                action,
+                &["add", "lock", "move", "prune", "remove", "repair", "unlock"],
+            ) =>
+        {
+            Operation::WorkingTree
+        }
+        _ => Operation::Unknown,
+    }
+}
+
+fn classify_submodule(args: &[OsString]) -> Operation {
+    match args {
+        [action, ..] if matches_ascii(action, &["status", "summary"]) => Operation::ReadOnly,
         _ => Operation::Unknown,
     }
 }
@@ -401,6 +448,25 @@ fn classify_config(args: &[OsString]) -> Operation {
         "--name-only",
         "--null",
         "-z",
+        "--local",
+        "--global",
+        "--system",
+        "--worktree",
+        "--file",
+        "--blob",
+        "--fixed-value",
+        "--includes",
+        "--no-includes",
+        "--default",
+        "--type",
+        "--bool",
+        "--int",
+        "--bool-or-int",
+        "--bool-or-str",
+        "--path",
+        "--expiry-date",
+        "--color",
+        "--no-type",
     ];
 
     let has_read_action = args
@@ -410,7 +476,10 @@ fn classify_config(args: &[OsString]) -> Operation {
         let Some(arg) = arg.to_str() else {
             return true;
         };
-        arg.starts_with('-') && !READ_ACTIONS.contains(&arg) && !READ_MODIFIERS.contains(&arg)
+        arg.starts_with('-')
+            && !READ_ACTIONS.contains(&arg)
+            && !READ_MODIFIERS.contains(&arg)
+            && !matches_config_read_attached_modifier(arg)
     });
 
     if has_read_action && !contains_unknown_option {
@@ -418,6 +487,12 @@ fn classify_config(args: &[OsString]) -> Operation {
     } else {
         Operation::ConfigWriteOrUnknown
     }
+}
+
+fn matches_config_read_attached_modifier(argument: &str) -> bool {
+    ["--file=", "--blob=", "--default=", "--type="]
+        .iter()
+        .any(|prefix| argument.starts_with(prefix) && argument.len() > prefix.len())
 }
 
 fn classify_pull(args: &[OsString]) -> Operation {

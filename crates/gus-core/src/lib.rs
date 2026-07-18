@@ -14,8 +14,8 @@ pub use model::{
     GitIdentityDisposition, GlobalOptions, HttpPreflightDisposition, HttpPreflightEvidence,
     InvocationContext, NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME, NormalizedInvocation, Operation,
     ParseIssue, ProfileRequirement, RequirementReason, ResolutionBinding, ResolutionError,
-    ResolutionEvidence, ResolutionRequest, ResolvedEndpoint, ResolvedInvocation,
-    SnapshotGenerations, Transport,
+    ResolutionEvidence, ResolutionIntent, ResolutionRequest, ResolutionTarget, ResolvedEndpoint,
+    ResolvedInvocation, SnapshotGenerations, Transport,
 };
 pub use resolver::{
     EffectiveConfigEntry, EndpointObservation, GitCredentialProtocolAdmission,

@@ -24,16 +24,20 @@ pub(crate) fn unresolved_profile_requirement(context: &InvocationContext) -> Pro
             ff_only_candidate: true,
             ..
         } => required(RequirementReason::UnresolvedTransport),
-        Operation::LightweightTagCandidate | Operation::SignedTag => {
-            required(RequirementReason::SigningIdentity)
-        }
+        Operation::LightweightTagCandidate
+        | Operation::Merge {
+            ff_only_candidate: true,
+        } => required(RequirementReason::UnresolvedIdentityCreation),
+        Operation::SignedTag => required(RequirementReason::SigningIdentity),
         Operation::Pull {
             ff_only_candidate: false,
             ..
         }
         | Operation::Commit
         | Operation::CommitTree
-        | Operation::Merge { .. }
+        | Operation::Merge {
+            ff_only_candidate: false,
+        }
         | Operation::HistoryRewrite
         | Operation::Stash
         | Operation::AnnotatedTag => required(RequirementReason::AuthorIdentity),
@@ -90,7 +94,7 @@ pub(crate) fn resolved_profile_requirement(context: &ResolvedInvocation) -> Prof
         | Operation::HistoryRewrite
         | Operation::Stash
         | Operation::AnnotatedTag => required(RequirementReason::AuthorIdentity),
-        Operation::Push => required(RequirementReason::PublishAuthentication),
+        Operation::Push => publish(context.evidence()),
         Operation::ConfigWriteOrUnknown => required(RequirementReason::AmbiguousConfiguration),
         Operation::Unknown => required(RequirementReason::UnknownOrExternalCommand),
     }
@@ -150,6 +154,14 @@ fn unsupported_http_preflight(evidence: &ResolutionEvidence) -> Option<ProfileRe
     }) {
         return Some(unsupported(RequirementReason::PreHandshakeHttpIdentity));
     }
+    if evidence
+        .endpoints()
+        .iter()
+        .any(|endpoint| endpoint.transport() == Transport::Http)
+        && !evidence.binding().credential_protocol_admitted()
+    {
+        return Some(unsupported(RequirementReason::UnverifiedCredentialProtocol));
+    }
     None
 }
 
@@ -175,6 +187,19 @@ fn remote_read(evidence: &ResolutionEvidence) -> ProfileRequirement {
         ProfileRequirement::Deferred(RequirementReason::HttpCredential)
     } else {
         ProfileRequirement::NotRequired
+    }
+}
+
+fn publish(evidence: &ResolutionEvidence) -> ProfileRequirement {
+    if evidence.endpoints().is_empty()
+        || evidence
+            .endpoints()
+            .iter()
+            .any(|endpoint| endpoint.transport() == Transport::Unknown)
+    {
+        required(RequirementReason::UnresolvedTransport)
+    } else {
+        required(RequirementReason::PublishAuthentication)
     }
 }
 
@@ -214,8 +239,14 @@ mod tests {
             invocation.operation(),
             Operation::Fetch | Operation::Clone | Operation::LsRemote | Operation::Pull { .. }
         );
-        let request =
-            invocation.begin_resolution([1; 32], [8; 32], [2; 32], Some([3; 32]), generations());
+        let request = invocation.begin_resolution(
+            [1; 32],
+            [8; 32],
+            true,
+            [2; 32],
+            Some([3; 32]),
+            generations(),
+        );
         let endpoints = if needs_fetch_endpoint {
             vec![request.bind_endpoint(EndpointRole::Fetch, transport, [1; 32])]
         } else {
@@ -253,7 +284,14 @@ mod tests {
             (
                 &["tag", "v1"],
                 Operation::LightweightTagCandidate,
-                required(RequirementReason::SigningIdentity),
+                required(RequirementReason::UnresolvedIdentityCreation),
+            ),
+            (
+                &["merge", "--ff-only", "topic"],
+                Operation::Merge {
+                    ff_only_candidate: true,
+                },
+                required(RequirementReason::UnresolvedIdentityCreation),
             ),
             (
                 &["push", "origin", "main"],
@@ -287,7 +325,13 @@ mod tests {
             &["for-each-ref", "--format=%(refname)"],
             &["symbolic-ref", "--short", "HEAD"],
             &["remote", "--verbose"],
+            &["remote", "get-url", "origin"],
             &["branch", "--show-current"],
+            &["worktree", "list", "--porcelain", "-z"],
+            &["submodule", "status", "--recursive"],
+            &["grep", "-n", "needle"],
+            &["describe", "--always"],
+            &["config", "--local", "--get", "remote.origin.url"],
             &["stash", "list"],
             &["stash", "show", "stash@{0}"],
             &["init", "repository"],
@@ -309,6 +353,17 @@ mod tests {
             InvocationContext::parse(["version", "--unknown"]).profile_requirement(),
             required(RequirementReason::UnknownOrExternalCommand)
         );
+        for args in [
+            &["remote", "get-url", "--delete", "origin"][..],
+            &["worktree", "list", "--unknown"][..],
+            &["submodule", "foreach", "arbitrary-command"][..],
+        ] {
+            assert_eq!(
+                InvocationContext::parse(args).profile_requirement(),
+                required(RequirementReason::UnknownOrExternalCommand),
+                "args: {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -334,8 +389,14 @@ mod tests {
     #[test]
     fn every_effective_endpoint_participates_in_remote_policy() {
         let context = InvocationContext::parse(["fetch", "--multiple", "public", "private"]);
-        let request =
-            context.begin_resolution([1; 32], [8; 32], [2; 32], Some([3; 32]), generations());
+        let request = context.begin_resolution(
+            [1; 32],
+            [8; 32],
+            true,
+            [2; 32],
+            Some([3; 32]),
+            generations(),
+        );
         let endpoints = vec![
             request.bind_endpoint(EndpointRole::Fetch, Transport::Http, [1; 32]),
             request.bind_endpoint(EndpointRole::Fetch, Transport::Ssh, [2; 32]),
@@ -358,7 +419,14 @@ mod tests {
     #[test]
     fn recursive_submodule_endpoints_are_bound_and_participate_in_policy() {
         let fetch = InvocationContext::parse(["fetch", "--recurse-submodules", "origin"])
-            .begin_resolution([1; 32], [8; 32], [2; 32], Some([3; 32]), generations());
+            .begin_resolution(
+                [1; 32],
+                [8; 32],
+                true,
+                [2; 32],
+                Some([3; 32]),
+                generations(),
+            );
         let fetch_endpoints = vec![
             fetch.bind_endpoint(EndpointRole::Fetch, Transport::Local, [4; 32]),
             fetch.bind_endpoint(EndpointRole::Submodule, Transport::Ssh, [5; 32]),
@@ -373,7 +441,14 @@ mod tests {
         );
 
         let push = InvocationContext::parse(["push", "--recurse-submodules=on-demand", "origin"])
-            .begin_resolution([1; 32], [8; 32], [2; 32], Some([3; 32]), generations());
+            .begin_resolution(
+                [1; 32],
+                [8; 32],
+                true,
+                [2; 32],
+                Some([3; 32]),
+                generations(),
+            );
         let push_endpoints = vec![
             push.bind_endpoint(EndpointRole::Push, Transport::Http, [4; 32]),
             push.bind_endpoint(EndpointRole::Submodule, Transport::Ssh, [5; 32]),
@@ -391,6 +466,29 @@ mod tests {
             push.profile_requirement(),
             required(RequirementReason::PublishAuthentication)
         );
+
+        let unknown =
+            InvocationContext::parse(["push", "--recurse-submodules=on-demand", "origin"])
+                .begin_resolution(
+                    [1; 32],
+                    [8; 32],
+                    true,
+                    [2; 32],
+                    Some([3; 32]),
+                    generations(),
+                );
+        let unknown_endpoints = vec![
+            unknown.bind_endpoint(EndpointRole::Push, Transport::Local, [4; 32]),
+            unknown.bind_endpoint(EndpointRole::Submodule, Transport::Unknown, [5; 32]),
+        ];
+        let unknown_config = unknown.bind_effective_config(MAY_CREATE, MAY_CREATE, MAY_CREATE);
+        let unknown = unknown
+            .resolve(unknown_endpoints, unknown_config, Vec::new())
+            .expect("unknown transport still forms conservative evidence");
+        assert_eq!(
+            unknown.profile_requirement(),
+            required(RequirementReason::UnresolvedTransport)
+        );
     }
 
     #[test]
@@ -398,16 +496,31 @@ mod tests {
         let status = InvocationContext::parse(["status"]).begin_resolution(
             [1; 32],
             [8; 32],
+            true,
             [2; 32],
             Some([3; 32]),
             generations(),
         );
         let status_binding = status.binding();
         let different_invocation = InvocationContext::parse(["status", "--short"])
-            .begin_resolution([1; 32], [8; 32], [2; 32], Some([3; 32]), generations())
+            .begin_resolution(
+                [1; 32],
+                [8; 32],
+                true,
+                [2; 32],
+                Some([3; 32]),
+                generations(),
+            )
             .binding();
         let different_repository = InvocationContext::parse(["status"])
-            .begin_resolution([9; 32], [8; 32], [2; 32], Some([3; 32]), generations())
+            .begin_resolution(
+                [9; 32],
+                [8; 32],
+                true,
+                [2; 32],
+                Some([3; 32]),
+                generations(),
+            )
             .binding();
 
         assert_ne!(
@@ -434,6 +547,7 @@ mod tests {
         let request_a = InvocationContext::parse(["fetch", "origin"]).begin_resolution(
             [1; 32],
             [8; 32],
+            true,
             [2; 32],
             Some([3; 32]),
             generations(),
@@ -443,6 +557,7 @@ mod tests {
         let request_b = InvocationContext::parse(["fetch", "origin"]).begin_resolution(
             [9; 32],
             [8; 32],
+            true,
             [2; 32],
             Some([3; 32]),
             generations(),
@@ -455,6 +570,7 @@ mod tests {
         let no_head = InvocationContext::parse(["merge", "--ff-only", "topic"]).begin_resolution(
             [1; 32],
             [8; 32],
+            true,
             [2; 32],
             None,
             generations(),
@@ -469,6 +585,7 @@ mod tests {
         let generation_a = InvocationContext::parse(["fetch", "origin"]).begin_resolution(
             [1; 32],
             [8; 32],
+            true,
             [2; 32],
             Some([3; 32]),
             generations(),
@@ -478,6 +595,7 @@ mod tests {
         let generation_b = InvocationContext::parse(["fetch", "origin"]).begin_resolution(
             [1; 32],
             [8; 32],
+            true,
             [2; 32],
             Some([3; 32]),
             wrong_generation,
@@ -492,6 +610,7 @@ mod tests {
         let fetch = InvocationContext::parse(["fetch", "origin"]).begin_resolution(
             [1; 32],
             [8; 32],
+            true,
             [2; 32],
             Some([3; 32]),
             generations(),

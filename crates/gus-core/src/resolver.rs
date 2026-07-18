@@ -4,8 +4,8 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{
     CliBooleanOverride, EndpointRole, HttpPreflightDisposition, IdentityCreationEvidence,
-    InvocationContext, Operation, ResolutionError, ResolvedInvocation, SnapshotGenerations,
-    Transport,
+    Operation, ResolutionError, ResolutionIntent, ResolutionTarget, ResolvedInvocation,
+    SnapshotGenerations, Transport,
 };
 
 /// One effective Git configuration record in the order returned by the fixed
@@ -573,8 +573,9 @@ impl EndpointObservation {
 
 /// Inputs captured atomically by the filesystem/config resolver. The config
 /// digest is computed here rather than accepted from a caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ResolverSnapshot {
+    intent: ResolutionIntent,
     repository_identity: [u8; 32],
     git_semantics: VerifiedGitSemantics,
     head_state_digest: Option<[u8; 32]>,
@@ -596,6 +597,7 @@ impl ResolverSnapshot {
     /// observations rather than a valid snapshot.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        intent: ResolutionIntent,
         repository_identity: [u8; 32],
         git_semantics: VerifiedGitSemantics,
         head_state_digest: Option<[u8; 32]>,
@@ -629,6 +631,7 @@ impl ResolverSnapshot {
         let config_snapshot_digest =
             digest_config(current_branch.as_deref(), &config_entries, &http_preflight);
         Ok(Self {
+            intent,
             repository_identity,
             git_semantics,
             head_state_digest,
@@ -658,13 +661,19 @@ impl GitResolver {
     /// endpoint roles/counts.
     pub fn resolve(
         self,
-        invocation: InvocationContext,
+        target: ResolutionTarget,
         snapshot: ResolverSnapshot,
     ) -> Result<ResolvedInvocation, ResolutionError> {
+        if !target.matches_intent(&snapshot.intent) {
+            return Err(ResolutionError::BindingMismatch);
+        }
+        let invocation = target.into_invocation();
         let config = EffectiveFacts::from_snapshot(&snapshot, invocation.operation());
         let request = invocation.begin_resolution(
             snapshot.repository_identity,
             snapshot.git_semantics.digest(),
+            snapshot.git_semantics.credential_ruleset()
+                != GitCredentialProtocolRuleset::Unsupported,
             snapshot.config_snapshot_digest,
             snapshot.head_state_digest,
             snapshot.generations,
@@ -1016,10 +1025,16 @@ fn digest_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProfileRequirement, RequirementReason};
+    use crate::{InvocationContext, ProfileRequirement, RequirementReason};
 
     fn generations() -> SnapshotGenerations {
         SnapshotGenerations::new(1, 1).expect("valid generations")
+    }
+
+    fn capture(args: &[&str]) -> (ResolutionTarget, ResolutionIntent) {
+        InvocationContext::parse(args)
+            .begin_resolution_capture()
+            .expect("unique fixture capture")
     }
 
     fn entry(name: &str, value: &str) -> EffectiveConfigEntry {
@@ -1100,6 +1115,57 @@ mod tests {
         }
     }
 
+    fn admitted_semantics(version: &str) -> VerifiedGitSemantics {
+        let mut runner = TestProbeRunner {
+            executable_identity: [8; 32],
+            version_output: version.to_owned(),
+            transcript: credential_probe(false),
+        };
+        let admission = GitCredentialProtocolAdmission::from_trusted_runner(&mut runner)
+            .expect("complete credential fixture");
+        semantics(version)
+            .with_credential_protocol_admission(&admission)
+            .expect("credential admission matches fixture Git")
+    }
+
+    fn resolved_http_requirement(
+        args: &[&str],
+        entries: Vec<EffectiveConfigEntry>,
+        observed: HttpPreflightDisposition,
+        credential_admitted: bool,
+    ) -> ProfileRequirement {
+        let (target, intent) = capture(args);
+        let git_semantics = if credential_admitted {
+            admitted_semantics("git version 2.55.0")
+        } else {
+            semantics("git version 2.55.0")
+        };
+        let snapshot = ResolverSnapshot::new(
+            intent,
+            [1; 32],
+            git_semantics,
+            Some([3; 32]),
+            generations(),
+            Some("main".to_owned()),
+            entries,
+            vec![EndpointObservation::new(
+                EndpointRole::Fetch,
+                Transport::Http,
+                [2; 32],
+            )],
+            vec![HttpPreflightObservation::from_verified_probe(
+                EndpointRole::Fetch,
+                [2; 32],
+                observed,
+            )],
+        )
+        .expect("complete HTTP snapshot");
+        GitResolver
+            .resolve(target, snapshot)
+            .expect("valid HTTP resolution")
+            .profile_requirement()
+    }
+
     fn resolve_pull_invocation(
         version: &str,
         args: &[&str],
@@ -1107,7 +1173,9 @@ mod tests {
         head: Option<[u8; 32]>,
         entries: Vec<EffectiveConfigEntry>,
     ) -> ProfileRequirement {
+        let (target, intent) = capture(args);
         let snapshot = ResolverSnapshot::new(
+            intent,
             [1; 32],
             semantics(version),
             head,
@@ -1123,7 +1191,7 @@ mod tests {
         )
         .expect("valid snapshot");
         GitResolver
-            .resolve(InvocationContext::parse(args), snapshot)
+            .resolve(target, snapshot)
             .expect("valid resolution")
             .profile_requirement()
     }
@@ -1195,7 +1263,9 @@ mod tests {
         for version in ["git version 2.39.5", "git version 2.55.0.windows.1"] {
             let semantics = semantics(version);
             assert_ne!(semantics.ruleset(), GitSemanticRuleset::Unsupported);
+            let (target, intent) = capture(&["pull", "--ff-only"]);
             let snapshot = ResolverSnapshot::new(
+                intent,
                 [1; 32],
                 semantics,
                 Some([3; 32]),
@@ -1214,13 +1284,15 @@ mod tests {
             )
             .expect("valid supported snapshot");
             let requirement = GitResolver
-                .resolve(InvocationContext::parse(["pull", "--ff-only"]), snapshot)
+                .resolve(target, snapshot)
                 .expect("valid resolution")
                 .profile_requirement();
             assert_eq!(requirement, ProfileRequirement::NotRequired, "{version}");
         }
 
+        let (target, intent) = capture(&["pull", "--ff-only"]);
         let unsupported = ResolverSnapshot::new(
+            intent,
             [1; 32],
             semantics("git version 2.54.3"),
             Some([3; 32]),
@@ -1239,7 +1311,7 @@ mod tests {
         )
         .expect("unsupported versions still form conservative snapshots");
         let requirement = GitResolver
-            .resolve(InvocationContext::parse(["pull", "--ff-only"]), unsupported)
+            .resolve(target, unsupported)
             .expect("unsupported semantics fail closed in policy")
             .profile_requirement();
         assert_eq!(
@@ -1392,72 +1464,47 @@ mod tests {
 
     #[test]
     fn http_preflight_evidence_rejects_proxy_and_client_identity_before_git() {
-        fn resolve_http(
-            args: &[&str],
-            entries: Vec<EffectiveConfigEntry>,
-            observed: HttpPreflightDisposition,
-        ) -> ProfileRequirement {
-            let snapshot = ResolverSnapshot::new(
-                [1; 32],
-                semantics("git version 2.55.0"),
-                Some([3; 32]),
-                generations(),
-                Some("main".to_owned()),
-                entries,
-                vec![EndpointObservation::new(
-                    EndpointRole::Fetch,
-                    Transport::Http,
-                    [2; 32],
-                )],
-                vec![HttpPreflightObservation::from_verified_probe(
-                    EndpointRole::Fetch,
-                    [2; 32],
-                    observed,
-                )],
-            )
-            .expect("complete HTTP snapshot");
-            GitResolver
-                .resolve(InvocationContext::parse(args), snapshot)
-                .expect("valid HTTP resolution")
-                .profile_requirement()
-        }
-
         assert_eq!(
-            resolve_http(
+            resolved_http_requirement(
                 &["-c", "http.proxy=http://127.0.0.1:8080", "fetch"],
                 vec![entry("http.proxy", "http://127.0.0.1:8080")],
                 HttpPreflightDisposition::HelperCompatible,
+                true,
             ),
             ProfileRequirement::Unsupported(RequirementReason::ProxyTransport)
         );
         assert_eq!(
-            resolve_http(
+            resolved_http_requirement(
                 &["-c", "http.sslCert=/managed/client.pem", "fetch"],
                 vec![entry("http.sslCert", "/managed/client.pem")],
                 HttpPreflightDisposition::HelperCompatible,
+                true,
             ),
             ProfileRequirement::Unsupported(RequirementReason::PreHandshakeHttpIdentity)
         );
         assert_eq!(
-            resolve_http(
+            resolved_http_requirement(
                 &["fetch"],
                 Vec::new(),
                 HttpPreflightDisposition::ProxyTransport,
+                true,
             ),
             ProfileRequirement::Unsupported(RequirementReason::ProxyTransport),
             "platform environment/network observations are also sealed"
         );
         assert_eq!(
-            resolve_http(
+            resolved_http_requirement(
                 &["fetch"],
                 Vec::new(),
                 HttpPreflightDisposition::HelperCompatible,
+                true,
             ),
             ProfileRequirement::Deferred(RequirementReason::HttpCredential)
         );
-
+        let (_, intent) = capture(&["fetch"]);
         assert_eq!(
             ResolverSnapshot::new(
+                intent,
                 [1; 32],
                 semantics("git version 2.55.0"),
                 Some([3; 32]),
@@ -1473,6 +1520,19 @@ mod tests {
             ),
             Err(ResolutionError::InvalidSnapshot),
             "an HTTP endpoint cannot omit preflight evidence"
+        );
+    }
+
+    #[test]
+    fn http_deferred_route_requires_exact_git_credential_admission() {
+        assert_eq!(
+            resolved_http_requirement(
+                &["fetch"],
+                Vec::new(),
+                HttpPreflightDisposition::HelperCompatible,
+                false,
+            ),
+            ProfileRequirement::Unsupported(RequirementReason::UnverifiedCredentialProtocol)
         );
     }
 }
