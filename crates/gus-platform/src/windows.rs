@@ -65,6 +65,13 @@ impl OwnedHandle {
     const fn raw(&self) -> HANDLE {
         self.0
     }
+
+    #[cfg(test)]
+    fn into_raw(self) -> HANDLE {
+        let raw = self.0;
+        std::mem::forget(self);
+        raw
+    }
 }
 
 impl Drop for OwnedHandle {
@@ -679,27 +686,72 @@ fn win32_read_error(resource: ObservationResource, error: u32) -> ObservationErr
 #[cfg(test)]
 mod tests {
     use std::{
-        env, fs,
+        env,
+        ffi::c_void,
+        fmt::Write as _,
+        fs::{self, File},
+        io::Read as _,
+        os::windows::{ffi::OsStrExt as _, io::FromRawHandle as _},
         path::{Path, PathBuf},
         process::{Command, Output},
+        thread,
     };
 
     use std::os::windows::process::CommandExt;
     use tempfile::tempdir;
-    use windows_sys::Win32::System::{
-        Console::{AllocConsole, FreeConsole},
-        Threading::CREATE_NO_WINDOW,
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            Console::{
+                AllocConsole, COORD, ClosePseudoConsole, CreatePseudoConsole, FreeConsole, HPCON,
+            },
+            Pipes::CreatePipe,
+            Threading::{
+                CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
+                EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+                InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
+                TerminateProcess, UpdateProcThreadAttribute,
+            },
+        },
     };
 
     use super::*;
+    use crate::IDENTITY_DIGEST_BYTES;
 
     const CHILD_TEST_NAME: &str = "windows::tests::native_observation_child_probe";
     const CHILD_MODE_ENV: &str = "GUS_WINDOWS_OBSERVER_CHILD_MODE";
     const CHILD_MARKER_ENV: &str = "GUS_WINDOWS_OBSERVER_CHILD_MARKER";
+    const CONPTY_COORDINATOR_TEST_NAME: &str = "windows::tests::native_conpty_coordinator_probe";
+    const CONPTY_DESCENDANT_TEST_NAME: &str = "windows::tests::native_conpty_descendant_probe";
+    const CONPTY_ID_PREFIX: &str = "GUS_CONPTY_ID:";
+    const MAX_CONPTY_OUTPUT_BYTES: u64 = 1024 * 1024;
+    const CONPTY_CHILD_TIMEOUT_MS: u32 = 30_000;
 
     #[test]
     fn current_process_observation_uses_native_windows_evidence() {
-        let observation = observe_current().expect("observe current Windows process");
+        // A headless service runner can expose console membership without a
+        // verifiable console window. That state must remain fail-closed; the
+        // managed fixtures below cover successful classic and pseudo-console
+        // observations independently of the runner's ambient host.
+        let observation = match observe_current() {
+            Ok(observation) => observation,
+            Err(ObservationError::TerminalBindingMismatch) => {
+                assert!(
+                    console_processes()
+                        .expect("inspect ambient console membership")
+                        .is_some(),
+                    "detached ambient process must be observable"
+                );
+                assert_eq!(
+                    observe_console().err(),
+                    Some(ObservationError::TerminalBindingMismatch),
+                    "only an unverifiable ambient console window may fail closed"
+                );
+                return;
+            }
+            Err(error) => panic!("observe current Windows process: {error:?}"),
+        };
         assert_eq!(
             observation.caller().user().family(),
             PlatformFamily::Windows
@@ -719,6 +771,9 @@ mod tests {
     fn native_observation_distinguishes_detached_and_replaced_consoles() {
         run_native_child("detached", b"detached");
         run_native_child("switch-console", b"switched");
+        let first = run_conpty_child();
+        let replacement = run_conpty_child();
+        assert_ne!(first, replacement, "replacement ConPTY reused identity");
     }
 
     #[test]
@@ -747,6 +802,43 @@ mod tests {
             "switch-console" => exercise_console_switch(&marker),
             other => panic!("unexpected native child mode: {other}"),
         }
+    }
+
+    #[test]
+    #[ignore = "internal child process hosted by the ConPTY smoke test"]
+    fn native_conpty_coordinator_probe() {
+        let terminal = observe_current()
+            .expect("observe ConPTY coordinator")
+            .terminal_session()
+            .expect("ConPTY coordinator identity")
+            .terminal();
+        let output = Command::new(env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg(CONPTY_DESCENDANT_TEST_NAME)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .output()
+            .expect("launch inherited ConPTY descendant");
+        assert!(
+            output.status.success(),
+            "ConPTY descendant failed with {:?}\nstdout: {}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(parse_conpty_identity(&output.stdout), terminal.digest);
+        emit_conpty_identity(terminal.digest);
+    }
+
+    #[test]
+    #[ignore = "internal descendant process hosted by the ConPTY smoke test"]
+    fn native_conpty_descendant_probe() {
+        let terminal = observe_current()
+            .expect("observe inherited ConPTY descendant")
+            .terminal_session()
+            .expect("inherited ConPTY identity")
+            .terminal();
+        emit_conpty_identity(terminal.digest);
     }
 
     fn exercise_console_switch(marker: &Path) {
@@ -789,7 +881,11 @@ mod tests {
     fn run_native_child(mode: &str, expected_marker: &[u8]) {
         let directory = tempdir().expect("create native child temp directory");
         let marker = directory.path().join("completed");
-        let output = run_exact_child(mode, &marker, CREATE_NO_WINDOW);
+        // `DETACHED_PROCESS` has the precise property this fixture needs: the
+        // child does not inherit the runner's console and may later create one
+        // with `AllocConsole`. `CREATE_NO_WINDOW` only suppresses a console
+        // window and proved ambiguous under a service-hosted CI runner.
+        let output = run_exact_child(mode, &marker, DETACHED_PROCESS);
         assert_child_success(&output, &marker, mode);
         assert_eq!(
             fs::read(&marker).expect("read native child marker"),
@@ -819,5 +915,283 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(marker.is_file(), "{context} did not create its marker");
+    }
+
+    fn emit_conpty_identity(identity: [u8; IDENTITY_DIGEST_BYTES]) {
+        let mut encoded = String::with_capacity(IDENTITY_DIGEST_BYTES * 2);
+        for byte in identity {
+            write!(&mut encoded, "{byte:02x}").expect("write identity hex");
+        }
+        println!("{CONPTY_ID_PREFIX}{encoded}");
+    }
+
+    fn parse_conpty_identity(output: &[u8]) -> [u8; IDENTITY_DIGEST_BYTES] {
+        let prefix = CONPTY_ID_PREFIX.as_bytes();
+        let start = output
+            .windows(prefix.len())
+            .position(|window| window == prefix)
+            .map_or_else(
+                || {
+                    panic!(
+                        "ConPTY identity marker missing from: {}",
+                        String::from_utf8_lossy(output)
+                    )
+                },
+                |position| position + prefix.len(),
+            );
+        let encoded_len = IDENTITY_DIGEST_BYTES * 2;
+        let encoded = output
+            .get(start..start + encoded_len)
+            .expect("complete ConPTY identity marker");
+        let mut identity = [0_u8; IDENTITY_DIGEST_BYTES];
+        for (index, pair) in encoded.chunks_exact(2).enumerate() {
+            identity[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+        }
+        identity
+    }
+
+    fn hex_nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => panic!("invalid ConPTY identity hex"),
+        }
+    }
+
+    struct OwnedPseudoConsole(HPCON);
+
+    impl Drop for OwnedPseudoConsole {
+        fn drop(&mut self) {
+            // SAFETY: The handle came from one successful
+            // `CreatePseudoConsole` call and is closed exactly once.
+            unsafe {
+                ClosePseudoConsole(self.0);
+            }
+        }
+    }
+
+    struct OwnedAttributeList {
+        _storage: Vec<usize>,
+        pointer: LPPROC_THREAD_ATTRIBUTE_LIST,
+    }
+
+    impl OwnedAttributeList {
+        fn for_pseudoconsole(pseudoconsole: HPCON) -> Self {
+            let mut required = 0_usize;
+            // SAFETY: A null list is the documented size-query form.
+            unsafe {
+                InitializeProcThreadAttributeList(
+                    ptr::null_mut(),
+                    1,
+                    0,
+                    ptr::addr_of_mut!(required),
+                );
+            }
+            assert_ne!(required, 0, "attribute list size query");
+            let word_count = required.div_ceil(size_of::<usize>());
+            let mut storage = vec![0_usize; word_count];
+            let pointer = storage.as_mut_ptr().cast::<c_void>();
+            // SAFETY: `storage` is aligned and writable for at least the byte
+            // count returned by the size query.
+            assert_ne!(
+                unsafe {
+                    InitializeProcThreadAttributeList(pointer, 1, 0, ptr::addr_of_mut!(required))
+                },
+                0,
+                "initialize process attribute list: {:?}",
+                io::Error::last_os_error()
+            );
+            // The ConPTY API contract passes the HPCON value itself as the
+            // attribute payload, rather than a pointer to local storage.
+            // SAFETY: The initialized list and live pseudoconsole handle meet
+            // the attribute contract; optional output pointers are null.
+            assert_ne!(
+                unsafe {
+                    UpdateProcThreadAttribute(
+                        pointer,
+                        0,
+                        usize::try_from(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE)
+                            .expect("pseudoconsole attribute fits usize"),
+                        pseudoconsole as *const c_void,
+                        size_of::<HPCON>(),
+                        ptr::null_mut(),
+                        ptr::null(),
+                    )
+                },
+                0,
+                "set pseudoconsole process attribute: {:?}",
+                io::Error::last_os_error()
+            );
+            Self {
+                _storage: storage,
+                pointer,
+            }
+        }
+    }
+
+    impl Drop for OwnedAttributeList {
+        fn drop(&mut self) {
+            // SAFETY: The pointer is an initialized attribute list and its
+            // backing storage remains alive through this call.
+            unsafe {
+                DeleteProcThreadAttributeList(self.pointer);
+            }
+        }
+    }
+
+    fn run_conpty_child() -> [u8; IDENTITY_DIGEST_BYTES] {
+        let (input_read, input_write) = create_anonymous_pipe();
+        let (output_read, output_write) = create_anonymous_pipe();
+        let mut pseudoconsole_raw = 0_isize;
+        // SAFETY: All pipe handles are synchronous, the dimensions are valid,
+        // and the output handle pointer is writable.
+        let result = unsafe {
+            CreatePseudoConsole(
+                COORD { X: 120, Y: 40 },
+                input_read.raw(),
+                output_write.raw(),
+                0,
+                ptr::addr_of_mut!(pseudoconsole_raw),
+            )
+        };
+        assert!(result >= 0, "create pseudoconsole HRESULT {result:#x}");
+        assert_ne!(pseudoconsole_raw, 0, "nonzero pseudoconsole handle");
+        let pseudoconsole = OwnedPseudoConsole(pseudoconsole_raw);
+        let (process, reader) = launch_conpty_child(pseudoconsole.0, output_read);
+        drop(input_read);
+        drop(output_write);
+
+        // SAFETY: `process` is a live process handle and the timeout is
+        // finite, preventing a broken fixture from hanging the CI job.
+        match unsafe { WaitForSingleObject(process.raw(), CONPTY_CHILD_TIMEOUT_MS) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => {
+                // SAFETY: This is the dedicated test child created above.
+                unsafe {
+                    TerminateProcess(process.raw(), 1);
+                    WaitForSingleObject(process.raw(), CONPTY_CHILD_TIMEOUT_MS);
+                }
+                panic!("ConPTY child timed out");
+            }
+            result => panic!("waiting for ConPTY child failed: {result:#x}"),
+        }
+        let mut exit_code = u32::MAX;
+        // SAFETY: `exit_code` is writable and the process has terminated.
+        assert_ne!(
+            unsafe { GetExitCodeProcess(process.raw(), ptr::addr_of_mut!(exit_code)) },
+            0,
+            "read ConPTY child exit code"
+        );
+        drop(input_write);
+        drop(pseudoconsole);
+        let output = reader.join().expect("join ConPTY output reader");
+        assert!(
+            output.len() <= usize::try_from(MAX_CONPTY_OUTPUT_BYTES).expect("output bound"),
+            "ConPTY child exceeded output bound"
+        );
+        assert_eq!(
+            exit_code,
+            0,
+            "ConPTY child failed:\n{}",
+            String::from_utf8_lossy(&output)
+        );
+        parse_conpty_identity(&output)
+    }
+
+    fn launch_conpty_child(
+        pseudoconsole: HPCON,
+        output_read: OwnedHandle,
+    ) -> (OwnedHandle, thread::JoinHandle<Vec<u8>>) {
+        let attributes = OwnedAttributeList::for_pseudoconsole(pseudoconsole);
+
+        let executable = env::current_exe().expect("current test executable");
+        let mut application: Vec<u16> = executable.as_os_str().encode_wide().collect();
+        application.push(0);
+        let mut command_line = Vec::new();
+        command_line.push(u16::from(b'"'));
+        command_line.extend(executable.as_os_str().encode_wide());
+        command_line.push(u16::from(b'"'));
+        command_line.extend(
+            format!(" --exact {CONPTY_COORDINATOR_TEST_NAME} --ignored --nocapture").encode_utf16(),
+        );
+        command_line.push(0);
+        let startup = STARTUPINFOEXW {
+            StartupInfo: windows_sys::Win32::System::Threading::STARTUPINFOW {
+                cb: u32::try_from(size_of::<STARTUPINFOEXW>()).expect("startup info size fits u32"),
+                ..Default::default()
+            },
+            lpAttributeList: attributes.pointer,
+        };
+        let mut process_info = PROCESS_INFORMATION::default();
+
+        // SAFETY: Ownership of this valid pipe handle is transferred from
+        // `OwnedHandle` to `File` exactly once.
+        let output_file = unsafe { File::from_raw_handle(output_read.into_raw()) };
+        let reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            output_file
+                .take(MAX_CONPTY_OUTPUT_BYTES + 1)
+                .read_to_end(&mut output)
+                .expect("read ConPTY output");
+            output
+        });
+
+        // SAFETY: The mutable command line, initialized extended startup
+        // information, application path, and process output are all valid for
+        // the duration of this call. No unrelated handles are inherited.
+        assert_ne!(
+            unsafe {
+                CreateProcessW(
+                    application.as_ptr(),
+                    command_line.as_mut_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    EXTENDED_STARTUPINFO_PRESENT,
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::addr_of!(startup.StartupInfo),
+                    ptr::addr_of_mut!(process_info),
+                )
+            },
+            0,
+            "launch ConPTY child: {:?}",
+            io::Error::last_os_error()
+        );
+        let process =
+            OwnedHandle::regular(process_info.hProcess, ObservationResource::CallerProcess)
+                .expect("own ConPTY child process");
+        let thread_handle =
+            OwnedHandle::regular(process_info.hThread, ObservationResource::CallerProcess)
+                .expect("own ConPTY child thread");
+        drop(thread_handle);
+        drop(attributes);
+        (process, reader)
+    }
+
+    fn create_anonymous_pipe() -> (OwnedHandle, OwnedHandle) {
+        let mut read = ptr::null_mut();
+        let mut write = ptr::null_mut();
+        // SAFETY: Both handle outputs are writable. Null security attributes
+        // create non-inheritable synchronous handles, as required by ConPTY.
+        assert_ne!(
+            unsafe {
+                CreatePipe(
+                    ptr::addr_of_mut!(read),
+                    ptr::addr_of_mut!(write),
+                    ptr::null(),
+                    0,
+                )
+            },
+            0,
+            "create ConPTY pipe: {:?}",
+            io::Error::last_os_error()
+        );
+        (
+            OwnedHandle::regular(read, ObservationResource::TerminalSession)
+                .expect("own ConPTY read pipe"),
+            OwnedHandle::regular(write, ObservationResource::TerminalSession)
+                .expect("own ConPTY write pipe"),
+        )
     }
 }
