@@ -8,12 +8,25 @@
 
 use std::{fmt, num::NonZeroU32, num::NonZeroU64};
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+mod bsd;
+#[cfg(any(target_os = "macos", target_os = "freebsd", test))]
+mod bsd_model;
+#[cfg(target_os = "freebsd")]
+mod freebsd;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(any(target_os = "windows", test))]
@@ -45,7 +58,13 @@ impl OsUserIdentity {
         self.family
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
         Self {
             family,
@@ -74,7 +93,13 @@ impl fmt::Debug for OsUserIdentity {
 pub struct ProcessTimeDomainIdentity([u8; IDENTITY_DIGEST_BYTES]);
 
 impl ProcessTimeDomainIdentity {
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
         Self(identity_digest(
             b"gus.platform.process-time-domain.v1",
@@ -120,7 +145,13 @@ impl ProcessIdentity {
         self.time_domain
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     const fn from_observation(
         time_domain: ProcessTimeDomainIdentity,
         pid: NonZeroU32,
@@ -161,7 +192,13 @@ impl TerminalIdentity {
         self.family
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
         Self {
             family,
@@ -198,7 +235,13 @@ impl TerminalSessionIdentity {
         self.anchor_process
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     const fn from_observation(terminal: TerminalIdentity, anchor_process: ProcessIdentity) -> Self {
         Self {
             terminal,
@@ -236,7 +279,13 @@ impl LocalSessionObservation {
         self.terminal.is_some()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows",
+        test
+    ))]
     const fn from_observation(
         caller: ProcessIdentity,
         parent_pid: Option<NonZeroU32>,
@@ -276,7 +325,20 @@ impl CurrentSessionObserver {
         {
             windows::observe_current()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(target_os = "macos")]
+        {
+            macos::observe_current()
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            freebsd::observe_current()
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "windows"
+        )))]
         {
             Err(ObservationError::UnsupportedPlatform)
         }
@@ -333,7 +395,13 @@ pub enum ObservationError {
     TerminalBindingMismatch,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows",
+    test
+))]
 fn identity_digest(
     domain: &[u8],
     family: PlatformFamily,
