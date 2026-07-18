@@ -38,6 +38,7 @@ mod peer_linux;
 mod peer_macos;
 #[cfg(target_os = "windows")]
 mod peer_windows;
+mod real_git;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(any(target_os = "windows", test))]
@@ -53,6 +54,12 @@ pub use peer_macos::{AuthenticatedUnixStream, PeerAuthenticationError};
 pub use peer_windows::{
     AuthenticatedNamedPipe, ConnectedClientPipe, ConnectedServerPipe, NamedPipeListener,
     PeerAuthenticationError, connect_named_pipe,
+};
+#[cfg(target_os = "windows")]
+pub use real_git::TrustedPrelaunchExecutableLease;
+pub use real_git::{
+    CurrentExecutableEvidence, ExclusionSnapshotId, ExecutableCandidate, ExecutableExclusionSet,
+    ExecutableIdentity, ExecutablePathBinding, RealGitArtifactError,
 };
 
 const IDENTITY_DIGEST_BYTES: usize = 32;
