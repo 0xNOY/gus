@@ -989,6 +989,11 @@ mod tests {
                 },
             )
             .expect("write tampered response");
+            let mut acknowledgement = [0];
+            assert!(
+                client.read_exact(&mut acknowledgement).is_err(),
+                "server must close without acknowledging a tampered proof"
+            );
         });
         assert_eq!(
             AuthenticatedUnixStream::authenticate_incoming(server)
