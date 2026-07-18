@@ -5,6 +5,9 @@
 //! arguments. Their constructors are deliberately private. The identities are
 //! suitable for equality and hashing, but they do not make processes sharing
 //! one OS user into mutually distrustful security principals.
+//! FreeBSD observations are scoped to one prison: the kernel reports the
+//! observer's current prison as JID zero, so brokers, sockets, and stored
+//! session authority must never be shared across prison boundaries.
 
 use std::{fmt, num::NonZeroU32, num::NonZeroU64};
 
@@ -45,7 +48,8 @@ pub enum PlatformFamily {
     Other,
 }
 
-/// Opaque identity for one local OS user.
+/// Opaque identity for one local OS user in this observer's native isolation
+/// boundary.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OsUserIdentity {
     family: PlatformFamily,
@@ -85,7 +89,7 @@ impl fmt::Debug for OsUserIdentity {
 
 /// Opaque identity for the native time domain of a process start value.
 ///
-/// Linux uses the host boot ID because `/proc` reports ticks since boot.
+/// Linux and FreeBSD bind a host boot ID to boot-relative process time.
 /// Platforms whose process creation time has an absolute epoch bind that epoch
 /// instead. Consumers compare this value together with `start_time` and never
 /// interpret either field in isolation.

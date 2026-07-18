@@ -1,4 +1,4 @@
-use std::{io, num::NonZeroU32, ptr::NonNull};
+use std::{io, mem::MaybeUninit, num::NonZeroU32, ptr::NonNull};
 
 use crate::{
     LocalSessionObservation, ObservationError, ObservationResource, PlatformFamily,
@@ -69,6 +69,7 @@ fn read_process(
     pid: NonZeroU32,
     resource: ObservationResource,
 ) -> Result<ProcessFacts, ObservationError> {
+    let boot_time_before = read_boot_time()?;
     let native_pid =
         i32::try_from(pid.get()).map_err(|_| ObservationError::Malformed { resource })?;
     // `kinfo_getproc` can return null from its own exact-size validation
@@ -103,35 +104,44 @@ fn read_process(
     if information.ki_structsize != expected_size
         || information.ki_layout != 0
         || information.ki_pid != native_pid
-        || information.ki_stat == libc::SZOMB
     {
         return Err(ObservationError::Malformed { resource });
     }
+    if information.ki_stat == libc::SZOMB {
+        return Err(zombie_error(resource));
+    }
 
-    let session_id = pid_to_nonzero(information.ki_sid, resource)?;
+    let session_id = required_pid(information.ki_sid, resource)?;
     let terminal_device = (information.ki_tdev != u64::MAX).then_some(information.ki_tdev);
     let terminal_session_id = NonZeroU32::new(
         u32::try_from(information.ki_tsid).map_err(|_| ObservationError::Malformed { resource })?,
     );
-    let process_group_id = pid_to_nonzero(information.ki_pgid, resource)?;
+    let process_group_id = required_pid(information.ki_pgid, resource)?;
     let jail_id =
         u32::try_from(information.ki_jid).map_err(|_| ObservationError::Malformed { resource })?;
     let flags = usize::try_from(information.ki_kiflag)
         .map_err(|_| ObservationError::Malformed { resource })?;
-    let start_time = timeval_start(
+    let absolute_start = timeval_start(
         i128::from(information.ki_start.tv_sec),
         i128::from(information.ki_start.tv_usec),
         resource,
     )?;
+    let boot_time_after = read_boot_time()?;
+    if boot_time_before != boot_time_after {
+        return Err(ObservationError::ProcessChanged);
+    }
+    let start_time = absolute_start
+        .get()
+        .checked_sub(boot_time_before.get())
+        .and_then(std::num::NonZeroU64::new)
+        .ok_or(ObservationError::Malformed { resource })?;
     if resource == ObservationResource::CallerProcess {
         validate_current_process(information, session_id, resource)?;
     }
 
     Ok(ProcessFacts {
         pid,
-        parent_pid: u32::try_from(information.ki_ppid)
-            .ok()
-            .and_then(NonZeroU32::new),
+        parent_pid: optional_pid(information.ki_ppid, resource)?,
         process_group_id,
         session_id,
         terminal_device,
@@ -142,6 +152,55 @@ fn read_process(
         effective_uid: information.ki_uid,
         user_namespace: jail_id,
     })
+}
+
+fn read_boot_time() -> Result<std::num::NonZeroU64, ObservationError> {
+    let resource = ObservationResource::ProcessTimeDomain;
+    let mut value = MaybeUninit::<libc::timeval>::uninit();
+    let mut length = size_of::<libc::timeval>();
+    // SAFETY: the name is static and NUL-terminated; `value` is correctly
+    // sized writable storage. This is a read-only sysctl.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            value.as_mut_ptr().cast(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result == -1 {
+        return Err(last_read_error(resource));
+    }
+    if length != size_of::<libc::timeval>() {
+        return Err(ObservationError::Malformed { resource });
+    }
+    // SAFETY: the exact-size successful sysctl initialized the structure.
+    let value = unsafe { value.assume_init() };
+    timeval_start(
+        i128::from(value.tv_sec),
+        i128::from(value.tv_usec),
+        resource,
+    )
+}
+
+fn optional_pid(
+    value: libc::pid_t,
+    resource: ObservationResource,
+) -> Result<Option<NonZeroU32>, ObservationError> {
+    u32::try_from(value)
+        .map(NonZeroU32::new)
+        .map_err(|_| ObservationError::Malformed { resource })
+}
+
+fn required_pid(
+    value: libc::pid_t,
+    resource: ObservationResource,
+) -> Result<NonZeroU32, ObservationError> {
+    u32::try_from(value)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(ObservationError::Malformed { resource })
 }
 
 fn validate_current_process(
@@ -160,15 +219,32 @@ fn validate_current_process(
             libc::getsid(0),
         )
     };
+    if process_group == -1 || session == -1 {
+        return Err(ObservationError::Read {
+            resource,
+            kind: io::Error::last_os_error().kind(),
+        });
+    }
     if pid != information.ki_pid
         || parent_pid != information.ki_ppid
         || effective_uid != information.ki_uid
         || process_group != information.ki_pgid
         || u32::try_from(session).ok() != Some(session_id.get())
     {
-        return Err(ObservationError::Malformed { resource });
+        return Err(ObservationError::ProcessChanged);
     }
     Ok(())
+}
+
+fn zombie_error(resource: ObservationResource) -> ObservationError {
+    if resource == ObservationResource::TerminalAnchorProcess {
+        ObservationError::Read {
+            resource,
+            kind: io::ErrorKind::NotFound,
+        }
+    } else {
+        ObservationError::Malformed { resource }
+    }
 }
 
 struct KinfoAllocation(NonNull<libc::c_void>);

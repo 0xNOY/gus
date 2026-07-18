@@ -17,8 +17,9 @@ pub(super) struct ProcessFacts {
     pub(super) is_session_leader: bool,
     pub(super) start_time: NonZeroU64,
     pub(super) effective_uid: u32,
-    /// Native user namespace. This is zero on macOS and the jail ID on
-    /// FreeBSD, where identical UIDs in different jails are not one user.
+    /// Native namespace discriminator visible to this observer. This is zero
+    /// on macOS. FreeBSD reports a target jail ID to a host observer but zero
+    /// for the observer's own prison, so it is not a global jail identity.
     pub(super) user_namespace: u32,
 }
 
@@ -42,6 +43,7 @@ pub(super) fn timeval_start(
 pub(super) struct TerminalFacts {
     pub(super) terminal_device: u64,
     pub(super) session_id: NonZeroU32,
+    pub(super) device_binding_matches: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +109,7 @@ pub(super) fn assemble_observation(
                 || caller_first.session_id != first.session_id
                 || !caller_first.has_control_terminal
                 || caller_first.terminal_session_id != Some(caller_first.session_id)
+                || !first.device_binding_matches
                 || leader_first.pid != caller_first.session_id
                 || leader_first.process_group_id != caller_first.session_id
                 || leader_first.session_id != caller_first.session_id
@@ -174,6 +177,7 @@ mod tests {
         TerminalFacts {
             terminal_device: 30,
             session_id: NonZeroU32::new(9).expect("nonzero test session"),
+            device_binding_matches: true,
         }
     }
 
@@ -309,6 +313,7 @@ mod tests {
         assert_changed(|facts| {
             facts.session_id = NonZeroU32::new(10).expect("nonzero test session");
         });
+        assert_changed(|facts| facts.device_binding_matches = false);
     }
 
     #[test]
@@ -433,5 +438,33 @@ mod tests {
                 Err(ObservationError::Malformed { resource })
             );
         }
+    }
+
+    #[test]
+    fn terminal_attachment_race_is_a_process_change() {
+        let caller_first = process(42, 7, 42, None, 200, 1000);
+        let mut caller_second = caller_first;
+        caller_second.terminal_device = Some(30);
+        caller_second.terminal_session_id = Some(caller_second.session_id);
+        caller_second.has_control_terminal = true;
+        let mut access = terminal();
+        access.terminal_device = u64::MAX;
+        access.device_binding_matches = false;
+        let leader = process(42, 7, 42, Some(30), 200, 1000);
+        assert_eq!(
+            assemble_observation(
+                PlatformFamily::FreeBsd,
+                time_domain(),
+                caller_first,
+                TerminalEvidence::Attached {
+                    first: access,
+                    leader_first: leader,
+                    leader_second: leader,
+                    second: Some(access),
+                },
+                caller_second,
+            ),
+            Err(ObservationError::ProcessChanged)
+        );
     }
 }

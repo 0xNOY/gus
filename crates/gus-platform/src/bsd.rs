@@ -29,16 +29,17 @@ pub(super) fn observe_current<B: ProcessBackend>()
     let caller_first = B::read_process(pid, ObservationResource::CallerProcess)?;
     let first_terminal = open_terminal()?;
 
-    let terminal = match first_terminal {
-        None => TerminalEvidence::Detached {
-            second: open_terminal()?
-                .map(|terminal| {
+    let (terminal, monitor) = match first_terminal {
+        None => (
+            TerminalEvidence::Detached {
+                second: open_terminal()?.map(|terminal| {
                     terminal
                         .access
                         .with_terminal_device(caller_first.terminal_device)
-                })
-                .transpose()?,
-        },
+                }),
+            },
+            None,
+        ),
         Some(first_terminal) => {
             let leader_first = B::read_process(
                 caller_first.session_id,
@@ -49,22 +50,23 @@ pub(super) fn observe_current<B: ProcessBackend>()
                 caller_first.session_id,
                 ObservationResource::TerminalAnchorProcess,
             ))?;
-            let second = open_terminal()?
-                .map(|terminal| {
-                    terminal
-                        .access
-                        .with_terminal_device(caller_first.terminal_device)
-                })
-                .transpose()?;
-            monitor.ensure_live()?;
-            TerminalEvidence::Attached {
-                first: first_terminal
+            let second = open_terminal()?.map(|terminal| {
+                terminal
                     .access
-                    .with_terminal_device(caller_first.terminal_device)?,
-                leader_first,
-                leader_second,
-                second,
-            }
+                    .with_terminal_device(caller_first.terminal_device)
+            });
+            monitor.ensure_live()?;
+            (
+                TerminalEvidence::Attached {
+                    first: first_terminal
+                        .access
+                        .with_terminal_device(caller_first.terminal_device),
+                    leader_first,
+                    leader_second,
+                    second,
+                },
+                Some(monitor),
+            )
         }
     };
 
@@ -72,13 +74,17 @@ pub(super) fn observe_current<B: ProcessBackend>()
     if B::time_domain()? != time_domain {
         return Err(ObservationError::ProcessChanged);
     }
-    assemble_observation(
+    let observation = assemble_observation(
         B::FAMILY,
         time_domain,
         caller_first,
         terminal,
         caller_second,
-    )
+    )?;
+    if let Some(monitor) = monitor {
+        monitor.ensure_live()?;
+    }
+    Ok(observation)
 }
 
 struct ProcessExitMonitor {
@@ -90,7 +96,7 @@ impl ProcessExitMonitor {
         // SAFETY: `kqueue` has no arguments and returns a new descriptor.
         let raw = unsafe { libc::kqueue() };
         if raw == -1 {
-            return Err(last_read_error(ObservationResource::TerminalAnchorProcess));
+            return Err(last_anchor_monitor_error());
         }
         // SAFETY: `kqueue` returned a new descriptor transferred exactly once.
         let queue = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -125,7 +131,7 @@ impl ProcessExitMonitor {
             )
         };
         if count == -1 {
-            return Err(last_read_error(ObservationResource::TerminalAnchorProcess));
+            return Err(last_anchor_monitor_error());
         }
         if count == 0 {
             return Ok(());
@@ -134,7 +140,12 @@ impl ProcessExitMonitor {
         let data = event_data(&event);
         if flags & libc::EV_ERROR != 0 {
             if data == 0 {
-                return Ok(());
+                return Err(ObservationError::Malformed {
+                    resource: ObservationResource::TerminalAnchorProcess,
+                });
+            }
+            if data == i64::from(libc::ESRCH) {
+                return Err(ObservationError::TerminalAnchorChanged);
             }
             return Err(ObservationError::Read {
                 resource: ObservationResource::TerminalAnchorProcess,
@@ -148,6 +159,18 @@ impl ProcessExitMonitor {
         Err(ObservationError::Malformed {
             resource: ObservationResource::TerminalAnchorProcess,
         })
+    }
+}
+
+fn last_anchor_monitor_error() -> ObservationError {
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        ObservationError::TerminalAnchorChanged
+    } else {
+        ObservationError::Read {
+            resource: ObservationResource::TerminalAnchorProcess,
+            kind: error.kind(),
+        }
     }
 }
 
@@ -244,21 +267,15 @@ struct TerminalAccessFacts {
 }
 
 impl TerminalAccessFacts {
-    fn with_terminal_device(
-        self,
-        terminal_device: Option<u64>,
-    ) -> Result<TerminalFacts, ObservationError> {
-        let terminal_device = terminal_device.ok_or(ObservationError::TerminalBindingMismatch)?;
-        if self
-            .resolved_device
-            .is_some_and(|resolved| resolved != terminal_device)
-        {
-            return Err(ObservationError::TerminalBindingMismatch);
-        }
-        Ok(TerminalFacts {
+    fn with_terminal_device(self, terminal_device: Option<u64>) -> TerminalFacts {
+        let terminal_device = terminal_device.unwrap_or(u64::MAX);
+        TerminalFacts {
             terminal_device,
             session_id: self.session_id,
-        })
+            device_binding_matches: self
+                .resolved_device
+                .is_none_or(|resolved| resolved == terminal_device),
+        }
     }
 }
 
@@ -346,12 +363,16 @@ mod tests {
             unix::process::CommandExt,
         },
         path::Path,
+        path::PathBuf,
         process::{Command, Output, Stdio},
     };
 
     const CHILD_TEST_NAME: &str = "bsd::tests::native_observation_child_probe";
     const EXPECTATION_ENV: &str = "GUS_BSD_OBSERVER_CHILD_EXPECTATION";
     const MARKER_ENV: &str = "GUS_BSD_OBSERVER_CHILD_MARKER";
+    const DESCENDANT_TEST_NAME: &str = "bsd::tests::native_inherited_descendant_probe";
+    const DESCENDANT_EXPECTED_ENV: &str = "GUS_BSD_DESCENDANT_EXPECTED_IDENTITY";
+    const DESCENDANT_MARKER_ENV: &str = "GUS_BSD_DESCENDANT_MARKER";
 
     #[test]
     fn current_process_observation_uses_native_bsd_evidence() {
@@ -376,7 +397,34 @@ mod tests {
             .observe()
             .expect("child native BSD observation");
         assert_eq!(observation.has_terminal_session(), expectation == "tty");
-        std::fs::write(marker, b"observed").expect("write native probe marker");
+        if expectation == "tty" {
+            let terminal = observation
+                .terminal_session()
+                .expect("attached child terminal identity");
+            let fingerprint = terminal_fingerprint(terminal);
+            assert_inherited_descendant(&fingerprint, &marker);
+            std::fs::write(marker, fingerprint).expect("write attached native probe marker");
+        } else {
+            std::fs::write(marker, b"headless").expect("write detached native probe marker");
+        }
+    }
+
+    #[test]
+    #[ignore = "internal descendant for native BSD session smoke tests"]
+    fn native_inherited_descendant_probe() {
+        let (Ok(expected), Some(marker)) = (
+            std::env::var(DESCENDANT_EXPECTED_ENV),
+            std::env::var_os(DESCENDANT_MARKER_ENV),
+        ) else {
+            return;
+        };
+        let terminal = crate::CurrentSessionObserver::new()
+            .observe()
+            .expect("inherited descendant observation")
+            .terminal_session()
+            .expect("inherited descendant terminal identity");
+        assert_eq!(terminal_fingerprint(terminal), expected);
+        std::fs::write(marker, b"observed").expect("write descendant probe marker");
     }
 
     #[test]
@@ -385,6 +433,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("probe marker directory");
         let detached_marker = directory.path().join("detached.marker");
         let attached_marker = directory.path().join("attached.marker");
+        let second_attached_marker = directory.path().join("attached-second.marker");
 
         let mut detached = native_probe_command(&executable, "headless", &detached_marker);
         detached.stdin(Stdio::null());
@@ -399,11 +448,21 @@ mod tests {
             });
         }
         let detached_output = detached.output().expect("detached probe output");
-        assert_native_probe(&detached_output, &detached_marker, "detached");
+        assert_native_probe(&detached_output, &detached_marker, "detached", b"headless");
 
+        run_attached_probe(&executable, &attached_marker, "first PTY");
+        run_attached_probe(&executable, &second_attached_marker, "second PTY");
+        assert_ne!(
+            std::fs::read(&attached_marker).expect("read first PTY identity"),
+            std::fs::read(&second_attached_marker).expect("read second PTY identity"),
+            "independently generated PTY sessions must have distinct identities"
+        );
+    }
+
+    fn run_attached_probe(executable: &Path, marker: &Path, label: &str) {
         let (master, slave) = open_pty().expect("open PTY");
         let slave_fd = slave.as_raw_fd();
-        let mut attached = native_probe_command(&executable, "tty", &attached_marker);
+        let mut attached = native_probe_command(executable, "tty", marker);
         attached.stdin(Stdio::null());
         // SAFETY: `slave_fd` is an inherited PTY descriptor. `setsid` and
         // `ioctl(TIOCSCTTY)` are async-signal-safe system calls.
@@ -419,9 +478,45 @@ mod tests {
             });
         }
         let attached_output = attached.output().expect("PTY probe output");
-        assert_native_probe(&attached_output, &attached_marker, "PTY");
+        assert_native_probe_nonempty(&attached_output, marker, label);
         drop(master);
         drop(slave);
+    }
+
+    fn assert_inherited_descendant(expected: &str, parent_marker: &std::ffi::OsStr) {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut descendant_marker = PathBuf::from(parent_marker);
+        descendant_marker.set_extension("descendant.marker");
+        let output = Command::new(executable)
+            .arg("--exact")
+            .arg(DESCENDANT_TEST_NAME)
+            .arg("--ignored")
+            .env(DESCENDANT_EXPECTED_ENV, expected)
+            .env(DESCENDANT_MARKER_ENV, &descendant_marker)
+            .output()
+            .expect("inherited descendant probe output");
+        assert_native_probe(
+            &output,
+            &descendant_marker,
+            "inherited descendant",
+            b"observed",
+        );
+    }
+
+    fn terminal_fingerprint(terminal: crate::TerminalSessionIdentity) -> String {
+        let anchor = terminal.anchor_process;
+        let mut bytes = Vec::with_capacity(108);
+        bytes.extend_from_slice(&terminal.terminal.digest);
+        bytes.extend_from_slice(&anchor.time_domain.0);
+        bytes.extend_from_slice(&anchor.pid.get().to_le_bytes());
+        bytes.extend_from_slice(&anchor.start_time.get().to_le_bytes());
+        bytes.extend_from_slice(&anchor.user.digest);
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(encoded, "{byte:02x}").expect("write to string");
+        }
+        encoded
     }
 
     #[cfg(target_os = "macos")]
@@ -447,7 +542,7 @@ mod tests {
         command
     }
 
-    fn assert_native_probe(output: &Output, marker: &Path, label: &str) {
+    fn assert_native_probe(output: &Output, marker: &Path, label: &str, expected: &[u8]) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -455,14 +550,28 @@ mod tests {
             "{label} native probe failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             output.status
         );
-        assert_eq!(
-            std::fs::read(marker).unwrap_or_else(|error| {
+        let contents = std::fs::read(marker).unwrap_or_else(|error| {
                 panic!(
                     "{label} native probe did not create its marker: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
                 )
-            }),
-            b"observed"
+            });
+        assert_eq!(contents, expected);
+    }
+
+    fn assert_native_probe_nonempty(output: &Output, marker: &Path, label: &str) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{label} native probe failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
         );
+        let contents = std::fs::read(marker).unwrap_or_else(|error| {
+            panic!(
+                "{label} native probe did not create its marker: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )
+        });
+        assert!(!contents.is_empty(), "{label} identity marker was empty");
     }
 
     fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd)> {

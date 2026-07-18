@@ -79,8 +79,11 @@ fn read_process(
     }
     // SAFETY: an exact-size successful result initialized the whole structure.
     let information = unsafe { information.assume_init() };
-    if information.pbi_pid != pid.get() || information.pbi_status == libc::SZOMB {
+    if information.pbi_pid != pid.get() {
         return Err(ObservationError::Malformed { resource });
+    }
+    if information.pbi_status == libc::SZOMB {
+        return Err(zombie_error(resource));
     }
 
     // SAFETY: `getsid` only reads process metadata for the requested PID.
@@ -129,13 +132,30 @@ fn validate_current_process(
             libc::getsid(0),
         )
     };
+    if process_group == -1 || session == -1 {
+        return Err(ObservationError::Read {
+            resource,
+            kind: io::Error::last_os_error().kind(),
+        });
+    }
     if u32::try_from(pid).ok() != Some(information.pbi_pid)
         || u32::try_from(parent_pid).ok() != Some(information.pbi_ppid)
         || effective_uid != information.pbi_uid
         || u32::try_from(process_group).ok() != Some(information.pbi_pgid)
         || u32::try_from(session).ok() != Some(session_id.get())
     {
-        return Err(ObservationError::Malformed { resource });
+        return Err(ObservationError::ProcessChanged);
     }
     Ok(())
+}
+
+fn zombie_error(resource: ObservationResource) -> ObservationError {
+    if resource == ObservationResource::TerminalAnchorProcess {
+        ObservationError::Read {
+            resource,
+            kind: io::ErrorKind::NotFound,
+        }
+    } else {
+        ObservationError::Malformed { resource }
+    }
 }
