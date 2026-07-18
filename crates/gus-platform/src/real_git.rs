@@ -2567,12 +2567,12 @@ mod tests {
         tempfile::tempdir().expect("temporary directory")
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn native_fixture_path() -> PathBuf {
         PathBuf::from("/usr/bin/echo")
     }
 
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     fn native_fixture_path() -> PathBuf {
         PathBuf::from("/bin/echo")
     }
