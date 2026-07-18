@@ -1,0 +1,1 @@
+{"protocol_version":1,"request_id":"7f86b094-6af1-44e6-b967-6050fe782a89","message":{"type":"resolve_selection","body":{"plan_digest":"1111111111111111111111111111111111111111111111111111111111111111","repository_identity":"2222222222222222222222222222222222222222222222222222222222222222","operation":"commit","interaction":"foreground","explicit_profile":null}}}
