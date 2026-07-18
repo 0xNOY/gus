@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 use crate::{parser, policy};
 
@@ -12,6 +13,28 @@ pub enum ProfileRequirement {
     /// profile only if Git actually requests credentials.
     Deferred(RequirementReason),
     Required(RequirementReason),
+}
+
+/// Identity environment selected before real Git starts. Identity-free and
+/// deferred operations still receive a neutral identity so reflog writes never
+/// inherit another session's ambient user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitIdentityDisposition {
+    NeutralReflog,
+    SelectedProfile,
+}
+
+pub const NEUTRAL_REFLOG_NAME: &str = "GUS Reflog";
+pub const NEUTRAL_REFLOG_EMAIL: &str = "reflog@gus.invalid";
+
+impl ProfileRequirement {
+    #[must_use]
+    pub const fn identity_disposition(self) -> GitIdentityDisposition {
+        match self {
+            Self::NotRequired | Self::Deferred(_) => GitIdentityDisposition::NeutralReflog,
+            Self::Required(_) => GitIdentityDisposition::SelectedProfile,
+        }
+    }
 }
 
 /// The primary reason a profile is required.
@@ -54,8 +77,7 @@ pub struct ResolvedEndpoint {
 }
 
 impl ResolvedEndpoint {
-    #[must_use]
-    pub const fn new(role: EndpointRole, transport: Transport, identity_digest: [u8; 32]) -> Self {
+    const fn new(role: EndpointRole, transport: Transport, identity_digest: [u8; 32]) -> Self {
         Self {
             role,
             transport,
@@ -79,57 +101,54 @@ impl ResolvedEndpoint {
     }
 }
 
+/// Endpoint evidence bound to exactly one resolver request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundEndpoint {
+    binding: ResolutionBinding,
+    endpoint: ResolvedEndpoint,
+}
+
 /// Resolver proof about whether a syntactically restricted operation can
 /// create an identity-bearing Git object under the complete effective config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityCreationEvidence {
+pub(crate) enum IdentityCreationEvidence {
     IdentityFreeProven,
     MayCreateOrUnresolved,
 }
 
 /// Security-relevant values from one immutable effective-config snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EffectiveConfigEvidence {
+pub(crate) struct EffectiveConfigEvidence {
+    binding: ResolutionBinding,
     merge_ff_only: IdentityCreationEvidence,
     pull_ff_only: IdentityCreationEvidence,
     lightweight_tag: IdentityCreationEvidence,
 }
 
 impl EffectiveConfigEvidence {
-    #[must_use]
-    pub const fn new(
+    const fn new(
+        binding: ResolutionBinding,
         merge_ff_only: IdentityCreationEvidence,
         pull_ff_only: IdentityCreationEvidence,
         lightweight_tag: IdentityCreationEvidence,
     ) -> Self {
         Self {
+            binding,
             merge_ff_only,
             pull_ff_only,
             lightweight_tag,
         }
     }
 
-    #[must_use]
-    pub const fn conservative() -> Self {
-        Self::new(
-            IdentityCreationEvidence::MayCreateOrUnresolved,
-            IdentityCreationEvidence::MayCreateOrUnresolved,
-            IdentityCreationEvidence::MayCreateOrUnresolved,
-        )
-    }
-
-    #[must_use]
-    pub const fn merge_ff_only(self) -> IdentityCreationEvidence {
+    pub(crate) const fn merge_ff_only(self) -> IdentityCreationEvidence {
         self.merge_ff_only
     }
 
-    #[must_use]
-    pub const fn pull_ff_only(self) -> IdentityCreationEvidence {
+    pub(crate) const fn pull_ff_only(self) -> IdentityCreationEvidence {
         self.pull_ff_only
     }
 
-    #[must_use]
-    pub const fn lightweight_tag(self) -> IdentityCreationEvidence {
+    pub(crate) const fn lightweight_tag(self) -> IdentityCreationEvidence {
         self.lightweight_tag
     }
 }
@@ -169,8 +188,10 @@ impl SnapshotGenerations {
 pub struct ResolutionBinding {
     invocation_digest: [u8; 32],
     repository_identity: [u8; 32],
+    git_semantics_digest: [u8; 32],
     config_snapshot_digest: [u8; 32],
     head_state_digest: Option<[u8; 32]>,
+    generations: SnapshotGenerations,
 }
 
 impl ResolutionBinding {
@@ -185,6 +206,11 @@ impl ResolutionBinding {
     }
 
     #[must_use]
+    pub const fn git_semantics_digest(self) -> [u8; 32] {
+        self.git_semantics_digest
+    }
+
+    #[must_use]
     pub const fn config_snapshot_digest(self) -> [u8; 32] {
         self.config_snapshot_digest
     }
@@ -193,6 +219,23 @@ impl ResolutionBinding {
     pub const fn head_state_digest(self) -> Option<[u8; 32]> {
         self.head_state_digest
     }
+
+    #[must_use]
+    pub const fn generations(self) -> SnapshotGenerations {
+        self.generations
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ResolutionError {
+    #[error("resolver evidence belongs to a different request or snapshot")]
+    BindingMismatch,
+    #[error("an identity-free merge or pull proof requires a bound HEAD state")]
+    HeadStateRequired,
+    #[error("resolved endpoint roles or count do not match the Git operation")]
+    EndpointSetMismatch,
+    #[error("resolver snapshot is missing a required file or endpoint identity")]
+    InvalidSnapshot,
 }
 
 /// Output of the trusted resolver after fixed Git has expanded configuration,
@@ -217,7 +260,7 @@ impl ResolutionEvidence {
     }
 
     #[must_use]
-    pub const fn effective_config(&self) -> EffectiveConfigEvidence {
+    pub(crate) const fn effective_config(&self) -> EffectiveConfigEvidence {
         self.effective_config
     }
 
@@ -250,6 +293,12 @@ pub struct GlobalOptions {
     pub git_dir: Option<OsString>,
     /// Last `--work-tree` value, matching Git's effective-option behavior.
     pub work_tree: Option<OsString>,
+    /// Last `--namespace` value. The resolver binds this to the repository
+    /// snapshot before any endpoint or ref decision is trusted.
+    pub namespace: Option<OsString>,
+    /// Explicit exec path. It is parsed losslessly but remains conservative
+    /// until executable provenance is verified.
+    pub exec_path: Option<OsString>,
     pub config_overrides: Vec<ConfigOverride>,
     pub config_env_overrides: Vec<ConfigEnvOverride>,
     /// Recognized global flags which do not carry values.
@@ -268,6 +317,7 @@ pub enum ParseIssue {
 /// Command category used by the policy engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
+    Informational,
     ReadOnly,
     WorkingTree,
     ConfigRead,
@@ -346,9 +396,10 @@ impl InvocationContext {
     /// request, preventing evidence produced for another invocation from being
     /// attached accidentally.
     #[must_use]
-    pub fn begin_resolution(
+    pub(crate) fn begin_resolution(
         self,
         repository_identity: [u8; 32],
+        git_semantics_digest: [u8; 32],
         config_snapshot_digest: [u8; 32],
         head_state_digest: Option<[u8; 32]>,
         generations: SnapshotGenerations,
@@ -356,13 +407,14 @@ impl InvocationContext {
         let binding = ResolutionBinding {
             invocation_digest: digest_invocation(&self.invocation.raw_args),
             repository_identity,
+            git_semantics_digest,
             config_snapshot_digest,
             head_state_digest,
+            generations,
         };
         ResolutionRequest {
             invocation: self,
             binding,
-            generations,
         }
     }
 
@@ -378,7 +430,6 @@ impl InvocationContext {
 pub struct ResolutionRequest {
     invocation: InvocationContext,
     binding: ResolutionBinding,
-    generations: SnapshotGenerations,
 }
 
 impl ResolutionRequest {
@@ -388,20 +439,105 @@ impl ResolutionRequest {
     }
 
     #[must_use]
-    pub fn resolve(
+    pub(crate) const fn bind_endpoint(
+        &self,
+        role: EndpointRole,
+        transport: Transport,
+        identity_digest: [u8; 32],
+    ) -> BoundEndpoint {
+        BoundEndpoint {
+            binding: self.binding,
+            endpoint: ResolvedEndpoint::new(role, transport, identity_digest),
+        }
+    }
+
+    pub(crate) const fn bind_effective_config(
+        &self,
+        merge_ff_only: IdentityCreationEvidence,
+        pull_ff_only: IdentityCreationEvidence,
+        lightweight_tag: IdentityCreationEvidence,
+    ) -> EffectiveConfigEvidence {
+        EffectiveConfigEvidence::new(self.binding, merge_ff_only, pull_ff_only, lightweight_tag)
+    }
+
+    /// Finalizes evidence produced by the sealed resolver implementation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects evidence from another request, incomplete HEAD evidence for an
+    /// identity-free integration proof, or endpoint roles/counts that do not
+    /// match the parsed operation.
+    pub(crate) fn resolve(
         self,
-        endpoints: Vec<ResolvedEndpoint>,
+        endpoints: Vec<BoundEndpoint>,
         effective_config: EffectiveConfigEvidence,
-    ) -> ResolvedInvocation {
-        ResolvedInvocation {
+    ) -> Result<ResolvedInvocation, ResolutionError> {
+        if effective_config.binding != self.binding
+            || endpoints
+                .iter()
+                .any(|endpoint| endpoint.binding != self.binding)
+        {
+            return Err(ResolutionError::BindingMismatch);
+        }
+
+        let endpoints = endpoints
+            .into_iter()
+            .map(|endpoint| endpoint.endpoint)
+            .collect::<Vec<_>>();
+        if !endpoint_set_matches(self.invocation.operation(), &endpoints) {
+            return Err(ResolutionError::EndpointSetMismatch);
+        }
+
+        let identity_free_integration = match self.invocation.operation() {
+            Operation::Merge {
+                ff_only_candidate: true,
+            } => effective_config.merge_ff_only == IdentityCreationEvidence::IdentityFreeProven,
+            Operation::Pull {
+                ff_only_candidate: true,
+            } => effective_config.pull_ff_only == IdentityCreationEvidence::IdentityFreeProven,
+            _ => false,
+        };
+        if identity_free_integration && self.binding.head_state_digest.is_none() {
+            return Err(ResolutionError::HeadStateRequired);
+        }
+
+        Ok(ResolvedInvocation {
             invocation: self.invocation,
             evidence: ResolutionEvidence {
                 binding: self.binding,
                 endpoints,
                 effective_config,
-                generations: self.generations,
+                generations: self.binding.generations,
             },
+        })
+    }
+}
+
+fn endpoint_set_matches(operation: Operation, endpoints: &[ResolvedEndpoint]) -> bool {
+    match operation {
+        Operation::Fetch | Operation::Clone | Operation::Pull { .. } => {
+            endpoints
+                .iter()
+                .any(|endpoint| endpoint.role == EndpointRole::Fetch)
+                && endpoints.iter().all(|endpoint| {
+                    matches!(endpoint.role, EndpointRole::Fetch | EndpointRole::Submodule)
+                })
         }
+        Operation::LsRemote => {
+            !endpoints.is_empty()
+                && endpoints
+                    .iter()
+                    .all(|endpoint| endpoint.role == EndpointRole::Fetch)
+        }
+        Operation::Push => {
+            endpoints
+                .iter()
+                .any(|endpoint| endpoint.role == EndpointRole::Push)
+                && endpoints.iter().all(|endpoint| {
+                    matches!(endpoint.role, EndpointRole::Push | EndpointRole::Submodule)
+                })
+        }
+        _ => endpoints.is_empty(),
     }
 }
 

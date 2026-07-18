@@ -18,6 +18,10 @@ where
 }
 
 fn normalize(raw_args: Vec<OsString>) -> NormalizedInvocation {
+    if is_global_information_request(&raw_args) {
+        return global_information(raw_args);
+    }
+
     let mut global = GlobalOptions::default();
     let mut index = 0;
     let mut issue = None;
@@ -47,6 +51,11 @@ fn normalize(raw_args: Vec<OsString>) -> NormalizedInvocation {
                 Some(_) => issue = Some(ParseIssue::MalformedOptionValue),
                 None => issue = Some(ParseIssue::MissingOptionValue),
             },
+            "--namespace" => match take_value(&raw_args, &mut index) {
+                Some(value) if !value.is_empty() => global.namespace = Some(value.to_owned()),
+                Some(_) => issue = Some(ParseIssue::MalformedOptionValue),
+                None => issue = Some(ParseIssue::MissingOptionValue),
+            },
             "-c" => match take_value(&raw_args, &mut index) {
                 Some(value) => match parse_config_override(value) {
                     Some(value) => global.config_overrides.push(value),
@@ -73,6 +82,18 @@ fn normalize(raw_args: Vec<OsString>) -> NormalizedInvocation {
                     |value| global.work_tree = Some(value),
                 );
             }
+            _ if arg.starts_with("--namespace=") => {
+                parse_attached_path(arg, "--namespace=").map_or_else(
+                    || issue = Some(ParseIssue::MalformedOptionValue),
+                    |value| global.namespace = Some(value),
+                );
+            }
+            _ if arg.starts_with("--exec-path=") => {
+                parse_attached_path(arg, "--exec-path=").map_or_else(
+                    || issue = Some(ParseIssue::MalformedOptionValue),
+                    |value| global.exec_path = Some(value),
+                );
+            }
             _ if arg.starts_with("--config-env=") => {
                 match parse_config_env(OsStr::new(&arg["--config-env=".len()..])) {
                     Some(value) => global.config_env_overrides.push(value),
@@ -84,6 +105,7 @@ fn normalize(raw_args: Vec<OsString>) -> NormalizedInvocation {
             | "-p"
             | "-P"
             | "--bare"
+            | "--no-optional-locks"
             | "--no-replace-objects"
             | "--literal-pathspecs"
             | "--glob-pathspecs"
@@ -99,6 +121,21 @@ fn normalize(raw_args: Vec<OsString>) -> NormalizedInvocation {
     }
 
     finish_normalization(raw_args, global, index, issue)
+}
+
+fn global_information(raw_args: Vec<OsString>) -> NormalizedInvocation {
+    let command = raw_args[0]
+        .to_str()
+        .expect("information requests are ASCII")
+        .to_owned();
+    NormalizedInvocation {
+        raw_args,
+        global: GlobalOptions::default(),
+        command: Some(command),
+        command_args: Vec::new(),
+        operation: Operation::Informational,
+        issue: None,
+    }
 }
 
 fn finish_normalization(
@@ -195,9 +232,16 @@ fn valid_environment_variable(name: &str) -> bool {
 
 fn classify_operation(command: &str, args: &[OsString]) -> Operation {
     match command {
+        "version" if version_is_informational(args) => Operation::Informational,
+        "help" => Operation::Informational,
         "status" | "diff" | "log" | "show" | "blame" | "rev-parse" | "rev-list" | "ls-files"
-        | "cat-file" => Operation::ReadOnly,
-        "add" | "restore" | "checkout" | "switch" => Operation::WorkingTree,
+        | "cat-file" | "for-each-ref" | "show-ref" | "merge-base" | "name-rev" | "check-ignore"
+        | "check-attr" | "count-objects" => Operation::ReadOnly,
+        "symbolic-ref" => classify_symbolic_ref(args),
+        "remote" => classify_remote(args),
+        "branch" => classify_branch(args),
+        "add" | "restore" | "checkout" | "switch" | "init" | "reset" | "clean" | "rm" | "mv"
+        | "update-index" => Operation::WorkingTree,
         "config" => classify_config(args),
         "fetch" => Operation::Fetch,
         "clone" => Operation::Clone,
@@ -212,9 +256,135 @@ fn classify_operation(command: &str, args: &[OsString]) -> Operation {
             ff_only_candidate: merge_ff_only_is_candidate(args),
         },
         "rebase" | "cherry-pick" | "revert" | "am" => Operation::HistoryRewrite,
-        "stash" => Operation::Stash,
+        "stash" => classify_stash(args),
         "tag" => classify_tag(args),
         _ => Operation::Unknown,
+    }
+}
+
+fn is_global_information_request(args: &[OsString]) -> bool {
+    matches!(
+        args,
+        [argument]
+            if matches_ascii(
+                argument,
+                &[
+                    "-h",
+                    "--help",
+                    "--version",
+                    "--exec-path",
+                    "--html-path",
+                    "--man-path",
+                    "--info-path",
+                ]
+            )
+    )
+}
+
+fn version_is_informational(args: &[OsString]) -> bool {
+    args.is_empty() || matches!(args, [argument] if argument == "--build-options")
+}
+
+fn classify_symbolic_ref(args: &[OsString]) -> Operation {
+    let mut names = 0;
+    for argument in args {
+        let Some(argument) = argument.to_str() else {
+            return Operation::Unknown;
+        };
+        match argument {
+            "-q" | "--quiet" | "--short" | "--no-recurse" => {}
+            "-m" => return Operation::WorkingTree,
+            value if !value.starts_with('-') => names += 1,
+            _ => return Operation::Unknown,
+        }
+    }
+    if names == 1 {
+        Operation::ReadOnly
+    } else if names == 2 {
+        Operation::WorkingTree
+    } else {
+        Operation::Unknown
+    }
+}
+
+fn classify_remote(args: &[OsString]) -> Operation {
+    match args {
+        [] => Operation::ReadOnly,
+        [flag] if matches_ascii(flag, &["-v", "--verbose"]) => Operation::ReadOnly,
+        [action, ..]
+            if matches_ascii(
+                action,
+                &[
+                    "add",
+                    "rename",
+                    "remove",
+                    "set-head",
+                    "set-branches",
+                    "set-url",
+                ],
+            ) =>
+        {
+            Operation::WorkingTree
+        }
+        _ => Operation::Unknown,
+    }
+}
+
+fn classify_branch(args: &[OsString]) -> Operation {
+    const READ_FLAGS: &[&str] = &[
+        "--list",
+        "-l",
+        "--show-current",
+        "-a",
+        "--all",
+        "-r",
+        "--remotes",
+        "-v",
+        "-vv",
+        "--verbose",
+        "--no-color",
+        "--ignore-case",
+        "--omit-empty",
+    ];
+    const MUTATION_FLAGS: &[&str] = &[
+        "-d",
+        "-D",
+        "--delete",
+        "-m",
+        "-M",
+        "--move",
+        "-c",
+        "-C",
+        "--copy",
+        "--set-upstream-to",
+        "--unset-upstream",
+        "--edit-description",
+    ];
+    if args.is_empty() {
+        return Operation::ReadOnly;
+    }
+    let mut read_only = true;
+    for argument in args {
+        let Some(argument) = argument.to_str() else {
+            return Operation::Unknown;
+        };
+        if MUTATION_FLAGS.contains(&argument) || !argument.starts_with('-') {
+            read_only = false;
+        } else if !READ_FLAGS.contains(&argument) {
+            return Operation::Unknown;
+        }
+    }
+    if read_only {
+        Operation::ReadOnly
+    } else {
+        Operation::WorkingTree
+    }
+}
+
+fn classify_stash(args: &[OsString]) -> Operation {
+    match args {
+        [action, ..] if matches_ascii(action, &["list", "show"]) => Operation::ReadOnly,
+        _ => Operation::Stash,
     }
 }
 
@@ -261,7 +431,9 @@ fn pull_ff_only_is_candidate(args: &[OsString]) -> bool {
         match arg {
             "--ff-only" => found = true,
             "--autostash" | "--rebase" | "-r" => return false,
-            "-q"
+            "--no-autostash"
+            | "--no-rebase"
+            | "-q"
             | "--quiet"
             | "-v"
             | "--verbose"
@@ -306,7 +478,8 @@ fn merge_ff_only_is_candidate(args: &[OsString]) -> bool {
         match argument {
             "--ff-only" => found_ff_only = true,
             "--" => after_separator = true,
-            "-q"
+            "--no-autostash"
+            | "-q"
             | "--quiet"
             | "-v"
             | "--verbose"

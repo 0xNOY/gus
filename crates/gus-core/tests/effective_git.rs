@@ -1,13 +1,12 @@
 use std::{fs, path::Path, process::Command};
 
 use gus_core::{
-    EffectiveConfigEvidence, EndpointRole, IdentityCreationEvidence, InvocationContext,
-    ProfileRequirement, RequirementReason, ResolvedEndpoint, SnapshotGenerations, Transport,
+    EffectiveConfigEntry, EndpointObservation, EndpointRole, GitResolver, InvocationContext,
+    NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME, ProfileRequirement, RequirementReason,
+    ResolverSnapshot, SnapshotGenerations, Transport, VerifiedGitSemantics,
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-
-const PROVEN: IdentityCreationEvidence = IdentityCreationEvidence::IdentityFreeProven;
-const MAY_CREATE: IdentityCreationEvidence = IdentityCreationEvidence::MayCreateOrUnresolved;
 
 fn git(repo: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
@@ -34,6 +33,101 @@ fn success(repo: &Path, args: &[&str]) -> std::process::Output {
     output
 }
 
+fn neutral_success(repo: &Path, args: &[&str]) -> std::process::Output {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("EMAIL")
+        .env("GIT_AUTHOR_NAME", NEUTRAL_REFLOG_NAME)
+        .env("GIT_AUTHOR_EMAIL", NEUTRAL_REFLOG_EMAIL)
+        .env("GIT_COMMITTER_NAME", NEUTRAL_REFLOG_NAME)
+        .env("GIT_COMMITTER_EMAIL", NEUTRAL_REFLOG_EMAIL)
+        .output()
+        .expect("test fixture requires Git");
+    assert!(
+        output.status.success(),
+        "neutral git {args:?} failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn digest(value: &[u8]) -> [u8; 32] {
+    Sha256::digest(value).into()
+}
+
+fn effective_entries(repo: &Path, names: &[&str]) -> Vec<EffectiveConfigEntry> {
+    let mut entries = Vec::new();
+    for name in names {
+        let output = git(repo, &["config", "--null", "--get-all", name]);
+        if output.status.code() == Some(1) {
+            continue;
+        }
+        assert!(output.status.success(), "failed to read config {name}");
+        for value in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|v| !v.is_empty())
+        {
+            entries.push(EffectiveConfigEntry::new(
+                (*name).to_owned(),
+                String::from_utf8(value.to_vec())
+                    .expect("ASCII integration fixture")
+                    .into(),
+            ));
+        }
+    }
+    entries
+}
+
+fn resolved_requirement(
+    repo: &Path,
+    args: &[&str],
+    config_names: &[&str],
+    endpoints: Vec<EndpointObservation>,
+) -> ProfileRequirement {
+    let git_dir = fs::canonicalize(repo.join(".git")).expect("canonical Git directory");
+    let branch = success(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let branch = String::from_utf8(branch.stdout)
+        .expect("ASCII fixture branch")
+        .trim()
+        .to_owned();
+    let head = success(repo, &["rev-parse", "HEAD"]);
+    let head_state = digest(&[branch.as_bytes(), head.stdout.as_slice()].concat());
+    let git_version = success(repo, &["--version"]);
+    let git_version = String::from_utf8(git_version.stdout).expect("UTF-8 Git version");
+    let git_semantics = VerifiedGitSemantics::from_version_output(
+        digest(b"real Git executable selected by integration fixture"),
+        &git_version,
+    )
+    .expect("supported or conservative real-Git semantics");
+    let snapshot = ResolverSnapshot::new(
+        digest(git_dir.as_os_str().as_encoded_bytes()),
+        git_semantics,
+        Some(head_state),
+        SnapshotGenerations::new(1, 1).expect("valid fixture generations"),
+        Some(branch),
+        effective_entries(repo, config_names),
+        endpoints,
+    )
+    .expect("valid real-Git snapshot");
+    GitResolver
+        .resolve(InvocationContext::parse(args), snapshot)
+        .expect("snapshot matches invocation")
+        .profile_requirement()
+}
+
+fn local_fetch_endpoint() -> Vec<EndpointObservation> {
+    vec![EndpointObservation::new(
+        EndpointRole::Fetch,
+        Transport::Local,
+        [7; 32],
+    )]
+}
+
 fn repository() -> TempDir {
     let directory = tempfile::tempdir().expect("temporary repository");
     success(directory.path(), &["init", "--initial-branch=main"]);
@@ -46,29 +140,6 @@ fn repository() -> TempDir {
     success(directory.path(), &["add", "tracked"]);
     success(directory.path(), &["commit", "-m", "base"]);
     directory
-}
-
-fn generations() -> SnapshotGenerations {
-    SnapshotGenerations::new(1, 1).expect("non-zero fixture generations")
-}
-
-fn requirement(
-    args: &[&str],
-    merge: IdentityCreationEvidence,
-    pull: IdentityCreationEvidence,
-    tag: IdentityCreationEvidence,
-) -> ProfileRequirement {
-    InvocationContext::parse(args)
-        .begin_resolution([1; 32], [2; 32], Some([3; 32]), generations())
-        .resolve(
-            vec![ResolvedEndpoint::new(
-                EndpointRole::Fetch,
-                Transport::Local,
-                [1; 32],
-            )],
-            EffectiveConfigEvidence::new(merge, pull, tag),
-        )
-        .profile_requirement()
 }
 
 fn pull_fixture() -> (TempDir, std::path::PathBuf) {
@@ -148,25 +219,22 @@ fn effective_merge_autostash_can_create_an_ambient_identity_commit() {
     fs::write(repo.join("tracked"), "local\n").expect("write dirty file");
     success(repo, &["config", "merge.autoStash", "true"]);
 
+    assert_eq!(
+        resolved_requirement(
+            repo,
+            &["merge", "--ff-only", "topic"],
+            &["merge.autoStash", "branch.main.mergeOptions"],
+            Vec::new(),
+        ),
+        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
+    );
+
     let merge = git(repo, &["merge", "--ff-only", "topic"]);
     let oid = created_autostash_oid(&merge);
     let author = success(repo, &["show", "-s", "--format=%an <%ae>", &oid]);
     assert_eq!(
         String::from_utf8_lossy(&author.stdout).trim(),
         "Wrong Ambient <wrong@example.test>"
-    );
-    assert_eq!(
-        requirement(&["merge", "--ff-only", "topic"], MAY_CREATE, PROVEN, PROVEN,),
-        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
-    );
-    assert_eq!(
-        requirement(
-            &["merge", "--ff-only", "--autostash", "topic"],
-            PROVEN,
-            PROVEN,
-            PROVEN,
-        ),
-        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
     );
 }
 
@@ -182,16 +250,22 @@ fn branch_merge_options_can_enable_autostash_when_global_config_disables_it() {
     success(repo, &["config", "merge.autoStash", "false"]);
     success(repo, &["config", "branch.main.mergeOptions", "--autostash"]);
 
+    assert_eq!(
+        resolved_requirement(
+            repo,
+            &["merge", "--ff-only", "topic"],
+            &["merge.autoStash", "branch.main.mergeOptions"],
+            Vec::new(),
+        ),
+        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
+    );
+
     let merge = git(repo, &["merge", "--ff-only", "topic"]);
     let oid = created_autostash_oid(&merge);
     let author = success(repo, &["show", "-s", "--format=%an <%ae>", &oid]);
     assert_eq!(
         String::from_utf8_lossy(&author.stdout).trim(),
         "Wrong Ambient <wrong@example.test>"
-    );
-    assert_eq!(
-        requirement(&["merge", "--ff-only", "topic"], MAY_CREATE, PROVEN, PROVEN,),
-        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
     );
 }
 
@@ -202,32 +276,29 @@ fn pull_autostash_overrides_merge_autostash_and_creates_an_ambient_commit() {
     success(&consumer, &["config", "pull.autoStash", "true"]);
     success(&consumer, &["config", "pull.rebase", "false"]);
 
+    assert_eq!(
+        resolved_requirement(
+            &consumer,
+            &["pull", "--ff-only"],
+            &[
+                "merge.autoStash",
+                "pull.autoStash",
+                "pull.rebase",
+                "branch.main.rebase",
+                "rebase.autoStash",
+                "branch.main.mergeOptions",
+            ],
+            local_fetch_endpoint(),
+        ),
+        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
+    );
+
     let pull = git(&consumer, &["pull", "--ff-only"]);
     let oid = created_autostash_oid(&pull);
     let author = success(&consumer, &["show", "-s", "--format=%an <%ae>", &oid]);
     assert_eq!(
         String::from_utf8_lossy(&author.stdout).trim(),
         "Wrong Ambient <wrong@example.test>"
-    );
-
-    let policy = InvocationContext::parse(["pull", "--ff-only"])
-        .begin_resolution([1; 32], [2; 32], Some([3; 32]), generations())
-        .resolve(
-            vec![ResolvedEndpoint::new(
-                EndpointRole::Fetch,
-                Transport::Local,
-                [1; 32],
-            )],
-            EffectiveConfigEvidence::new(
-                IdentityCreationEvidence::IdentityFreeProven,
-                IdentityCreationEvidence::MayCreateOrUnresolved,
-                IdentityCreationEvidence::IdentityFreeProven,
-            ),
-        )
-        .profile_requirement();
-    assert_eq!(
-        policy,
-        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
     );
 }
 
@@ -238,16 +309,29 @@ fn pull_rebase_autostash_can_create_an_ambient_commit_for_ff_only_pull() {
     success(&consumer, &["config", "pull.rebase", "true"]);
     success(&consumer, &["config", "rebase.autoStash", "true"]);
 
+    assert_eq!(
+        resolved_requirement(
+            &consumer,
+            &["pull", "--ff-only"],
+            &[
+                "merge.autoStash",
+                "pull.autoStash",
+                "pull.rebase",
+                "branch.main.rebase",
+                "rebase.autoStash",
+                "branch.main.mergeOptions",
+            ],
+            local_fetch_endpoint(),
+        ),
+        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
+    );
+
     let pull = git(&consumer, &["pull", "--ff-only"]);
     let oid = created_autostash_oid(&pull);
     let author = success(&consumer, &["show", "-s", "--format=%an <%ae>", &oid]);
     assert_eq!(
         String::from_utf8_lossy(&author.stdout).trim(),
         "Wrong Ambient <wrong@example.test>"
-    );
-    assert_eq!(
-        requirement(&["pull", "--ff-only"], PROVEN, MAY_CREATE, PROVEN),
-        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
     );
 }
 
@@ -261,6 +345,11 @@ fn effective_tag_signing_promotes_a_bare_tag_command() {
         &["config", "gpg.program", "/gus-test/nonexistent-gpg"],
     );
 
+    assert_eq!(
+        resolved_requirement(repo, &["tag", "v1"], &["tag.gpgSign"], Vec::new(),),
+        ProfileRequirement::Required(RequirementReason::SigningIdentity)
+    );
+
     let tag = git(repo, &["tag", "v1"]);
     assert!(
         !tag.status.success(),
@@ -272,8 +361,35 @@ fn effective_tag_signing_promotes_a_bare_tag_command() {
             .success(),
         "failed signing operation must not leave a lightweight tag"
     );
+}
+
+#[test]
+fn identity_free_checkout_and_fetch_use_a_neutral_reflog_identity() {
+    let checkout = repository();
+    neutral_success(checkout.path(), &["switch", "-c", "neutral"]);
+    let head_reflog = success(
+        checkout.path(),
+        &["reflog", "show", "-1", "--format=%gN <%gE>", "HEAD"],
+    );
     assert_eq!(
-        requirement(&["tag", "v1"], PROVEN, PROVEN, MAY_CREATE,),
-        ProfileRequirement::Required(RequirementReason::SigningIdentity)
+        String::from_utf8_lossy(&head_reflog.stdout).trim(),
+        format!("{NEUTRAL_REFLOG_NAME} <{NEUTRAL_REFLOG_EMAIL}>")
+    );
+
+    let (_directory, consumer) = pull_fixture();
+    neutral_success(&consumer, &["fetch", "origin"]);
+    let fetch_reflog = success(
+        &consumer,
+        &[
+            "reflog",
+            "show",
+            "-1",
+            "--format=%gN <%gE>",
+            "refs/remotes/origin/main",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&fetch_reflog.stdout).trim(),
+        format!("{NEUTRAL_REFLOG_NAME} <{NEUTRAL_REFLOG_EMAIL}>")
     );
 }

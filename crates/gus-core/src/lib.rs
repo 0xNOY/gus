@@ -7,10 +7,16 @@
 mod model;
 mod parser;
 mod policy;
+mod resolver;
 
 pub use model::{
-    ConfigEnvOverride, ConfigOverride, EffectiveConfigEvidence, EndpointRole, GlobalOptions,
-    IdentityCreationEvidence, InvocationContext, NormalizedInvocation, Operation, ParseIssue,
-    ProfileRequirement, RequirementReason, ResolutionBinding, ResolutionEvidence,
-    ResolutionRequest, ResolvedEndpoint, ResolvedInvocation, SnapshotGenerations, Transport,
+    BoundEndpoint, ConfigEnvOverride, ConfigOverride, EndpointRole, GitIdentityDisposition,
+    GlobalOptions, InvocationContext, NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME,
+    NormalizedInvocation, Operation, ParseIssue, ProfileRequirement, RequirementReason,
+    ResolutionBinding, ResolutionError, ResolutionEvidence, ResolutionRequest, ResolvedEndpoint,
+    ResolvedInvocation, SnapshotGenerations, Transport,
+};
+pub use resolver::{
+    EffectiveConfigEntry, EndpointObservation, GitResolver, GitSemanticRuleset, ResolverSnapshot,
+    VerifiedGitSemantics,
 };

@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 sha2.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
