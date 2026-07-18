@@ -8,11 +8,16 @@
 
 use std::{fmt, num::NonZeroU32, num::NonZeroU64};
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(any(target_os = "windows", test))]
+mod windows_model;
 
 const IDENTITY_DIGEST_BYTES: usize = 32;
 
@@ -40,6 +45,7 @@ impl OsUserIdentity {
         self.family
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
         Self {
             family,
@@ -58,27 +64,36 @@ impl fmt::Debug for OsUserIdentity {
     }
 }
 
-/// Opaque identity for one host boot. It prevents process start counters from
-/// being reused across a reboot.
+/// Opaque identity for the native time domain of a process start value.
+///
+/// Linux uses the host boot ID because `/proc` reports ticks since boot.
+/// Platforms whose process creation time has an absolute epoch bind that epoch
+/// instead. Consumers compare this value together with `start_time` and never
+/// interpret either field in isolation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BootIdentity([u8; IDENTITY_DIGEST_BYTES]);
+pub struct ProcessTimeDomainIdentity([u8; IDENTITY_DIGEST_BYTES]);
 
-impl BootIdentity {
+impl ProcessTimeDomainIdentity {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
-        Self(identity_digest(b"gus.platform.boot.v1", family, native))
+        Self(identity_digest(
+            b"gus.platform.process-time-domain.v1",
+            family,
+            native,
+        ))
     }
 }
 
-impl fmt::Debug for BootIdentity {
+impl fmt::Debug for ProcessTimeDomainIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("BootIdentity([REDACTED])")
+        formatter.write_str("ProcessTimeDomainIdentity([REDACTED])")
     }
 }
 
 /// Identity of a process that remains stable across PID reuse.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessIdentity {
-    boot: BootIdentity,
+    time_domain: ProcessTimeDomainIdentity,
     pid: NonZeroU32,
     start_time: NonZeroU64,
     user: OsUserIdentity,
@@ -101,18 +116,19 @@ impl ProcessIdentity {
     }
 
     #[must_use]
-    pub const fn boot(self) -> BootIdentity {
-        self.boot
+    pub const fn time_domain(self) -> ProcessTimeDomainIdentity {
+        self.time_domain
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     const fn from_observation(
-        boot: BootIdentity,
+        time_domain: ProcessTimeDomainIdentity,
         pid: NonZeroU32,
         start_time: NonZeroU64,
         user: OsUserIdentity,
     ) -> Self {
         Self {
-            boot,
+            time_domain,
             pid,
             start_time,
             user,
@@ -126,7 +142,7 @@ impl fmt::Debug for ProcessIdentity {
             .debug_struct("ProcessIdentity")
             .field("pid", &self.pid)
             .field("start_time", &self.start_time)
-            .field("boot", &self.boot)
+            .field("time_domain", &self.time_domain)
             .field("user", &self.user)
             .finish()
     }
@@ -145,6 +161,7 @@ impl TerminalIdentity {
         self.family
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn from_native_bytes(family: PlatformFamily, native: &[u8]) -> Self {
         Self {
             family,
@@ -181,6 +198,7 @@ impl TerminalSessionIdentity {
         self.anchor_process
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     const fn from_observation(terminal: TerminalIdentity, anchor_process: ProcessIdentity) -> Self {
         Self {
             terminal,
@@ -218,6 +236,7 @@ impl LocalSessionObservation {
         self.terminal.is_some()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     const fn from_observation(
         caller: ProcessIdentity,
         parent_pid: Option<NonZeroU32>,
@@ -253,7 +272,11 @@ impl CurrentSessionObserver {
         {
             linux::observe_current()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        {
+            windows::observe_current()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             Err(ObservationError::UnsupportedPlatform)
         }
@@ -264,9 +287,11 @@ impl CurrentSessionObserver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ObservationResource {
-    BootIdentity,
+    ProcessTimeDomain,
     CallerProcess,
     CallerUser,
+    ProcessAncestry,
+    TerminalSession,
     TerminalAnchorProcess,
     TerminalAnchorUser,
 }
@@ -274,9 +299,11 @@ pub enum ObservationResource {
 impl fmt::Display for ObservationResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
-            Self::BootIdentity => "boot identity",
+            Self::ProcessTimeDomain => "process time domain",
             Self::CallerProcess => "caller process",
             Self::CallerUser => "caller user",
+            Self::ProcessAncestry => "process ancestry",
+            Self::TerminalSession => "terminal session",
             Self::TerminalAnchorProcess => "terminal anchor process",
             Self::TerminalAnchorUser => "terminal anchor user",
         };
@@ -306,6 +333,7 @@ pub enum ObservationError {
     TerminalBindingMismatch,
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn identity_digest(
     domain: &[u8],
     family: PlatformFamily,

@@ -924,6 +924,16 @@ mod tests {
         Sha256Digest::try_from("00".repeat(32)).expect("valid digest")
     }
 
+    #[cfg(unix)]
+    fn absolute_path(relative: &str) -> PathBuf {
+        PathBuf::from("/").join(relative)
+    }
+
+    #[cfg(windows)]
+    fn absolute_path(relative: &str) -> PathBuf {
+        PathBuf::from(r"C:\").join(relative)
+    }
+
     fn host(value: &str) -> CredentialHost {
         CredentialHost::try_from(value.to_owned()).expect("valid host")
     }
@@ -988,7 +998,7 @@ mod tests {
                 format: SigningFormat::Ssh,
                 key_reference: "SHA256:signing".into(),
                 program: Some(ExecutableRef {
-                    path: "/usr/bin/ssh-keygen".into(),
+                    path: absolute_path("usr/bin/ssh-keygen"),
                     arguments: Vec::new(),
                     sha256: digest(),
                 }),
@@ -997,7 +1007,7 @@ mod tests {
             }),
             ssh_transport: Some(SshIdentity {
                 source: SshIdentitySource::PrivateKey {
-                    path: "/keys/transport".into(),
+                    path: absolute_path("keys/transport"),
                     certificate: None,
                     public_key_fingerprint: SshFingerprint::try_from(format!(
                         "SHA256:{}",
@@ -1006,7 +1016,7 @@ mod tests {
                     .expect("valid fingerprint"),
                 },
                 proxy_jump: None,
-                known_hosts_file: Some("/keys/known_hosts".into()),
+                known_hosts_file: Some(absolute_path("keys/known_hosts")),
             }),
             http: Some(HttpIdentity {
                 bindings: vec![CredentialBinding {

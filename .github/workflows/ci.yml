@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Install MSRV Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Lint Rust
+        run: cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test Rust
+        run: cargo +stable test --workspace --all-targets --all-features
+
+      - name: Check MSRV
+        run: cargo +1.85.0 check --workspace --all-targets --all-features
+
+      - name: Check Rust documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --workspace --all-features --no-deps
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install VS Code extension dependencies
+        run: npm --prefix editors/vscode ci
+
+      - name: Test VS Code extension
+        run: npm --prefix editors/vscode test
+
+  native-platform:
+    name: Native platform (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+          - windows-2025
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install MSRV Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+
+      - name: Lint workspace on native host
+        run: cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test native session observer
+        run: cargo +stable test -p gus-platform --all-targets --all-features
+
+      - name: Test workspace on native host
+        run: cargo +stable test --workspace --all-targets --all-features
+
+      - name: Check workspace MSRV on native host
+        run: cargo +1.85.0 check --workspace --all-targets --all-features
+
+      - name: Check documentation on native host
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --workspace --all-features --no-deps
+
+      - name: Exercise managed native session probes
+        if: runner.os != 'macOS'
+        run: cargo +stable test -p gus-platform --all-targets --all-features -- --include-ignored

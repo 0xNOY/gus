@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::{
-    BootIdentity, LocalSessionObservation, ObservationError, ObservationResource, OsUserIdentity,
-    PlatformFamily, ProcessIdentity, TerminalIdentity, TerminalSessionIdentity,
+    LocalSessionObservation, ObservationError, ObservationResource, OsUserIdentity, PlatformFamily,
+    ProcessIdentity, ProcessTimeDomainIdentity, TerminalIdentity, TerminalSessionIdentity,
 };
 
 const MAX_BOOT_ID_BYTES: u64 = 128;
@@ -27,7 +27,7 @@ pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationEr
     let boot_id = read_bounded(
         Path::new("/proc/sys/kernel/random/boot_id"),
         MAX_BOOT_ID_BYTES,
-        ObservationResource::BootIdentity,
+        ObservationResource::ProcessTimeDomain,
     )?;
     let boot = parse_boot_identity(&boot_id)?;
     let caller_first = read_proc_stat(
@@ -100,7 +100,7 @@ fn normalize_anchor_recheck<T>(result: Result<T, ObservationError>) -> Result<T,
 }
 
 fn assemble_observation(
-    boot: BootIdentity,
+    boot: ProcessTimeDomainIdentity,
     caller_first: ProcStat,
     caller_uid_first: u32,
     terminal: Option<(u32, ProcStat, u32, ProcStat, u32)>,
@@ -220,7 +220,7 @@ fn parse_effective_uid(
     Err(ObservationError::Malformed { resource })
 }
 
-fn parse_boot_identity(contents: &[u8]) -> Result<BootIdentity, ObservationError> {
+fn parse_boot_identity(contents: &[u8]) -> Result<ProcessTimeDomainIdentity, ObservationError> {
     let value = trim_ascii(contents);
     if value.len() != 36
         || value.iter().enumerate().any(|(index, byte)| match index {
@@ -229,10 +229,10 @@ fn parse_boot_identity(contents: &[u8]) -> Result<BootIdentity, ObservationError
         })
     {
         return Err(ObservationError::Malformed {
-            resource: ObservationResource::BootIdentity,
+            resource: ObservationResource::ProcessTimeDomain,
         });
     }
-    Ok(BootIdentity::from_native_bytes(
+    Ok(ProcessTimeDomainIdentity::from_native_bytes(
         PlatformFamily::Linux,
         value,
     ))
@@ -313,7 +313,7 @@ mod tests {
         }
     }
 
-    fn boot() -> BootIdentity {
+    fn boot() -> ProcessTimeDomainIdentity {
         parse_boot_identity(b"01234567-89ab-cdef-8123-456789abcdef\n").expect("boot identity")
     }
 
@@ -643,9 +643,9 @@ mod tests {
         let oversized = directory.path().join("oversized");
         std::fs::write(&oversized, b"12345").expect("write fixture");
         assert_eq!(
-            read_bounded(&oversized, 4, ObservationResource::BootIdentity),
+            read_bounded(&oversized, 4, ObservationResource::ProcessTimeDomain),
             Err(ObservationError::Oversized {
-                resource: ObservationResource::BootIdentity,
+                resource: ObservationResource::ProcessTimeDomain,
             })
         );
 
