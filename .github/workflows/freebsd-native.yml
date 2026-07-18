@@ -16,10 +16,6 @@ concurrency:
   group: freebsd-native-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: "1"
-
 jobs:
   native-freebsd:
     name: FreeBSD ${{ matrix.release }} native
@@ -68,6 +64,8 @@ jobs:
           run: |
             set -eu
             export PATH="${HOME}/.cargo/bin:${PATH}"
+            export CARGO_TERM_COLOR=always
+            export RUST_BACKTRACE=1
 
             expected_release="${{ matrix.release }}"
             kernel_release="$(freebsd-version -k)"
