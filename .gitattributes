@@ -1,0 +1,2 @@
+# Wire fixtures are compared byte-for-byte by Rust and TypeScript on every host.
+crates/gus-ipc/tests/fixtures/*.json text eol=lf
