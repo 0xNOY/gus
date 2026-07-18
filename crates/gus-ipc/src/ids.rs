@@ -176,3 +176,64 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+/// A nonzero generation serialized as a decimal string.
+///
+/// String encoding preserves the complete `u64` domain in JavaScript and
+/// TypeScript without depending on IEEE-754 safe-integer limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Generation(u64);
+
+impl Generation {
+    /// Creates a nonzero generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero, which is reserved as an invalid/stale sentinel.
+    pub const fn new(value: u64) -> Result<Self, ProtocolError> {
+        if value == 0 {
+            Err(ProtocolError::InvalidGeneration)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for Generation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for Generation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Generation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(de::Error::custom(ProtocolError::InvalidGeneration));
+        }
+        value
+            .parse::<u64>()
+            .map_err(|_| de::Error::custom(ProtocolError::InvalidGeneration))
+            .and_then(|value| Self::new(value).map_err(de::Error::custom))
+    }
+}

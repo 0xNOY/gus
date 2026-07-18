@@ -1,0 +1,114 @@
+{
+  "valid": [
+    {
+      "direction": "shim_request",
+      "payload": {"protocol_version":1,"message_family":"shim_request","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"resolve_selection","body":{"plan_digest":"1111111111111111111111111111111111111111111111111111111111111111","repository_identity":"2222222222222222222222222222222222222222222222222222222222222222","operation":"commit","explicit_profile":null}}}
+    },
+    {
+      "direction": "shim_request",
+      "payload": {"protocol_version":1,"message_family":"shim_request","request_id":"10000000-0000-4000-8000-000000000002","message":{"type":"clear_selection","body":{"repository_identity":"2222222222222222222222222222222222222222222222222222222222222222","expected_session_generation":"9"}}}
+    },
+    {
+      "direction": "shim_request",
+      "payload": {"protocol_version":1,"message_family":"shim_request","request_id":"10000000-0000-4000-8000-000000000003","message":{"type":"status","body":{"repository_identity":"2222222222222222222222222222222222222222222222222222222222222222"}}}
+    },
+    {
+      "direction": "shim_response",
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"resolved","body":{"profile_id":"work","profile_generation":"18446744073709551615","session_generation":"10"}}}
+    },
+    {
+      "direction": "shim_response",
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000002","message":{"type":"cleared","body":{"session_generation":"10"}}}
+    },
+    {
+      "direction": "shim_response",
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000003","message":{"type":"status","body":{"repository_identity":"2222222222222222222222222222222222222222222222222222222222222222","selected_profile":"work","session_generation":"10"}}}
+    },
+    {
+      "direction": "shim_response",
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000004","message":{"type":"error","body":{"code":"GUS_E_PROFILE_REQUIRED","phase":"preflight","retry":"after_selection","diagnostic_id":"90000000-0000-4000-8000-000000000001","real_git_started":false,"action":"select_profile","detail":{"type":"none"}}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"20000000-0000-4000-8000-000000000001","message":{"type":"register","body":{"kind":"vscode","editor_session_id":"window-1","host_instance":"3333333333333333333333333333333333333333333333333333333333333333","repositories":["2222222222222222222222222222222222222222222222222222222222222222"],"capabilities":["profile_quick_pick","status","diagnostics"]}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"20000000-0000-4000-8000-000000000002","message":{"type":"heartbeat","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3"}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"20000000-0000-4000-8000-000000000003","message":{"type":"subscribe_status","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3"}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"20000000-0000-4000-8000-000000000004","message":{"type":"update_repositories","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","membership_generation":"4","repositories":["2222222222222222222222222222222222222222222222222222222222222222"]}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"40000000-0000-4000-8000-000000000001","message":{"type":"selection_decision","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","selection_generation":"7","decision":{"result":"selected","profile_id":"work"}}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"40000000-0000-4000-8000-000000000002","message":{"type":"selection_decision","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","selection_generation":"8","decision":{"result":"cancelled"}}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"40000000-0000-4000-8000-000000000003","message":{"type":"selection_decision","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","selection_generation":"9","decision":{"result":"unavailable"}}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"20000000-0000-4000-8000-000000000005","message":{"type":"unregister","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3"}}}
+    },
+    {
+      "direction": "provider_response",
+      "payload": {"protocol_version":1,"message_family":"provider_response","request_id":"20000000-0000-4000-8000-000000000001","message":{"type":"registered","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","heartbeat_interval_millis":15000}}}
+    },
+    {
+      "direction": "provider_response",
+      "payload": {"protocol_version":1,"message_family":"provider_response","request_id":"40000000-0000-4000-8000-000000000001","message":{"type":"selection_prompt","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","selection_generation":"7","scope":{"kind":"ide_window","opaque_id":"4444444444444444444444444444444444444444444444444444444444444444","label":"SCM"},"repository":{"identity":"2222222222222222222222222222222222222222222222222222222222222222","label":"gus"},"operation":"push","profiles":[{"profile_id":"work","display_name":"Work profile","email":"work@example.invalid"}],"timeout_millis":30000}}}
+    },
+    {
+      "direction": "provider_response",
+      "payload": {"protocol_version":1,"message_family":"provider_response","request_id":"50000000-0000-4000-8000-000000000001","message":{"type":"status_snapshot","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","entries":[{"scope":{"kind":"ide_window","opaque_id":"4444444444444444444444444444444444444444444444444444444444444444","label":"SCM"},"repository":{"identity":"2222222222222222222222222222222222222222222222222222222222222222","label":"gus"},"selected_profile":{"profile_id":"work","display_name":"Work profile","email":"work@example.invalid"},"protection":"verified"},{"scope":{"kind":"terminal","opaque_id":"5555555555555555555555555555555555555555555555555555555555555555","label":"Terminal A"},"repository":{"identity":"2222222222222222222222222222222222222222222222222222222222222222","label":"gus"},"selected_profile":{"profile_id":"personal","display_name":"Personal profile","email":null},"protection":"verified"},{"scope":{"kind":"ide_task","opaque_id":"6666666666666666666666666666666666666666666666666666666666666666","label":"Task"},"repository":{"identity":"2222222222222222222222222222222222222222222222222222222222222222","label":"gus"},"selected_profile":null,"protection":"unverified"}]}}}
+    },
+    {
+      "direction": "provider_response",
+      "payload": {"protocol_version":1,"message_family":"provider_response","request_id":"20000000-0000-4000-8000-000000000002","message":{"type":"acknowledged"}}
+    },
+    {
+      "direction": "provider_response",
+      "payload": {"protocol_version":1,"message_family":"provider_response","request_id":"20000000-0000-4000-8000-000000000006","message":{"type":"error","body":{"code":"GUS_E_PROTOCOL_MISMATCH","phase":"preflight","retry":"after_repair","diagnostic_id":"90000000-0000-4000-8000-000000000002","real_git_started":false,"action":"repair","detail":{"type":"protocol","body":{"expected":1,"received":2}}}}}
+    }
+  ],
+  "invalid": [
+    {
+      "direction": "shim_request",
+      "payload": {"protocol_version":2,"message_family":"shim_request","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"status","body":{"repository_identity":"2222222222222222222222222222222222222222222222222222222222222222"}}}
+    },
+    {
+      "direction": "shim_response",
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"resolved","body":{"profile_id":"work","profile_generation":9007199254740992,"session_generation":"10"}}}
+    },
+    {
+      "direction": "provider_request",
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"20000000-0000-4000-8000-000000000002","message":{"type":"heartbeat","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","ignored":"smuggled"}}}
+    },
+    {
+      "direction": "provider_response",
+      "payload": {"protocol_version":1,"message_family":"provider_response","request_id":"40000000-0000-4000-8000-000000000001","message":{"type":"selection_prompt","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","selection_generation":"7","scope":{"kind":"explicit_automation","opaque_id":"4444444444444444444444444444444444444444444444444444444444444444","label":"Automation"},"repository":{"identity":"2222222222222222222222222222222222222222222222222222222222222222","label":"gus"},"operation":"push","profiles":[{"profile_id":"work","display_name":"Work","email":null}],"timeout_millis":30000}}}
+    },
+    {
+      "direction": "shim_response",
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000004","message":{"type":"error","body":{"code":"GUS_E_BROKER_CAPACITY","phase":"deferred_helper","retry":"no","diagnostic_id":"90000000-0000-4000-8000-000000000001","real_git_started":true,"action":"retry","detail":{"type":"none"}}}}
+    },
+    {
+      "direction": "provider_response",
+      "payload": {"protocol_version":1,"message_family":"provider_response","request_id":"40000000-0000-4000-8000-000000000001","message":{"type":"selection_prompt","body":{"registration_id":"30000000-0000-4000-8000-000000000001","provider_generation":"3","selection_generation":"7","scope":{"kind":"ide_window","opaque_id":"4444444444444444444444444444444444444444444444444444444444444444","label":"SCM"},"repository":{"identity":"2222222222222222222222222222222222222222222222222222222222222222","label":"gus"},"operation":"push","profiles":[{"profile_id":"work","display_name":"Work","email":null},{"profile_id":"work","display_name":"Spoof","email":null}],"timeout_millis":30000}}}
+    },
+    {
+      "direction": "provider_response",
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"20000000-0000-4000-8000-000000000006","message":{"type":"error","body":{"code":"GUS_E_PROTOCOL_MISMATCH","phase":"preflight","retry":"after_repair","diagnostic_id":"90000000-0000-4000-8000-000000000002","real_git_started":false,"action":"repair","detail":{"type":"protocol","body":{"expected":1,"received":2}}}}}
+    }
+  ]
+}
