@@ -31,9 +31,11 @@ mod messages;
 mod provider_state;
 
 pub use codec::{
-    FRAME_HEADER_BYTES, MAX_FRAME_BYTES, decode_frame_length, decode_provider_request,
-    decode_provider_response, decode_shim_request, decode_shim_response, encode_provider_request,
-    encode_provider_response, encode_shim_request, encode_shim_response,
+    FRAME_HEADER_BYTES, MAX_FRAME_BYTES, TransportError, decode_frame_length,
+    decode_provider_request, decode_provider_response, decode_shim_request, decode_shim_response,
+    encode_provider_request, encode_provider_response, encode_shim_request, encode_shim_response,
+    read_provider_request, read_provider_response, read_shim_request, read_shim_response,
+    write_provider_request, write_provider_response, write_shim_request, write_shim_response,
 };
 pub use ids::{Digest32, Generation, RequestId};
 pub use messages::{

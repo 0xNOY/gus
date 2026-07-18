@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    fmt,
+    io::{self, Read, Write},
+};
 
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -10,6 +13,38 @@ use crate::messages::{
     ProviderRequestFrame, ProviderResponseFrame, ShimRequest, ShimRequestFrame, ShimResponseFrame,
     WireFrame, WireMessage,
 };
+
+/// Failure while transferring one bounded IPC record over an already
+/// authenticated byte stream.
+///
+/// This type deliberately retains only [`io::ErrorKind`]. Platform paths,
+/// pipe names, and other potentially sensitive transport details belong in a
+/// local diagnostic sink rather than on the protocol boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum TransportError {
+    #[error("IPC transport failed: {0:?}")]
+    Io(io::ErrorKind),
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+}
+
+impl PartialEq for TransportError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Io(left), Self::Io(right)) => left == right,
+            (Self::Protocol(left), Self::Protocol(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TransportError {}
+
+impl From<io::Error> for TransportError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
 
 /// Maximum JSON payload accepted before transport framing overhead.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -138,6 +173,111 @@ pub fn encode_provider_response(frame: &ProviderResponseFrame) -> Result<Vec<u8>
     encode_record(frame)
 }
 
+/// Reads and validates one shim-to-broker record from a byte stream.
+///
+/// The caller must authenticate the native peer and install a bounded I/O
+/// deadline before calling this function. The declared length is validated
+/// before allocating the payload buffer.
+///
+/// # Errors
+///
+/// Rejects transport failures, truncated records, oversized declarations, and
+/// invalid shim requests.
+pub fn read_shim_request(reader: &mut impl Read) -> Result<ShimRequestFrame, TransportError> {
+    read_record(reader, decode_shim_request)
+}
+
+/// Reads and validates one broker-to-shim record from a byte stream.
+///
+/// The caller must authenticate the native peer and install a bounded I/O
+/// deadline before calling this function.
+///
+/// # Errors
+///
+/// Rejects transport failures, truncated records, oversized declarations, and
+/// invalid shim responses.
+pub fn read_shim_response(reader: &mut impl Read) -> Result<ShimResponseFrame, TransportError> {
+    read_record(reader, decode_shim_response)
+}
+
+/// Reads and validates one provider-to-broker record from a byte stream.
+///
+/// The caller must authenticate the native peer and install a bounded I/O
+/// deadline before calling this function.
+///
+/// # Errors
+///
+/// Rejects transport failures, truncated records, oversized declarations, and
+/// invalid provider requests.
+pub fn read_provider_request(
+    reader: &mut impl Read,
+) -> Result<ProviderRequestFrame, TransportError> {
+    read_record(reader, decode_provider_request)
+}
+
+/// Reads and validates one broker-to-provider record from a byte stream.
+///
+/// The caller must authenticate the native peer and install a bounded I/O
+/// deadline before calling this function.
+///
+/// # Errors
+///
+/// Rejects transport failures, truncated records, oversized declarations, and
+/// invalid provider responses.
+pub fn read_provider_response(
+    reader: &mut impl Read,
+) -> Result<ProviderResponseFrame, TransportError> {
+    read_record(reader, decode_provider_response)
+}
+
+/// Writes one validated shim-to-broker record completely to a byte stream.
+///
+/// # Errors
+///
+/// Rejects invalid records and transport failures.
+pub fn write_shim_request(
+    writer: &mut impl Write,
+    frame: &ShimRequestFrame,
+) -> Result<(), TransportError> {
+    write_record(writer, frame, encode_shim_request)
+}
+
+/// Writes one validated broker-to-shim record completely to a byte stream.
+///
+/// # Errors
+///
+/// Rejects invalid records and transport failures.
+pub fn write_shim_response(
+    writer: &mut impl Write,
+    frame: &ShimResponseFrame,
+) -> Result<(), TransportError> {
+    write_record(writer, frame, encode_shim_response)
+}
+
+/// Writes one validated provider-to-broker record completely to a byte stream.
+///
+/// # Errors
+///
+/// Rejects invalid records and transport failures.
+pub fn write_provider_request(
+    writer: &mut impl Write,
+    frame: &ProviderRequestFrame,
+) -> Result<(), TransportError> {
+    write_record(writer, frame, encode_provider_request)
+}
+
+/// Writes one validated broker-to-provider record completely to a byte stream.
+///
+/// # Errors
+///
+/// Rejects invalid records and transport failures.
+pub fn write_provider_response(
+    writer: &mut impl Write,
+    frame: &ProviderResponseFrame,
+) -> Result<(), TransportError> {
+    write_record(writer, frame, encode_provider_response)
+}
+
 /// Decodes the fixed four-byte big-endian record header before allocating a
 /// payload buffer.
 ///
@@ -202,6 +342,42 @@ where
     Ok(frame)
 }
 
+fn read_record<M>(
+    reader: &mut impl Read,
+    decode: fn(&[u8]) -> Result<WireFrame<M>, ProtocolError>,
+) -> Result<WireFrame<M>, TransportError> {
+    let mut header = [0_u8; FRAME_HEADER_BYTES];
+    read_exact_record_part(reader, &mut header)?;
+    let payload_length = decode_frame_length(&header)?;
+    let record_length = FRAME_HEADER_BYTES
+        .checked_add(payload_length)
+        .ok_or(ProtocolError::FrameTooLarge)?;
+    let mut record = vec![0_u8; record_length];
+    record[..FRAME_HEADER_BYTES].copy_from_slice(&header);
+    read_exact_record_part(reader, &mut record[FRAME_HEADER_BYTES..])?;
+    Ok(decode(&record)?)
+}
+
+fn read_exact_record_part(reader: &mut impl Read, buffer: &mut [u8]) -> Result<(), TransportError> {
+    match reader.read_exact(buffer) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(ProtocolError::IncompleteFrame.into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_record<M>(
+    writer: &mut impl Write,
+    frame: &WireFrame<M>,
+    encode: fn(&WireFrame<M>) -> Result<Vec<u8>, ProtocolError>,
+) -> Result<(), TransportError> {
+    let record = encode(frame)?;
+    writer.write_all(&record)?;
+    Ok(())
+}
+
 fn encode_record<M>(frame: &WireFrame<M>) -> Result<Vec<u8>, ProtocolError>
 where
     M: Serialize + WireMessage,
@@ -226,3 +402,120 @@ const _: fn(&[u8]) -> Result<WireFrame<BrokerShimMessage>, ProtocolError> = deco
 const _: fn(&[u8]) -> Result<WireFrame<ProviderRequest>, ProtocolError> = decode_provider_request;
 const _: fn(&[u8]) -> Result<WireFrame<BrokerProviderMessage>, ProtocolError> =
     decode_provider_response;
+
+#[cfg(test)]
+mod stream_tests {
+    use std::io::{self, Cursor, Read, Write};
+
+    use super::*;
+    use crate::{Digest32, ShimRequest, StatusRequest};
+
+    struct ShortReader<R> {
+        inner: R,
+        maximum: usize,
+    }
+
+    impl<R: Read> Read for ShortReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let length = buffer.len().min(self.maximum);
+            self.inner.read(&mut buffer[..length])
+        }
+    }
+
+    #[derive(Default)]
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        maximum: usize,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let length = buffer.len().min(self.maximum);
+            self.bytes.extend_from_slice(&buffer[..length]);
+            Ok(length)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn status_frame() -> ShimRequestFrame {
+        ShimRequestFrame::request(ShimRequest::Status(StatusRequest::new(
+            Digest32::from_bytes([7; 32]),
+        )))
+        .expect("valid request")
+    }
+
+    #[test]
+    fn reads_a_record_across_short_reads() {
+        let frame = status_frame();
+        let record = encode_shim_request(&frame).expect("encode fixture");
+        let mut reader = ShortReader {
+            inner: Cursor::new(record),
+            maximum: 1,
+        };
+
+        assert_eq!(read_shim_request(&mut reader), Ok(frame));
+    }
+
+    #[test]
+    fn writes_a_record_across_short_writes_without_flushing() {
+        let frame = status_frame();
+        let expected = encode_shim_request(&frame).expect("encode fixture");
+        let mut writer = ShortWriter {
+            maximum: 2,
+            ..ShortWriter::default()
+        };
+
+        write_shim_request(&mut writer, &frame).expect("write fixture");
+
+        assert_eq!(writer.bytes, expected);
+    }
+
+    #[test]
+    fn rejects_an_oversized_declaration_before_reading_a_payload() {
+        let oversized = u32::try_from(MAX_FRAME_BYTES + 1)
+            .expect("frame bound fits u32")
+            .to_be_bytes();
+        let mut reader = Cursor::new(oversized);
+
+        assert_eq!(
+            read_shim_request(&mut reader),
+            Err(TransportError::Protocol(ProtocolError::FrameTooLarge))
+        );
+        assert_eq!(reader.position(), FRAME_HEADER_BYTES as u64);
+    }
+
+    #[test]
+    fn maps_truncated_header_and_payload_to_protocol_errors() {
+        let frame = status_frame();
+        let mut record = encode_shim_request(&frame).expect("encode fixture");
+        record.pop();
+
+        assert_eq!(
+            read_shim_request(&mut Cursor::new([0_u8; 3])),
+            Err(TransportError::Protocol(ProtocolError::IncompleteFrame))
+        );
+        assert_eq!(
+            read_shim_request(&mut Cursor::new(record)),
+            Err(TransportError::Protocol(ProtocolError::IncompleteFrame))
+        );
+    }
+
+    #[test]
+    fn retains_non_eof_transport_error_kind() {
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "secret path"))
+            }
+        }
+
+        assert_eq!(
+            read_shim_request(&mut FailingReader),
+            Err(TransportError::Io(io::ErrorKind::TimedOut))
+        );
+    }
+}
