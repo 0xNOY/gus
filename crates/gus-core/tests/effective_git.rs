@@ -336,6 +336,39 @@ fn pull_rebase_autostash_can_create_an_ambient_commit_for_ff_only_pull() {
 }
 
 #[test]
+fn pull_no_rebase_cli_override_selects_merge_autostash() {
+    let (_directory, consumer) = pull_fixture();
+    success(&consumer, &["config", "pull.rebase", "true"]);
+    success(&consumer, &["config", "rebase.autoStash", "false"]);
+    success(&consumer, &["config", "merge.autoStash", "true"]);
+
+    assert_eq!(
+        resolved_requirement(
+            &consumer,
+            &["pull", "--ff-only", "--no-rebase"],
+            &[
+                "merge.autoStash",
+                "pull.autoStash",
+                "pull.rebase",
+                "branch.main.rebase",
+                "rebase.autoStash",
+                "branch.main.mergeOptions",
+            ],
+            local_fetch_endpoint(),
+        ),
+        ProfileRequirement::Required(RequirementReason::AuthorIdentity)
+    );
+
+    let pull = git(&consumer, &["pull", "--ff-only", "--no-rebase"]);
+    let oid = created_autostash_oid(&pull);
+    let author = success(&consumer, &["show", "-s", "--format=%an <%ae>", &oid]);
+    assert_eq!(
+        String::from_utf8_lossy(&author.stdout).trim(),
+        "Wrong Ambient <wrong@example.test>"
+    );
+}
+
+#[test]
 fn effective_tag_signing_promotes_a_bare_tag_command() {
     let directory = repository();
     let repo = directory.path();

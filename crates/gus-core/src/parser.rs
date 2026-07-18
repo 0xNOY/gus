@@ -1,8 +1,8 @@
 use std::ffi::{OsStr, OsString};
 
 use crate::model::{
-    ConfigEnvOverride, ConfigOverride, GlobalOptions, InvocationContext, NormalizedInvocation,
-    Operation, ParseIssue,
+    CliBooleanOverride, ConfigEnvOverride, ConfigOverride, GlobalOptions, InvocationContext,
+    NormalizedInvocation, Operation, ParseIssue,
 };
 
 pub(crate) fn parse<I, S>(args: I) -> InvocationContext
@@ -246,9 +246,7 @@ fn classify_operation(command: &str, args: &[OsString]) -> Operation {
         "fetch" => Operation::Fetch,
         "clone" => Operation::Clone,
         "ls-remote" => Operation::LsRemote,
-        "pull" => Operation::Pull {
-            ff_only_candidate: pull_ff_only_is_candidate(args),
-        },
+        "pull" => classify_pull(args),
         "push" => Operation::Push,
         "commit" => Operation::Commit,
         "commit-tree" => Operation::CommitTree,
@@ -422,18 +420,23 @@ fn classify_config(args: &[OsString]) -> Operation {
     }
 }
 
-fn pull_ff_only_is_candidate(args: &[OsString]) -> bool {
-    let mut found = false;
+fn classify_pull(args: &[OsString]) -> Operation {
+    let mut found_ff_only = false;
+    let mut rebase = CliBooleanOverride::Unspecified;
+    let mut autostash = CliBooleanOverride::Unspecified;
+    let mut recognized = true;
     for arg in args {
         let Some(arg) = arg.to_str() else {
-            return false;
+            recognized = false;
+            break;
         };
         match arg {
-            "--ff-only" => found = true,
-            "--autostash" | "--rebase" | "-r" => return false,
-            "--no-autostash"
-            | "--no-rebase"
-            | "-q"
+            "--ff-only" => found_ff_only = true,
+            "--autostash" => autostash = CliBooleanOverride::Enabled,
+            "--no-autostash" => autostash = CliBooleanOverride::Disabled,
+            "--rebase" | "-r" => rebase = CliBooleanOverride::Enabled,
+            "--no-rebase" => rebase = CliBooleanOverride::Disabled,
+            "-q"
             | "--quiet"
             | "-v"
             | "--verbose"
@@ -456,10 +459,20 @@ fn pull_ff_only_is_candidate(args: &[OsString]) -> bool {
             | "--no-compact-summary"
             | "--" => {}
             value if !value.starts_with('-') => {}
-            _ => return false,
+            _ => {
+                recognized = false;
+                break;
+            }
         }
     }
-    found
+    Operation::Pull {
+        ff_only_candidate: recognized
+            && found_ff_only
+            && rebase != CliBooleanOverride::Enabled
+            && autostash != CliBooleanOverride::Enabled,
+        rebase,
+        autostash,
+    }
 }
 
 fn merge_ff_only_is_candidate(args: &[OsString]) -> bool {

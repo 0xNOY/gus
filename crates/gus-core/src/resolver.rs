@@ -3,8 +3,8 @@ use std::ffi::{OsStr, OsString};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    EndpointRole, IdentityCreationEvidence, InvocationContext, ResolutionError, ResolvedInvocation,
-    SnapshotGenerations, Transport,
+    CliBooleanOverride, EndpointRole, IdentityCreationEvidence, InvocationContext, Operation,
+    ResolutionError, ResolvedInvocation, SnapshotGenerations, Transport,
 };
 
 /// One effective Git configuration record in the order returned by the fixed
@@ -214,7 +214,7 @@ impl GitResolver {
         invocation: InvocationContext,
         snapshot: ResolverSnapshot,
     ) -> Result<ResolvedInvocation, ResolutionError> {
-        let config = EffectiveFacts::from_snapshot(&snapshot);
+        let config = EffectiveFacts::from_snapshot(&snapshot, invocation.operation());
         let request = invocation.begin_resolution(
             snapshot.repository_identity,
             snapshot.git_semantics.digest(),
@@ -246,7 +246,7 @@ struct EffectiveFacts {
 }
 
 impl EffectiveFacts {
-    fn from_snapshot(snapshot: &ResolverSnapshot) -> Self {
+    fn from_snapshot(snapshot: &ResolverSnapshot, operation: Operation) -> Self {
         if !snapshot.git_semantics.supports_identity_proofs() {
             return Self {
                 merge_ff_only: IdentityCreationEvidence::MayCreateOrUnresolved,
@@ -259,16 +259,27 @@ impl EffectiveFacts {
         let merge_autostash = config.boolean("merge.autostash");
         let merge_ff_only = evidence(merge_options_safe && merge_autostash.is_disabled());
 
-        let rebase = config.pull_uses_rebase();
-        let pull_autostash = match snapshot.git_semantics.ruleset() {
+        let (cli_rebase, cli_autostash) = match operation {
+            Operation::Pull {
+                rebase, autostash, ..
+            } => (rebase, autostash),
+            _ => (
+                CliBooleanOverride::Unspecified,
+                CliBooleanOverride::Unspecified,
+            ),
+        };
+        let rebase = config.pull_uses_rebase(cli_rebase);
+        let configured_pull_autostash = match snapshot.git_semantics.ruleset() {
             // Git 2.39 has no pull.autoStash key. Treating an ignored false
             // value as authoritative could hide merge.autoStash=true.
             GitSemanticRuleset::Git2_39 => ParsedBoolean::Unset,
             GitSemanticRuleset::Git2_55 => config.boolean("pull.autostash"),
             GitSemanticRuleset::Unsupported => unreachable!("handled above"),
         };
-        let effective_pull_autostash = if !pull_autostash.is_unset() {
-            pull_autostash
+        let effective_pull_autostash = if cli_autostash != CliBooleanOverride::Unspecified {
+            ParsedBoolean::from_cli(cli_autostash)
+        } else if !configured_pull_autostash.is_unset() {
+            configured_pull_autostash
         } else if rebase == ParsedBoolean::Enabled {
             config.boolean("rebase.autostash")
         } else if rebase == ParsedBoolean::Disabled {
@@ -328,7 +339,10 @@ impl<'a> ConfigView<'a> {
             .map_or(ParsedBoolean::Unset, parse_boolean)
     }
 
-    fn pull_uses_rebase(&self) -> ParsedBoolean {
+    fn pull_uses_rebase(&self, cli: CliBooleanOverride) -> ParsedBoolean {
+        if cli != CliBooleanOverride::Unspecified {
+            return ParsedBoolean::from_cli(cli);
+        }
         if self.branch.is_some() {
             let branch_value = self.branch_boolean("rebase");
             if !branch_value.is_unset() {
@@ -398,6 +412,14 @@ enum ParsedBoolean {
 }
 
 impl ParsedBoolean {
+    const fn from_cli(value: CliBooleanOverride) -> Self {
+        match value {
+            CliBooleanOverride::Unspecified => Self::Unset,
+            CliBooleanOverride::Enabled => Self::Enabled,
+            CliBooleanOverride::Disabled => Self::Disabled,
+        }
+    }
+
     const fn is_unset(self) -> bool {
         matches!(self, Self::Unset)
     }
@@ -459,8 +481,9 @@ mod tests {
             .expect("valid fixture Git semantics")
     }
 
-    fn resolve_pull_with_version(
+    fn resolve_pull_invocation(
         version: &str,
+        args: &[&str],
         branch: Option<&str>,
         head: Option<[u8; 32]>,
         entries: Vec<EffectiveConfigEntry>,
@@ -480,7 +503,7 @@ mod tests {
         )
         .expect("valid snapshot");
         GitResolver
-            .resolve(InvocationContext::parse(["pull", "--ff-only"]), snapshot)
+            .resolve(InvocationContext::parse(args), snapshot)
             .expect("valid resolution")
             .profile_requirement()
     }
@@ -490,7 +513,13 @@ mod tests {
         head: Option<[u8; 32]>,
         entries: Vec<EffectiveConfigEntry>,
     ) -> ProfileRequirement {
-        resolve_pull_with_version("git version 2.55.0", branch, head, entries)
+        resolve_pull_invocation(
+            "git version 2.55.0",
+            &["pull", "--ff-only"],
+            branch,
+            head,
+            entries,
+        )
     }
 
     #[test]
@@ -607,15 +636,62 @@ mod tests {
             ]
         };
         assert_eq!(
-            resolve_pull_with_version("git version 2.39.5", Some("main"), Some([3; 32]), entries(),),
+            resolve_pull_invocation(
+                "git version 2.39.5",
+                &["pull", "--ff-only"],
+                Some("main"),
+                Some([3; 32]),
+                entries(),
+            ),
             ProfileRequirement::Required(RequirementReason::AuthorIdentity),
             "Git 2.39 ignores pull.autoStash and inherits merge.autoStash"
         );
         assert_eq!(
-            resolve_pull_with_version("git version 2.55.0", Some("main"), Some([3; 32]), entries(),),
+            resolve_pull_invocation(
+                "git version 2.55.0",
+                &["pull", "--ff-only"],
+                Some("main"),
+                Some([3; 32]),
+                entries(),
+            ),
             ProfileRequirement::NotRequired,
             "Git 2.55 pull.autoStash overrides merge.autoStash"
         );
+    }
+
+    #[test]
+    fn pull_cli_rebase_and_autostash_override_config_for_every_ruleset() {
+        let entries = || {
+            vec![
+                entry("pull.rebase", "true"),
+                entry("rebase.autoStash", "false"),
+                entry("merge.autoStash", "true"),
+            ]
+        };
+        for version in ["git version 2.39.5", "git version 2.55.0"] {
+            assert_eq!(
+                resolve_pull_invocation(
+                    version,
+                    &["pull", "--ff-only", "--no-rebase"],
+                    Some("main"),
+                    Some([3; 32]),
+                    entries(),
+                ),
+                ProfileRequirement::Required(RequirementReason::AuthorIdentity),
+                "--no-rebase selects merge.autoStash for {version}"
+            );
+            assert_eq!(
+                resolve_pull_invocation(
+                    version,
+                    &["pull", "--ff-only", "--no-rebase", "--no-autostash",],
+                    Some("main"),
+                    Some([3; 32]),
+                    entries(),
+                ),
+                ProfileRequirement::NotRequired,
+                "--no-autostash overrides merge.autoStash for {version}"
+            );
+        }
     }
 
     #[test]

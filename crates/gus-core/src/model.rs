@@ -327,6 +327,8 @@ pub enum Operation {
     LsRemote,
     Pull {
         ff_only_candidate: bool,
+        rebase: CliBooleanOverride,
+        autostash: CliBooleanOverride,
     },
     Push,
     Commit,
@@ -342,6 +344,16 @@ pub enum Operation {
     AnnotatedTag,
     SignedTag,
     Unknown,
+}
+
+/// Last explicit command-line value for a Git boolean option. Keeping this in
+/// the normalized operation lets the resolver apply Git's CLI-over-config
+/// precedence without reparsing lossy strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliBooleanOverride {
+    Unspecified,
+    Enabled,
+    Disabled,
 }
 
 /// Result of syntactically normalizing a Git invocation.
@@ -494,6 +506,7 @@ impl ResolutionRequest {
             } => effective_config.merge_ff_only == IdentityCreationEvidence::IdentityFreeProven,
             Operation::Pull {
                 ff_only_candidate: true,
+                ..
             } => effective_config.pull_ff_only == IdentityCreationEvidence::IdentityFreeProven,
             _ => false,
         };

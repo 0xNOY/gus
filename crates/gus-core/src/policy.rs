@@ -22,12 +22,14 @@ pub(crate) fn unresolved_profile_requirement(context: &InvocationContext) -> Pro
         | Operation::LsRemote
         | Operation::Pull {
             ff_only_candidate: true,
+            ..
         } => required(RequirementReason::UnresolvedTransport),
         Operation::LightweightTagCandidate | Operation::SignedTag => {
             required(RequirementReason::SigningIdentity)
         }
         Operation::Pull {
             ff_only_candidate: false,
+            ..
         }
         | Operation::Commit
         | Operation::CommitTree
@@ -61,6 +63,7 @@ pub(crate) fn resolved_profile_requirement(context: &ResolvedInvocation) -> Prof
         }
         Operation::Pull {
             ff_only_candidate: true,
+            ..
         } if config.pull_ff_only() == IdentityCreationEvidence::IdentityFreeProven => {
             remote_read(context.evidence().endpoints())
         }
@@ -603,7 +606,9 @@ mod tests {
         assert_eq!(
             context.operation(),
             Operation::Pull {
-                ff_only_candidate: false
+                ff_only_candidate: false,
+                rebase: crate::CliBooleanOverride::Unspecified,
+                autostash: crate::CliBooleanOverride::Unspecified,
             }
         );
         assert_eq!(
