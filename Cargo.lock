@@ -96,6 +96,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gus-broker"
+version = "0.2.0"
+dependencies = [
+ "gus-profile",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "gus-core"
 version = "0.2.0"
 dependencies = [

@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gus-broker",
     "crates/gus-core",
     "crates/gus-profile",
 ]
 default-members = [
+    "crates/gus-broker",
     "crates/gus-core",
     "crates/gus-profile",
 ]

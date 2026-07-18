@@ -430,14 +430,14 @@ impl From<CredentialPathPrefix> for String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialProtocol {
     Http,
     Https,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CanonicalCredentialRequest {
     protocol: CredentialProtocol,
     host: CredentialHost,
@@ -447,6 +447,31 @@ pub struct CanonicalCredentialRequest {
 }
 
 impl CanonicalCredentialRequest {
+    #[must_use]
+    pub const fn protocol(&self) -> CredentialProtocol {
+        self.protocol
+    }
+
+    #[must_use]
+    pub fn host(&self) -> &CredentialHost {
+        &self.host
+    }
+
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &CredentialPathPrefix {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+
     /// Canonicalizes an endpoint-capability context whose host and port are
     /// already structurally separated and whose path is absolute.
     ///

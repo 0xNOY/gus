@@ -1,0 +1,19 @@
+[package]
+name = "gus-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+gus-profile = { path = "../gus-profile" }
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
