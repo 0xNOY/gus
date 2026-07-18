@@ -297,6 +297,10 @@ mod tests {
             AuthenticatedUnixStream::authenticate(stream).expect("authenticate peer child");
         assert_eq!(authenticated.peer_identity().pid().get(), child.id());
         authenticated.write_all(&[1]).expect("release peer child");
+        authenticated
+            .stream
+            .write_all(&[2])
+            .expect("allow peer child to exit after liveness check");
         assert!(child.wait().expect("wait for peer child").success());
     }
 
@@ -391,5 +395,10 @@ mod tests {
             return;
         }
         assert_eq!(release, [1]);
+        let mut exit_release = [0_u8; 1];
+        stream
+            .read_exact(&mut exit_release)
+            .expect("wait until parent completes its liveness check");
+        assert_eq!(exit_release, [2]);
     }
 }
