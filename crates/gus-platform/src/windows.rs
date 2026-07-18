@@ -725,6 +725,7 @@ mod tests {
     const CONPTY_COORDINATOR_TEST_NAME: &str = "windows::tests::native_conpty_coordinator_probe";
     const CONPTY_DESCENDANT_TEST_NAME: &str = "windows::tests::native_conpty_descendant_probe";
     const CONPTY_ID_PREFIX: &str = "GUS_CONPTY_ID:";
+    const CONPTY_MARKER_FILE: &str = "gus-conpty-identity";
     const MAX_CONPTY_OUTPUT_BYTES: u64 = 1024 * 1024;
     const CONPTY_CHILD_TIMEOUT_MS: u32 = 30_000;
 
@@ -827,7 +828,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(parse_conpty_identity(&output.stdout), terminal.digest);
-        emit_conpty_identity(terminal.digest);
+        fs::write(CONPTY_MARKER_FILE, terminal.digest).expect("write ConPTY identity marker");
     }
 
     #[test]
@@ -1040,6 +1041,8 @@ mod tests {
     }
 
     fn run_conpty_child() -> [u8; IDENTITY_DIGEST_BYTES] {
+        let directory = tempdir().expect("create ConPTY child directory");
+        let marker = directory.path().join(CONPTY_MARKER_FILE);
         let (input_read, input_write) = create_anonymous_pipe();
         let (output_read, output_write) = create_anonymous_pipe();
         let mut pseudoconsole_raw = 0_isize;
@@ -1057,7 +1060,7 @@ mod tests {
         assert!(result >= 0, "create pseudoconsole HRESULT {result:#x}");
         assert_ne!(pseudoconsole_raw, 0, "nonzero pseudoconsole handle");
         let pseudoconsole = OwnedPseudoConsole(pseudoconsole_raw);
-        let (process, reader) = launch_conpty_child(pseudoconsole.0, output_read);
+        let (process, reader) = launch_conpty_child(pseudoconsole.0, output_read, directory.path());
         drop(input_read);
         drop(output_write);
 
@@ -1095,12 +1098,16 @@ mod tests {
             "ConPTY child failed:\n{}",
             String::from_utf8_lossy(&output)
         );
-        parse_conpty_identity(&output)
+        fs::read(&marker)
+            .expect("read ConPTY identity marker")
+            .try_into()
+            .expect("exact ConPTY identity marker length")
     }
 
     fn launch_conpty_child(
         pseudoconsole: HPCON,
         output_read: OwnedHandle,
+        current_directory: &Path,
     ) -> (OwnedHandle, thread::JoinHandle<Vec<u8>>) {
         let attributes = OwnedAttributeList::for_pseudoconsole(pseudoconsole);
 
@@ -1115,6 +1122,9 @@ mod tests {
             format!(" --exact {CONPTY_COORDINATOR_TEST_NAME} --ignored --nocapture").encode_utf16(),
         );
         command_line.push(0);
+        let mut current_directory_wide: Vec<u16> =
+            current_directory.as_os_str().encode_wide().collect();
+        current_directory_wide.push(0);
         let startup = STARTUPINFOEXW {
             StartupInfo: windows_sys::Win32::System::Threading::STARTUPINFOW {
                 cb: u32::try_from(size_of::<STARTUPINFOEXW>()).expect("startup info size fits u32"),
@@ -1149,7 +1159,7 @@ mod tests {
                     0,
                     EXTENDED_STARTUPINFO_PRESENT,
                     ptr::null(),
-                    ptr::null(),
+                    current_directory_wide.as_ptr(),
                     ptr::addr_of!(startup.StartupInfo),
                     ptr::addr_of_mut!(process_info),
                 )
