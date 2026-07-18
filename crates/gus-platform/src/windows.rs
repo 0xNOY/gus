@@ -725,6 +725,9 @@ mod tests {
     const CONPTY_COORDINATOR_TEST_NAME: &str = "windows::tests::native_conpty_coordinator_probe";
     const CONPTY_DESCENDANT_TEST_NAME: &str = "windows::tests::native_conpty_descendant_probe";
     const CONPTY_ID_PREFIX: &str = "GUS_CONPTY_ID:";
+    const CONPTY_COORDINATOR_SENTINEL_FILE: &str = "gus-managed-conpty-coordinator";
+    const CONPTY_DESCENDANT_ENV: &str = "GUS_WINDOWS_CONPTY_DESCENDANT";
+    const CONPTY_DESCENDANT_TOKEN: &str = "managed-v1";
     const CONPTY_MARKER_FILE: &str = "gus-conpty-identity";
     const MAX_CONPTY_OUTPUT_BYTES: u64 = 1024 * 1024;
     const CONPTY_CHILD_TIMEOUT_MS: u32 = 30_000;
@@ -808,6 +811,11 @@ mod tests {
     #[test]
     #[ignore = "internal child process hosted by the ConPTY smoke test"]
     fn native_conpty_coordinator_probe() {
+        if !Path::new(CONPTY_COORDINATOR_SENTINEL_FILE).is_file() {
+            return;
+        }
+        fs::remove_file(CONPTY_COORDINATOR_SENTINEL_FILE)
+            .expect("consume managed ConPTY coordinator sentinel");
         let terminal = observe_current()
             .expect("observe ConPTY coordinator")
             .terminal_session()
@@ -818,6 +826,7 @@ mod tests {
             .arg(CONPTY_DESCENDANT_TEST_NAME)
             .arg("--ignored")
             .arg("--nocapture")
+            .env(CONPTY_DESCENDANT_ENV, CONPTY_DESCENDANT_TOKEN)
             .output()
             .expect("launch inherited ConPTY descendant");
         assert!(
@@ -834,6 +843,9 @@ mod tests {
     #[test]
     #[ignore = "internal descendant process hosted by the ConPTY smoke test"]
     fn native_conpty_descendant_probe() {
+        if env::var(CONPTY_DESCENDANT_ENV).as_deref() != Ok(CONPTY_DESCENDANT_TOKEN) {
+            return;
+        }
         let terminal = observe_current()
             .expect("observe inherited ConPTY descendant")
             .terminal_session()
@@ -1043,6 +1055,11 @@ mod tests {
     fn run_conpty_child() -> [u8; IDENTITY_DIGEST_BYTES] {
         let directory = tempdir().expect("create ConPTY child directory");
         let marker = directory.path().join(CONPTY_MARKER_FILE);
+        fs::write(
+            directory.path().join(CONPTY_COORDINATOR_SENTINEL_FILE),
+            b"managed",
+        )
+        .expect("write managed ConPTY coordinator sentinel");
         let (input_read, input_write) = create_anonymous_pipe();
         let (output_read, output_write) = create_anonymous_pipe();
         let mut pseudoconsole_raw = 0_isize;
