@@ -20,10 +20,26 @@ pub enum ValidationError {
     InvalidCredentialUsername,
     #[error("executable argument contains a NUL or control character")]
     InvalidExecutableArgument,
+    #[error("managed executable path must be absolute")]
+    InvalidExecutablePath,
+    #[error("SHA-256 digest must contain exactly 64 hexadecimal characters")]
+    InvalidSha256Digest,
+    #[error("SSH key, certificate, agent, and known-hosts paths must be absolute")]
+    InvalidSshPath,
+    #[error("SSH fingerprint must be a canonical SHA256 fingerprint")]
+    InvalidSshFingerprint,
+    #[error("SSH proxy jump host, user, port, or host-key fingerprint is invalid")]
+    InvalidProxyJump,
+    #[error("secret-store service and account must be non-empty single-line values")]
+    InvalidSecretStoreReference,
+    #[error("credential bindings contain the same canonical scope more than once")]
+    DuplicateCredentialBinding,
     #[error("profile map key '{map_key}' does not match embedded id '{profile_id}'")]
     ProfileKeyMismatch { map_key: String, profile_id: String },
     #[error("profile generation must be greater than zero")]
     InvalidProfileGeneration,
+    #[error("profile set generation must be greater than zero")]
+    InvalidProfileSetGeneration,
     #[error("profile set version {0} is not supported")]
     UnsupportedProfileSetVersion(u32),
 }
