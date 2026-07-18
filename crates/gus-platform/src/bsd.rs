@@ -322,7 +322,15 @@ fn terminal_facts(descriptor: &OwnedFd) -> Result<TerminalAccessFacts, Observati
 
     // SAFETY: `tcgetsid` only borrows the live terminal descriptor.
     let session_id = unsafe { libc::tcgetsid(descriptor.as_raw_fd()) };
-    let session_id = pid_to_nonzero(session_id, ObservationResource::TerminalSession)?;
+    if session_id == -1 {
+        return Err(terminal_session_error(&io::Error::last_os_error()));
+    }
+    let session_id = u32::try_from(session_id)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(ObservationError::Malformed {
+            resource: ObservationResource::TerminalSession,
+        })?;
     Ok(TerminalAccessFacts {
         #[cfg(target_os = "macos")]
         resolved_device: None,
@@ -330,6 +338,18 @@ fn terminal_facts(descriptor: &OwnedFd) -> Result<TerminalAccessFacts, Observati
         resolved_device: Some(status.st_rdev),
         session_id,
     })
+}
+
+fn terminal_session_error(error: &io::Error) -> ObservationError {
+    match error.raw_os_error() {
+        Some(libc::EACCES | libc::ENOTTY | libc::ENODEV | libc::ENXIO) => {
+            ObservationError::ProcessChanged
+        }
+        _ => ObservationError::Read {
+            resource: ObservationResource::TerminalSession,
+            kind: error.kind(),
+        },
+    }
 }
 
 pub(super) fn pid_to_nonzero(
@@ -383,6 +403,23 @@ mod tests {
             observation.caller().user().family(),
             crate::PlatformFamily::MacOs | crate::PlatformFamily::FreeBsd
         ));
+    }
+
+    #[test]
+    fn terminal_detachment_errors_are_retryable_process_changes() {
+        for raw in [libc::EACCES, libc::ENOTTY, libc::ENODEV, libc::ENXIO] {
+            assert_eq!(
+                super::terminal_session_error(&std::io::Error::from_raw_os_error(raw)),
+                crate::ObservationError::ProcessChanged
+            );
+        }
+        assert_eq!(
+            super::terminal_session_error(&std::io::Error::from_raw_os_error(libc::EPERM)),
+            crate::ObservationError::Read {
+                resource: crate::ObservationResource::TerminalSession,
+                kind: std::io::ErrorKind::PermissionDenied,
+            }
+        );
     }
 
     #[test]
