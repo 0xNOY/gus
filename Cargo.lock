@@ -130,6 +130,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gus-platform"
+version = "0.2.0"
+dependencies = [
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "gus-profile"
 version = "0.2.0"
 dependencies = [

@@ -4,12 +4,14 @@ members = [
     "crates/gus-broker",
     "crates/gus-core",
     "crates/gus-ipc",
+    "crates/gus-platform",
     "crates/gus-profile",
 ]
 default-members = [
     "crates/gus-broker",
     "crates/gus-core",
     "crates/gus-ipc",
+    "crates/gus-platform",
     "crates/gus-profile",
 ]
 
