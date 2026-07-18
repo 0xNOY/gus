@@ -1,0 +1,42 @@
+[
+  {
+    "name": "floating protocol version",
+    "direction": "shim_request",
+    "payload": "{\"protocol_version\":1.0,\"message_family\":\"shim_request\",\"request_id\":\"10000000-0000-4000-8000-000000000001\",\"message\":{\"type\":\"status\",\"body\":{\"repository_identity\":\"2222222222222222222222222222222222222222222222222222222222222222\"}}}"
+  },
+  {
+    "name": "floating heartbeat interval",
+    "direction": "provider_response",
+    "payload": "{\"protocol_version\":1,\"message_family\":\"provider_response\",\"request_id\":\"20000000-0000-4000-8000-000000000001\",\"message\":{\"type\":\"registered\",\"body\":{\"registration_id\":\"30000000-0000-4000-8000-000000000001\",\"provider_generation\":\"3\",\"heartbeat_interval_millis\":15000.0}}}"
+  },
+  {
+    "name": "UTF-8 BOM",
+    "direction": "shim_request",
+    "payload": "\uFEFF{\"protocol_version\":1,\"message_family\":\"shim_request\",\"request_id\":\"10000000-0000-4000-8000-000000000001\",\"message\":{\"type\":\"status\",\"body\":{\"repository_identity\":\"2222222222222222222222222222222222222222222222222222222222222222\"}}}"
+  },
+  {
+    "name": "lone UTF-16 surrogate escape",
+    "direction": "provider_request",
+    "payload": "{\"protocol_version\":1,\"message_family\":\"provider_request\",\"request_id\":\"20000000-0000-4000-8000-000000000001\",\"message\":{\"type\":\"register\",\"body\":{\"kind\":\"vscode\",\"editor_session_id\":\"\\ud800\",\"host_instance\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"repositories\":[],\"capabilities\":[\"profile_quick_pick\"]}}}"
+  },
+  {
+    "name": "soft hyphen presentation spoof",
+    "direction": "provider_request",
+    "payload": "{\"protocol_version\":1,\"message_family\":\"provider_request\",\"request_id\":\"20000000-0000-4000-8000-000000000001\",\"message\":{\"type\":\"register\",\"body\":{\"kind\":\"vscode\",\"editor_session_id\":\"Work\u00adProfile\",\"host_instance\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"repositories\":[],\"capabilities\":[\"profile_quick_pick\"]}}}"
+  },
+  {
+    "name": "Mongolian vowel separator presentation spoof",
+    "direction": "provider_request",
+    "payload": "{\"protocol_version\":1,\"message_family\":\"provider_request\",\"request_id\":\"20000000-0000-4000-8000-000000000001\",\"message\":{\"type\":\"register\",\"body\":{\"kind\":\"vscode\",\"editor_session_id\":\"Work\u180eProfile\",\"host_instance\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"repositories\":[],\"capabilities\":[\"profile_quick_pick\"]}}}"
+  },
+  {
+    "name": "line separator presentation spoof",
+    "direction": "provider_request",
+    "payload": "{\"protocol_version\":1,\"message_family\":\"provider_request\",\"request_id\":\"20000000-0000-4000-8000-000000000001\",\"message\":{\"type\":\"register\",\"body\":{\"kind\":\"vscode\",\"editor_session_id\":\"Work\u2028Profile\",\"host_instance\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"repositories\":[],\"capabilities\":[\"profile_quick_pick\"]}}}"
+  },
+  {
+    "name": "paragraph separator presentation spoof",
+    "direction": "provider_request",
+    "payload": "{\"protocol_version\":1,\"message_family\":\"provider_request\",\"request_id\":\"20000000-0000-4000-8000-000000000001\",\"message\":{\"type\":\"register\",\"body\":{\"kind\":\"vscode\",\"editor_session_id\":\"Work\u2029Profile\",\"host_instance\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"repositories\":[],\"capabilities\":[\"profile_quick_pick\"]}}}"
+  }
+]

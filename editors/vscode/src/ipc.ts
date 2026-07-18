@@ -96,6 +96,11 @@ export type ProviderRequest =
   | { type: "selection_decision"; body: ProviderSelectionDecision }
   | { type: "unregister"; body: ProviderControlRequest };
 
+export type ProviderControlMessage = Exclude<
+  ProviderRequest,
+  { type: "register" } | { type: "selection_decision" }
+>;
+
 export interface ResolvedSelection {
   profile_id: ProfileId;
   profile_generation: Generation;
@@ -239,7 +244,7 @@ export type ProviderResponseFrame = WireFrame<
 
 type JsonObject = Record<string, unknown>;
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: true });
+const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const requestIdPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const digestPattern = /^[0-9a-f]{64}$/u;
@@ -351,14 +356,31 @@ function isProfileId(value: unknown): value is ProfileId {
   return typeof value === "string" && profileIdPattern.test(value);
 }
 
+function isUnicodeScalarString(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      if (index + 1 >= value.length) return false;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function isPresentationText(value: unknown, minimumCharacters = 1): value is string {
   if (typeof value !== "string") return false;
-  if ([...value].length < minimumCharacters || textEncoder.encode(value).length > 256) {
+  if (
+    !isUnicodeScalarString(value) ||
+    [...value].length < minimumCharacters ||
+    textEncoder.encode(value).length > 256
+  ) {
     return false;
   }
-  return !/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/u.test(
-    value,
-  );
+  return !/[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f-\u1160\u17b4-\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\u{1bca0}-\u{1bca3}\u{1d173}-\u{1d17a}\u{e0000}-\u{e0fff}]/u.test(value);
 }
 
 function isUniqueArray<T>(
@@ -657,7 +679,7 @@ const errorContracts: Readonly<Record<ErrorCode, ErrorContract>> = {
     detail: "journal",
   },
   GUS_E_INTERNAL: {
-    phases: bothPhases,
+    phases: preflightOnly,
     retry: "no",
     action: "run_doctor",
     detail: "none",
@@ -961,7 +983,9 @@ function parseStrictJson(text: string): unknown {
       if (character === '"') {
         index += 1;
         const parsed: unknown = JSON.parse(text.slice(start, index));
-        if (typeof parsed !== "string") throw new Error("invalid JSON string");
+        if (typeof parsed !== "string" || !isUnicodeScalarString(parsed)) {
+          throw new Error("invalid JSON string");
+        }
         return parsed;
       }
       if (character === "\\") {
@@ -990,7 +1014,7 @@ function parseStrictJson(text: string): unknown {
       while (true) {
         skipWhitespace();
         const key = parseString();
-        if (keys.has(key)) throw new Error(`duplicate JSON key: ${key}`);
+        if (keys.has(key)) throw new Error("duplicate JSON key");
         keys.add(key);
         skipWhitespace();
         if (text[index] !== ":") throw new Error("expected JSON colon");
@@ -1034,9 +1058,7 @@ function parseStrictJson(text: string): unknown {
         return value;
       }
     }
-    const number = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/u.exec(
-      text.slice(index),
-    )?.[0];
+    const number = /^(?:0|[1-9][0-9]*)/u.exec(text.slice(index))?.[0];
     if (number !== undefined) {
       index += number.length;
       const parsed: unknown = JSON.parse(number);
@@ -1098,6 +1120,48 @@ export function decodeProviderResponse(record: Uint8Array): ProviderResponseFram
   return decodeRecord(record, "provider_response", isProviderResponse);
 }
 
+function cloneCanonicalJson(value: unknown, depth = 0): unknown {
+  if (depth > 64) throw new Error("cannot encode deeply nested GUS IPC data");
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 128) throw new Error("cannot encode oversized GUS IPC array");
+    const copy: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) {
+        throw new Error("cannot encode sparse GUS IPC array");
+      }
+      copy.push(cloneCanonicalJson(value[index], depth + 1));
+    }
+    const expectedKeys = new Set(Array.from({ length: value.length }, (_, index) => String(index)));
+    if (Object.keys(value).some((key) => !expectedKeys.has(key))) {
+      throw new Error("cannot encode array properties in GUS IPC data");
+    }
+    return copy;
+  }
+  if (!isObject(value) || Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error("cannot encode non-JSON GUS IPC data");
+  }
+
+  const copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      throw new Error("cannot encode accessor-backed GUS IPC data");
+    }
+    if (descriptor.enumerable) {
+      copy[key] = cloneCanonicalJson(descriptor.value, depth + 1);
+    }
+  }
+  return copy;
+}
+
 export function encodeFrame(
   frame:
     | ShimRequestFrame
@@ -1105,20 +1169,33 @@ export function encodeFrame(
     | ProviderRequestFrame
     | ProviderResponseFrame,
 ): Uint8Array {
-  const family = frame.message_family;
-  const messageValid =
-    (family === "shim_request" && isShimRequest(frame.message)) ||
-    (family === "shim_response" && isShimResponse(frame.message)) ||
-    (family === "provider_request" && isProviderRequest(frame.message)) ||
-    (family === "provider_response" && isProviderResponse(frame.message));
+  const candidate = cloneCanonicalJson(frame);
   if (
-    frame.protocol_version !== PROTOCOL_VERSION ||
-    !isRequestId(frame.request_id) ||
+    !isObject(candidate) ||
+    !hasExactKeys(candidate, ["protocol_version", "message_family", "request_id", "message"])
+  ) {
+    throw new Error("cannot encode invalid GUS IPC frame");
+  }
+  const family = candidate.message_family;
+  const messageValid =
+    (family === "shim_request" && isShimRequest(candidate.message)) ||
+    (family === "shim_response" && isShimResponse(candidate.message)) ||
+    (family === "provider_request" && isProviderRequest(candidate.message)) ||
+    (family === "provider_response" && isProviderResponse(candidate.message));
+  if (
+    candidate.protocol_version !== PROTOCOL_VERSION ||
+    !isRequestId(candidate.request_id) ||
     !messageValid
   ) {
     throw new Error("cannot encode invalid GUS IPC frame");
   }
-  const payload = textEncoder.encode(JSON.stringify(frame));
+  const canonical = {
+    protocol_version: PROTOCOL_VERSION,
+    message_family: family,
+    request_id: candidate.request_id,
+    message: candidate.message,
+  };
+  const payload = textEncoder.encode(JSON.stringify(canonical));
   if (payload.byteLength === 0 || payload.byteLength > MAX_FRAME_BYTES) {
     throw new Error("GUS IPC payload is oversized");
   }
@@ -1130,4 +1207,68 @@ export function encodeFrame(
 
 export function newRequestId(): RequestId {
   return randomUUID();
+}
+
+export function createProviderRegistrationFrame(
+  registration: ProviderRegistrationRequest,
+): ProviderRequestFrame {
+  if (!isProviderRegistration(registration)) {
+    throw new Error("cannot create invalid provider registration");
+  }
+  return {
+    protocol_version: PROTOCOL_VERSION,
+    message_family: "provider_request",
+    request_id: newRequestId(),
+    message: { type: "register", body: registration },
+  };
+}
+
+export function createProviderControlFrame(
+  message: ProviderControlMessage,
+): ProviderRequestFrame {
+  const candidate: unknown = message;
+  if (
+    !isProviderRequest(candidate) ||
+    candidate.type === "register" ||
+    candidate.type === "selection_decision"
+  ) {
+    throw new Error("cannot create invalid provider control command");
+  }
+  return {
+    protocol_version: PROTOCOL_VERSION,
+    message_family: "provider_request",
+    request_id: newRequestId(),
+    message,
+  };
+}
+
+export function createProviderSelectionResponseFrame(
+  promptFrame: ProviderResponseFrame,
+  decision: ProviderDecision,
+): ProviderRequestFrame {
+  if (
+    promptFrame.protocol_version !== PROTOCOL_VERSION ||
+    promptFrame.message_family !== "provider_response" ||
+    !isRequestId(promptFrame.request_id) ||
+    !isProviderResponse(promptFrame.message) ||
+    promptFrame.message.type !== "selection_prompt" ||
+    !isProviderDecision(decision)
+  ) {
+    throw new Error("selection response requires a valid broker prompt");
+  }
+  const prompt = promptFrame.message.body;
+  return {
+    protocol_version: PROTOCOL_VERSION,
+    message_family: "provider_request",
+    request_id: promptFrame.request_id,
+    message: {
+      type: "selection_decision",
+      body: {
+        registration_id: prompt.registration_id,
+        provider_generation: prompt.provider_generation,
+        selection_generation: prompt.selection_generation,
+        decision,
+      },
+    },
+  };
 }

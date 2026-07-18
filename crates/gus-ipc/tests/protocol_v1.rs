@@ -1,4 +1,7 @@
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use gus_ipc::{
     BrokerError, BrokerProviderMessage, BrokerShimMessage, Digest32, ErrorCode, ErrorDetail,
@@ -59,6 +62,25 @@ fn profile(id: &str, display_name: &str) -> ProfilePresentation {
         Some(format!("{id}@example.invalid")),
     )
     .expect("valid profile presentation")
+}
+
+fn provider_correlation(
+    registration_id: gus_ipc::RequestId,
+    provider_generation: Generation,
+    repositories: Vec<Digest32>,
+    capabilities: Vec<ProviderCapability>,
+) -> ProviderCorrelation {
+    let registration = ProviderRegistrationRequest::new(
+        ProviderKind::Vscode,
+        "test-editor-session".into(),
+        digest(0xfe),
+        repositories,
+        capabilities,
+    )
+    .expect("registration");
+    let accepted = RegistrationAccepted::new(registration_id, provider_generation, 15_000)
+        .expect("accepted registration");
+    ProviderCorrelation::from_registration(&registration, &accepted)
 }
 
 fn prompt(
@@ -314,6 +336,15 @@ fn error_catalog_mapping_rejects_contradictory_phase_retry_action_and_detail() {
     );
     assert!(
         BrokerError::new(
+            ErrorCode::GusEInternal,
+            ErrorPhase::DeferredHelper,
+            diagnostic_id,
+            ErrorDetail::None,
+        )
+        .is_err()
+    );
+    assert!(
+        BrokerError::new(
             ErrorCode::GusEProtocolMismatch,
             ErrorPhase::Preflight,
             diagnostic_id,
@@ -405,16 +436,27 @@ fn provider_correlation_consumes_one_exact_prompt_and_rejects_replay() {
     let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
     let provider_generation = generation(3);
     let selection_generation = generation(7);
+    let now = Instant::now();
     let prompt_frame = ProviderResponseFrame::selection_prompt(prompt(
         registration_id,
         provider_generation,
         selection_generation,
     ))
     .expect("prompt frame");
-    let mut correlation = ProviderCorrelation::new(registration_id, provider_generation);
-    correlation.track_prompt(&prompt_frame).expect("tracked");
+    let mut correlation = provider_correlation(
+        registration_id,
+        provider_generation,
+        vec![digest(0x33)],
+        vec![ProviderCapability::ProfileQuickPick],
+    );
+    assert!(
+        correlation
+            .track_prompt(&prompt_frame, now)
+            .expect("tracked")
+            .is_empty()
+    );
     assert_eq!(
-        correlation.track_prompt(&prompt_frame),
+        correlation.track_prompt(&prompt_frame, now),
         Err(ProviderCorrelationError::DuplicatePrompt)
     );
 
@@ -428,7 +470,7 @@ fn provider_correlation_consumes_one_exact_prompt_and_rejects_replay() {
     let stale_frame = ProviderRequestFrame::selection_response(prompt_frame.request_id(), stale)
         .expect("stale frame");
     assert_eq!(
-        correlation.accept_selection(&stale_frame),
+        correlation.accept_selection(&stale_frame, now),
         Err(ProviderCorrelationError::SelectionGenerationMismatch)
     );
     assert_eq!(correlation.outstanding_prompt_count(), 1);
@@ -445,31 +487,47 @@ fn provider_correlation_consumes_one_exact_prompt_and_rejects_replay() {
             .expect("response frame");
     assert!(matches!(
         correlation
-            .accept_selection(&response_frame)
+            .accept_selection(&response_frame, now)
             .expect("accepted once"),
         ProviderDecision::Selected(id) if id.as_str() == "work"
     ));
     assert_eq!(
-        correlation.accept_selection(&response_frame),
+        correlation.accept_selection(&response_frame, now),
         Err(ProviderCorrelationError::UnknownPrompt)
     );
 
-    let mut replacement = ProviderCorrelation::new(
+    let mut replacement = provider_correlation(
         request_id("cfac2219-d065-4602-a26a-26b5bfa33c51"),
         generation(4),
+        vec![digest(0x33)],
+        vec![ProviderCapability::ProfileQuickPick],
     );
     assert_eq!(
-        replacement.accept_selection(&response_frame),
+        replacement.accept_selection(&response_frame, now),
         Err(ProviderCorrelationError::RegistrationMismatch)
     );
+}
 
+#[test]
+fn provider_membership_change_revokes_prompts_and_unoffered_profiles() {
+    let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
+    let provider_generation = generation(3);
+    let now = Instant::now();
+    let mut correlation = provider_correlation(
+        registration_id,
+        provider_generation,
+        vec![digest(0x33)],
+        vec![ProviderCapability::ProfileQuickPick],
+    );
     let second_prompt = ProviderResponseFrame::selection_prompt(prompt(
         registration_id,
         provider_generation,
         generation(8),
     ))
     .expect("second prompt");
-    correlation.track_prompt(&second_prompt).expect("tracked");
+    correlation
+        .track_prompt(&second_prompt, now)
+        .expect("tracked");
     let unoffered = ProviderSelectionDecision::new(
         registration_id,
         provider_generation,
@@ -481,7 +539,7 @@ fn provider_correlation_consumes_one_exact_prompt_and_rejects_replay() {
         ProviderRequestFrame::selection_response(second_prompt.request_id(), unoffered)
             .expect("response frame");
     assert_eq!(
-        correlation.accept_selection(&unoffered_frame),
+        correlation.accept_selection(&unoffered_frame, now),
         Err(ProviderCorrelationError::ProfileNotOffered)
     );
     assert_eq!(correlation.outstanding_prompt_count(), 1);
@@ -496,12 +554,121 @@ fn provider_correlation_consumes_one_exact_prompt_and_rejects_replay() {
     let membership_frame =
         ProviderRequestFrame::control(ProviderRequest::UpdateRepositories(membership))
             .expect("membership frame");
-    correlation
+    let revoked = correlation
         .accept_membership(&membership_frame)
         .expect("first membership");
+    assert_eq!(revoked, vec![second_prompt.request_id()]);
+    assert_eq!(correlation.outstanding_prompt_count(), 0);
     assert_eq!(
         correlation.accept_membership(&membership_frame),
         Err(ProviderCorrelationError::StaleMembership)
+    );
+}
+
+#[test]
+fn provider_prompt_lifecycle_releases_timeout_failure_and_disconnect_waiters() {
+    let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
+    let provider_generation = generation(3);
+    let now = Instant::now();
+    let mut correlation = provider_correlation(
+        registration_id,
+        provider_generation,
+        vec![digest(0x33)],
+        vec![ProviderCapability::ProfileQuickPick],
+    );
+
+    let expired_prompt = ProviderResponseFrame::selection_prompt(prompt(
+        registration_id,
+        provider_generation,
+        generation(1),
+    ))
+    .expect("expired prompt");
+    correlation
+        .track_prompt(&expired_prompt, now)
+        .expect("track expiring prompt");
+    let late_decision = ProviderSelectionDecision::new(
+        registration_id,
+        provider_generation,
+        generation(1),
+        ProviderDecision::Cancelled,
+    )
+    .expect("late decision");
+    let late_frame =
+        ProviderRequestFrame::selection_response(expired_prompt.request_id(), late_decision)
+            .expect("late response frame");
+    assert_eq!(
+        correlation.accept_selection(&late_frame, now + Duration::from_secs(30)),
+        Err(ProviderCorrelationError::PromptExpired)
+    );
+    assert_eq!(correlation.outstanding_prompt_count(), 0);
+
+    let pruned_prompt = ProviderResponseFrame::selection_prompt(prompt(
+        registration_id,
+        provider_generation,
+        generation(2),
+    ))
+    .expect("pruned prompt");
+    correlation
+        .track_prompt(&pruned_prompt, now)
+        .expect("track pruned prompt");
+    let replacement_prompt = ProviderResponseFrame::selection_prompt(prompt(
+        registration_id,
+        provider_generation,
+        generation(3),
+    ))
+    .expect("replacement prompt");
+    assert_eq!(
+        correlation
+            .track_prompt(&replacement_prompt, now + Duration::from_secs(31))
+            .expect("expired capacity is reclaimed"),
+        vec![pruned_prompt.request_id()]
+    );
+    assert!(correlation.abandon_prompt(replacement_prompt.request_id()));
+    assert!(!correlation.abandon_prompt(replacement_prompt.request_id()));
+
+    let disconnect_prompt = ProviderResponseFrame::selection_prompt(prompt(
+        registration_id,
+        provider_generation,
+        generation(4),
+    ))
+    .expect("disconnect prompt");
+    correlation
+        .track_prompt(&disconnect_prompt, now)
+        .expect("track disconnect prompt");
+    assert_eq!(
+        correlation.disconnect(),
+        vec![disconnect_prompt.request_id()]
+    );
+}
+
+#[test]
+fn provider_capabilities_and_repository_membership_are_enforced() {
+    let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
+    let provider_generation = generation(3);
+    let correlation = provider_correlation(
+        registration_id,
+        provider_generation,
+        vec![digest(0x22)],
+        vec![ProviderCapability::ProfileQuickPick],
+    );
+    let status = ProviderStatusSnapshot::new(registration_id, provider_generation, Vec::new())
+        .expect("empty status");
+    let status_frame = ProviderResponseFrame::status_snapshot(status).expect("status frame");
+    assert_eq!(
+        correlation.validate_status(&status_frame),
+        Err(ProviderCorrelationError::CapabilityNotNegotiated)
+    );
+
+    let prompt_frame = ProviderResponseFrame::selection_prompt(prompt(
+        registration_id,
+        provider_generation,
+        generation(1),
+    ))
+    .expect("prompt frame");
+    let mut correlation = correlation;
+    assert_eq!(
+        correlation.track_prompt(&prompt_frame, Instant::now()),
+        Err(ProviderCorrelationError::RepositoryNotRegistered)
     );
 }
 
@@ -535,7 +702,15 @@ fn scoped_status_keeps_scm_terminals_and_tasks_independent() {
     let snapshot = ProviderStatusSnapshot::new(registration_id, provider_generation, entries)
         .expect("snapshot");
     let frame = ProviderResponseFrame::status_snapshot(snapshot).expect("status frame");
-    let correlation = ProviderCorrelation::new(registration_id, provider_generation);
+    let correlation = provider_correlation(
+        registration_id,
+        provider_generation,
+        vec![digest(9)],
+        vec![
+            ProviderCapability::ProfileQuickPick,
+            ProviderCapability::Status,
+        ],
+    );
     correlation.validate_status(&frame).expect("bound status");
     let BrokerProviderMessage::StatusSnapshot(snapshot) = frame.message() else {
         panic!("expected status snapshot");
@@ -579,6 +754,40 @@ fn decoded_values_are_readable_without_reserializing_and_debug_is_redacted() {
     .expect("accepted");
     assert_eq!(accepted.provider_generation(), generation(3));
     assert_eq!(accepted.heartbeat_interval_millis(), 15_000);
+
+    let sensitive_profile = profile_id("sensitive-user");
+    let resolved =
+        gus_ipc::ResolvedSelection::new(sensitive_profile.clone(), generation(1), generation(2))
+            .expect("resolved selection");
+    let status =
+        gus_ipc::SelectionStatus::new(digest(3), Some(sensitive_profile.clone()), generation(2))
+            .expect("selection status");
+    let decision = ProviderDecision::Selected(sensitive_profile);
+    assert!(!format!("{resolved:?}").contains("sensitive-user"));
+    assert!(!format!("{status:?}").contains("sensitive-user"));
+    assert!(!format!("{decision:?}").contains("sensitive-user"));
+}
+
+#[test]
+fn presentation_text_rejects_line_break_and_default_ignorable_spoofing() {
+    for forbidden in ['\u{00ad}', '\u{180e}', '\u{2028}', '\u{2029}'] {
+        let display_name = format!("Work{forbidden}Profile");
+        assert_eq!(
+            ProfilePresentation::new(profile_id("work"), display_name, None),
+            Err(gus_ipc::ProtocolError::InvalidField {
+                field: "profile.display_name"
+            })
+        );
+    }
+}
+
+#[test]
+fn unsupported_version_is_reported_before_decoding_its_message_schema() {
+    let future = br#"{"protocol_version":2,"message_family":"shim_request","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"future_v2","body":{"unknown":true}}}"#;
+    assert_eq!(
+        decode_shim_request(&record(future)),
+        Err(gus_ipc::ProtocolError::UnsupportedVersion { received: 2 })
+    );
 }
 
 #[test]
@@ -652,6 +861,32 @@ fn rust_consumes_the_complete_cross_language_conformance_corpus() {
             !accepted,
             "Rust accepted invalid {direction}: {}",
             case["payload"]
+        );
+    }
+}
+
+#[test]
+fn rust_rejects_the_cross_language_wire_negative_corpus() {
+    let cases: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/wire-negative-v1.json"))
+            .expect("valid wire-negative corpus JSON");
+    let cases = cases.as_array().expect("wire-negative case array");
+    assert_eq!(cases.len(), 8);
+    for case in cases {
+        let direction = case["direction"].as_str().expect("direction");
+        let payload = case["payload"].as_str().expect("payload");
+        let frame = record(payload.as_bytes());
+        let accepted = match direction {
+            "shim_request" => decode_shim_request(&frame).is_ok(),
+            "shim_response" => decode_shim_response(&frame).is_ok(),
+            "provider_request" => decode_provider_request(&frame).is_ok(),
+            "provider_response" => decode_provider_response(&frame).is_ok(),
+            other => panic!("unknown direction {other}"),
+        };
+        assert!(
+            !accepted,
+            "Rust accepted wire-negative case {}",
+            case["name"]
         );
     }
 }

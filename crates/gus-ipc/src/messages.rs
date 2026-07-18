@@ -307,7 +307,7 @@ impl Validate for ShimRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveSelectionRequest {
     plan_digest: Digest32,
@@ -358,6 +358,21 @@ impl Validate for ResolveSelectionRequest {
         // Interaction eligibility is intentionally absent from the wire. The
         // platform broker derives it from the authenticated peer/session.
         Ok(())
+    }
+}
+
+impl fmt::Debug for ResolveSelectionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolveSelectionRequest")
+            .field("plan_digest", &self.plan_digest)
+            .field("repository_identity", &self.repository_identity)
+            .field("operation", &self.operation)
+            .field(
+                "explicit_profile",
+                &self.explicit_profile.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
     }
 }
 
@@ -746,7 +761,7 @@ impl Validate for ProviderSelectionDecision {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     deny_unknown_fields,
     tag = "result",
@@ -757,6 +772,16 @@ pub enum ProviderDecision {
     Selected(ProfileId),
     Cancelled,
     Unavailable,
+}
+
+impl fmt::Debug for ProviderDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Selected(_) => formatter.write_str("Selected(<redacted>)"),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+            Self::Unavailable => formatter.write_str("Unavailable"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -794,7 +819,7 @@ impl Validate for BrokerShimMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedSelection {
     profile_id: ProfileId,
@@ -844,7 +869,18 @@ impl Validate for ResolvedSelection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for ResolvedSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedSelection")
+            .field("profile_id", &"<redacted>")
+            .field("profile_generation", &self.profile_generation)
+            .field("session_generation", &self.session_generation)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionStatus {
     repository_identity: Digest32,
@@ -891,6 +927,20 @@ impl SelectionStatus {
 impl Validate for SelectionStatus {
     fn validate(&self) -> Result<(), ProtocolError> {
         Ok(())
+    }
+}
+
+impl fmt::Debug for SelectionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectionStatus")
+            .field("repository_identity", &self.repository_identity)
+            .field(
+                "selected_profile",
+                &self.selected_profile.as_ref().map(|_| "<redacted>"),
+            )
+            .field("session_generation", &self.session_generation)
+            .finish()
     }
 }
 
@@ -1412,7 +1462,7 @@ impl fmt::Debug for ProfilePresentation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProfilePresentation")
-            .field("profile_id", &self.profile_id)
+            .field("profile_id", &"<redacted>")
             .field("display_name", &"<redacted>")
             .field("email", &self.email.as_ref().map(|_| "<redacted>"))
             .finish()
@@ -1596,7 +1646,11 @@ impl ErrorCode {
                 retry: AfterRepair,
                 action: RunDoctor,
             },
-            GusECapabilityInvalid | GusEInternal => ErrorContract {
+            GusECapabilityInvalid => ErrorContract {
+                retry: No,
+                action: RunDoctor,
+            },
+            GusEInternal if preflight_only => ErrorContract {
                 retry: No,
                 action: RunDoctor,
             },
@@ -2044,11 +2098,23 @@ fn is_forbidden_presentation_character(value: char) -> bool {
     value.is_control()
         || matches!(
             value,
-            '\u{061c}'
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
                 | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{2029}'
                 | '\u{202a}'..='\u{202e}'
-                | '\u{2060}'..='\u{2069}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
                 | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e0fff}'
         )
 }
 

@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned, de::IgnoredAny};
 
 use crate::messages::{
-    BrokerProviderMessage, BrokerShimMessage, ProtocolError, ProviderRequest, ProviderRequestFrame,
-    ProviderResponseFrame, ShimRequest, ShimRequestFrame, ShimResponseFrame, WireFrame,
-    WireMessage,
+    BrokerProviderMessage, BrokerShimMessage, PROTOCOL_VERSION, ProtocolError, ProviderRequest,
+    ProviderRequestFrame, ProviderResponseFrame, ShimRequest, ShimRequestFrame, ShimResponseFrame,
+    WireFrame, WireMessage,
 };
 
 /// Maximum JSON payload accepted before transport framing overhead.
@@ -18,6 +18,18 @@ struct RawWireFrame<M> {
     message_family: crate::MessageFamily,
     request_id: crate::RequestId,
     message: M,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEnvelopeProbe {
+    protocol_version: u16,
+    #[serde(rename = "message_family")]
+    _message_family: crate::MessageFamily,
+    #[serde(rename = "request_id")]
+    _request_id: crate::RequestId,
+    #[serde(rename = "message")]
+    _message: IgnoredAny,
 }
 
 /// Decodes and validates a shim-to-broker protocol frame.
@@ -132,6 +144,18 @@ where
         return Err(ProtocolError::FrameLengthMismatch);
     }
     let payload = &record[FRAME_HEADER_BYTES..];
+    let mut probe_deserializer = serde_json::Deserializer::from_slice(payload);
+    let probe = RawEnvelopeProbe::deserialize(&mut probe_deserializer)
+        .map_err(|_| ProtocolError::InvalidJson)?;
+    probe_deserializer
+        .end()
+        .map_err(|_| ProtocolError::InvalidJson)?;
+    if probe.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedVersion {
+            received: probe.protocol_version,
+        });
+    }
+
     let mut deserializer = serde_json::Deserializer::from_slice(payload);
     let raw = RawWireFrame::<M>::deserialize(&mut deserializer)
         .map_err(|_| ProtocolError::InvalidJson)?;
