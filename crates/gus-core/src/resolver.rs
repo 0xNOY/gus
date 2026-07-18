@@ -84,13 +84,13 @@ pub enum GitCredentialProtocolRuleset {
 /// Core validates the complete wire transcript; callers cannot select a
 /// ruleset or provide its digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitCredentialProbeAction {
+enum GitCredentialProbeAction {
     Capability,
     Get,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitCredentialProbeExchange {
+struct GitCredentialProbeExchange {
     action: GitCredentialProbeAction,
     input: Vec<u8>,
     output: Vec<u8>,
@@ -100,8 +100,8 @@ pub struct GitCredentialProbeExchange {
 }
 
 impl GitCredentialProbeExchange {
-    #[must_use]
-    pub fn new(
+    #[cfg(test)]
+    fn new(
         action: GitCredentialProbeAction,
         input: Vec<u8>,
         output: Vec<u8>,
@@ -129,10 +129,31 @@ pub struct GitCredentialProtocolProbeTranscript {
 }
 
 impl GitCredentialProtocolProbeTranscript {
-    #[must_use]
-    pub fn new(exchanges: Vec<GitCredentialProbeExchange>) -> Self {
+    #[cfg(test)]
+    fn new(exchanges: Vec<GitCredentialProbeExchange>) -> Self {
         Self { exchanges }
     }
+}
+
+mod credential_probe_sealed {
+    pub trait Sealed {}
+}
+
+/// Trusted exact-executable probe boundary. The private supertrait prevents
+/// downstream crates and IPC DTOs from implementing this interface; concrete
+/// file-handle runners must live in the resolver/platform TCB.
+pub trait TrustedGitCredentialProbeRunner: credential_probe_sealed::Sealed {
+    fn executable_identity(&self) -> [u8; 32];
+
+    fn version_output(&self) -> &str;
+
+    /// Executes the fixed probe through the already-verified Git artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns fail-closed when the handle cannot be executed or the capture
+    /// is incomplete. The opaque transcript has no public constructor.
+    fn execute(&mut self) -> Result<GitCredentialProtocolProbeTranscript, ResolutionError>;
 }
 
 /// Sealed receipt for one exact real-Git executable/version observation and
@@ -153,7 +174,16 @@ impl GitCredentialProtocolAdmission {
     ///
     /// Rejects malformed, overlapping, incomplete, or self-contradictory wire
     /// transcripts. The ruleset and transcript digest are derived by core.
-    pub fn from_transcript(
+    pub fn from_trusted_runner<R: TrustedGitCredentialProbeRunner>(
+        runner: &mut R,
+    ) -> Result<Self, ResolutionError> {
+        let executable_identity = runner.executable_identity();
+        let version_output = runner.version_output().to_owned();
+        let transcript = runner.execute()?;
+        Self::from_transcript(executable_identity, &version_output, &transcript)
+    }
+
+    fn from_transcript(
         executable_identity: [u8; 32],
         version_output: &str,
         transcript: &GitCredentialProtocolProbeTranscript,
@@ -1048,6 +1078,28 @@ mod tests {
         ])
     }
 
+    struct TestProbeRunner {
+        executable_identity: [u8; 32],
+        version_output: String,
+        transcript: GitCredentialProtocolProbeTranscript,
+    }
+
+    impl credential_probe_sealed::Sealed for TestProbeRunner {}
+
+    impl TrustedGitCredentialProbeRunner for TestProbeRunner {
+        fn executable_identity(&self) -> [u8; 32] {
+            self.executable_identity
+        }
+
+        fn version_output(&self) -> &str {
+            &self.version_output
+        }
+
+        fn execute(&mut self) -> Result<GitCredentialProtocolProbeTranscript, ResolutionError> {
+            Ok(self.transcript.clone())
+        }
+    }
+
     fn resolve_pull_invocation(
         version: &str,
         args: &[&str],
@@ -1284,12 +1336,13 @@ mod tests {
             GitCredentialProtocolRuleset::Unsupported
         );
 
-        let admission = GitCredentialProtocolAdmission::from_transcript(
-            [8; 32],
-            version,
-            &credential_probe(false),
-        )
-        .expect("complete exact-build probe");
+        let mut runner = TestProbeRunner {
+            executable_identity: [8; 32],
+            version_output: version.to_owned(),
+            transcript: credential_probe(false),
+        };
+        let admission = GitCredentialProtocolAdmission::from_trusted_runner(&mut runner)
+            .expect("complete exact-build probe");
         let admitted = unadmitted
             .with_credential_protocol_admission(&admission)
             .expect("receipt matches exact build");
