@@ -463,8 +463,12 @@ mod tests {
     #[test]
     #[ignore = "internal child process for native session smoke tests"]
     fn native_observation_child_probe() {
-        let expectation = std::env::var(NATIVE_PROBE_EXPECTATION).expect("probe expectation");
-        let marker = std::env::var_os(NATIVE_PROBE_MARKER).expect("probe marker");
+        let (Ok(expectation), Some(marker)) = (
+            std::env::var(NATIVE_PROBE_EXPECTATION),
+            std::env::var_os(NATIVE_PROBE_MARKER),
+        ) else {
+            return;
+        };
         let observation = crate::CurrentSessionObserver::new()
             .observe()
             .expect("child native observation");
