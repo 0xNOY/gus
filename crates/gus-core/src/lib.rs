@@ -11,12 +11,14 @@ mod resolver;
 
 pub use model::{
     BoundEndpoint, CliBooleanOverride, ConfigEnvOverride, ConfigOverride, EndpointRole,
-    GitIdentityDisposition, GlobalOptions, InvocationContext, NEUTRAL_REFLOG_EMAIL,
-    NEUTRAL_REFLOG_NAME, NormalizedInvocation, Operation, ParseIssue, ProfileRequirement,
-    RequirementReason, ResolutionBinding, ResolutionError, ResolutionEvidence, ResolutionRequest,
-    ResolvedEndpoint, ResolvedInvocation, SnapshotGenerations, Transport,
+    GitIdentityDisposition, GlobalOptions, HttpPreflightDisposition, HttpPreflightEvidence,
+    InvocationContext, NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME, NormalizedInvocation, Operation,
+    ParseIssue, ProfileRequirement, RequirementReason, ResolutionBinding, ResolutionError,
+    ResolutionEvidence, ResolutionRequest, ResolvedEndpoint, ResolvedInvocation,
+    SnapshotGenerations, Transport,
 };
 pub use resolver::{
-    EffectiveConfigEntry, EndpointObservation, GitCredentialProtocolRuleset, GitResolver,
-    GitSemanticRuleset, ResolverSnapshot, VerifiedGitSemantics,
+    EffectiveConfigEntry, EndpointObservation, GitCredentialProtocolAdmission,
+    GitCredentialProtocolProbeBehavior, GitCredentialProtocolRuleset, GitResolver,
+    GitSemanticRuleset, HttpPreflightObservation, ResolverSnapshot, VerifiedGitSemantics,
 };

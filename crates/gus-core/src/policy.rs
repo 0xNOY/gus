@@ -1,6 +1,6 @@
 use crate::model::{
-    IdentityCreationEvidence, InvocationContext, Operation, ProfileRequirement, RequirementReason,
-    ResolvedEndpoint, ResolvedInvocation, Transport,
+    HttpPreflightDisposition, IdentityCreationEvidence, InvocationContext, Operation,
+    ProfileRequirement, RequirementReason, ResolutionEvidence, ResolvedInvocation, Transport,
 };
 
 pub(crate) fn unresolved_profile_requirement(context: &InvocationContext) -> ProfileRequirement {
@@ -8,7 +8,7 @@ pub(crate) fn unresolved_profile_requirement(context: &InvocationContext) -> Pro
     if invocation.issue.is_some() {
         return required(RequirementReason::AmbiguousInvocation);
     }
-    if has_unsafe_runtime_config(context) {
+    if has_unsafe_runtime_config(context, false) {
         return required(RequirementReason::AmbiguousConfiguration);
     }
 
@@ -48,7 +48,10 @@ pub(crate) fn resolved_profile_requirement(context: &ResolvedInvocation) -> Prof
     if invocation.normalized().issue.is_some() {
         return required(RequirementReason::AmbiguousInvocation);
     }
-    if has_unsafe_runtime_config(invocation) {
+    if let Some(requirement) = unsupported_http_preflight(context.evidence()) {
+        return requirement;
+    }
+    if has_unsafe_runtime_config(invocation, true) {
         return required(RequirementReason::AmbiguousConfiguration);
     }
 
@@ -59,13 +62,13 @@ pub(crate) fn resolved_profile_requirement(context: &ResolvedInvocation) -> Prof
         | Operation::WorkingTree
         | Operation::ConfigRead => ProfileRequirement::NotRequired,
         Operation::Fetch | Operation::Clone | Operation::LsRemote => {
-            remote_read(context.evidence().endpoints())
+            remote_read(context.evidence())
         }
         Operation::Pull {
             ff_only_candidate: true,
             ..
         } if config.pull_ff_only() == IdentityCreationEvidence::IdentityFreeProven => {
-            remote_read(context.evidence().endpoints())
+            remote_read(context.evidence())
         }
         Operation::Merge {
             ff_only_candidate: true,
@@ -93,17 +96,35 @@ pub(crate) fn resolved_profile_requirement(context: &ResolvedInvocation) -> Prof
     }
 }
 
-fn has_unsafe_runtime_config(context: &InvocationContext) -> bool {
+fn has_unsafe_runtime_config(context: &InvocationContext, resolved: bool) -> bool {
     let global = &context.normalized().global;
     global.exec_path.is_some()
-        || global
-            .config_overrides
-            .iter()
-            .any(|config| !is_harmless_config(&config.name))
-        || global
-            .config_env_overrides
-            .iter()
-            .any(|config| !is_harmless_config(&config.name))
+        || global.config_overrides.iter().any(|config| {
+            !(is_harmless_config(&config.name)
+                || resolved && is_http_preflight_config(&config.name))
+        })
+        || global.config_env_overrides.iter().any(|config| {
+            !(is_harmless_config(&config.name)
+                || resolved && is_http_preflight_config(&config.name))
+        })
+}
+
+fn is_http_preflight_config(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "http.proxy"
+        || name == "http.proxyauthmethod"
+        || name == "http.sslcert"
+        || name == "http.sslkey"
+        || (name.starts_with("http.")
+            && (config_key_suffix_is(&name, "proxy")
+                || config_key_suffix_is(&name, "sslcert")
+                || config_key_suffix_is(&name, "sslkey")
+                || name.starts_with("http.proxyssl")))
+        || (name.starts_with("remote.") && config_key_suffix_is(&name, "proxy"))
+}
+
+fn config_key_suffix_is(name: &str, expected: &str) -> bool {
+    name.rsplit('.').next() == Some(expected)
 }
 
 fn is_harmless_config(name: &str) -> bool {
@@ -113,7 +134,27 @@ fn is_harmless_config(name: &str) -> bool {
     name.eq_ignore_ascii_case("color.ui")
 }
 
-fn remote_read(endpoints: &[ResolvedEndpoint]) -> ProfileRequirement {
+fn unsupported_http_preflight(evidence: &ResolutionEvidence) -> Option<ProfileRequirement> {
+    if evidence
+        .http_preflight()
+        .iter()
+        .any(|item| item.disposition() == HttpPreflightDisposition::ProxyTransport)
+    {
+        return Some(unsupported(RequirementReason::ProxyTransport));
+    }
+    if evidence.http_preflight().iter().any(|item| {
+        matches!(
+            item.disposition(),
+            HttpPreflightDisposition::PreHandshakeIdentity | HttpPreflightDisposition::Unresolved
+        )
+    }) {
+        return Some(unsupported(RequirementReason::PreHandshakeHttpIdentity));
+    }
+    None
+}
+
+fn remote_read(evidence: &ResolutionEvidence) -> ProfileRequirement {
+    let endpoints = evidence.endpoints();
     if endpoints.is_empty()
         || endpoints
             .iter()
@@ -139,6 +180,10 @@ fn remote_read(endpoints: &[ResolvedEndpoint]) -> ProfileRequirement {
 
 const fn required(reason: RequirementReason) -> ProfileRequirement {
     ProfileRequirement::Required(reason)
+}
+
+const fn unsupported(reason: RequirementReason) -> ProfileRequirement {
+    ProfileRequirement::Unsupported(reason)
 }
 
 #[cfg(test)]
@@ -176,9 +221,18 @@ mod tests {
         } else {
             Vec::new()
         };
+        let http_preflight = if needs_fetch_endpoint && transport == Transport::Http {
+            vec![request.bind_http_preflight(
+                EndpointRole::Fetch,
+                [1; 32],
+                HttpPreflightDisposition::HelperCompatible,
+            )]
+        } else {
+            Vec::new()
+        };
         let config = request.bind_effective_config(integration, integration, tag);
         request
-            .resolve(endpoints, config)
+            .resolve(endpoints, config, http_preflight)
             .expect("valid bound test evidence")
             .profile_requirement()
     }
@@ -287,8 +341,13 @@ mod tests {
             request.bind_endpoint(EndpointRole::Fetch, Transport::Ssh, [2; 32]),
         ];
         let config = request.bind_effective_config(MAY_CREATE, MAY_CREATE, MAY_CREATE);
+        let http_preflight = vec![request.bind_http_preflight(
+            EndpointRole::Fetch,
+            [1; 32],
+            HttpPreflightDisposition::HelperCompatible,
+        )];
         let resolved = request
-            .resolve(endpoints, config)
+            .resolve(endpoints, config, http_preflight)
             .expect("matching endpoint evidence");
         assert_eq!(
             resolved.profile_requirement(),
@@ -306,7 +365,7 @@ mod tests {
         ];
         let fetch_config = fetch.bind_effective_config(MAY_CREATE, MAY_CREATE, MAY_CREATE);
         let fetch = fetch
-            .resolve(fetch_endpoints, fetch_config)
+            .resolve(fetch_endpoints, fetch_config, Vec::new())
             .expect("fetch and submodule endpoints are compatible");
         assert_eq!(
             fetch.profile_requirement(),
@@ -320,8 +379,13 @@ mod tests {
             push.bind_endpoint(EndpointRole::Submodule, Transport::Ssh, [5; 32]),
         ];
         let push_config = push.bind_effective_config(MAY_CREATE, MAY_CREATE, MAY_CREATE);
+        let push_preflight = vec![push.bind_http_preflight(
+            EndpointRole::Push,
+            [4; 32],
+            HttpPreflightDisposition::HelperCompatible,
+        )];
         let push = push
-            .resolve(push_endpoints, push_config)
+            .resolve(push_endpoints, push_config, push_preflight)
             .expect("push and submodule endpoints are compatible");
         assert_eq!(
             push.profile_requirement(),
@@ -360,7 +424,7 @@ mod tests {
 
         let config = status.bind_effective_config(MAY_CREATE, MAY_CREATE, MAY_CREATE);
         let resolved = status
-            .resolve(Vec::new(), config)
+            .resolve(Vec::new(), config, Vec::new())
             .expect("matching bound evidence");
         assert_eq!(resolved.evidence().binding(), status_binding);
     }
@@ -384,7 +448,7 @@ mod tests {
             generations(),
         );
         assert_eq!(
-            request_b.resolve(vec![endpoint_a], config_a),
+            request_b.resolve(vec![endpoint_a], config_a, Vec::new()),
             Err(ResolutionError::BindingMismatch)
         );
 
@@ -397,7 +461,7 @@ mod tests {
         );
         let identity_free = no_head.bind_effective_config(PROVEN, MAY_CREATE, MAY_CREATE);
         assert_eq!(
-            no_head.resolve(Vec::new(), identity_free),
+            no_head.resolve(Vec::new(), identity_free, Vec::new()),
             Err(ResolutionError::HeadStateRequired)
         );
 
@@ -421,7 +485,7 @@ mod tests {
         let endpoint_generation_b =
             generation_b.bind_endpoint(EndpointRole::Fetch, Transport::Http, [4; 32]);
         assert_eq!(
-            generation_b.resolve(vec![endpoint_generation_b], config_generation_a),
+            generation_b.resolve(vec![endpoint_generation_b], config_generation_a, Vec::new(),),
             Err(ResolutionError::BindingMismatch)
         );
 
@@ -435,7 +499,7 @@ mod tests {
         let push_only = fetch.bind_endpoint(EndpointRole::Push, Transport::Ssh, [4; 32]);
         let config = fetch.bind_effective_config(MAY_CREATE, MAY_CREATE, MAY_CREATE);
         assert_eq!(
-            fetch.resolve(vec![push_only], config),
+            fetch.resolve(vec![push_only], config, Vec::new()),
             Err(ResolutionError::EndpointSetMismatch)
         );
     }

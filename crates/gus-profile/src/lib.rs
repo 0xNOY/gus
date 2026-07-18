@@ -10,7 +10,7 @@ mod validation;
 pub use model::{
     CanonicalCredentialRequest, CredentialBackend, CredentialBinding, CredentialHost,
     CredentialPathPrefix, CredentialProtocol, ExecutableRef, HttpIdentity, PersonIdentity, Profile,
-    ProfileId, ProfileSet, ProxyJump, Sha256Digest, SigningFormat, SigningIdentity, SigningPolicy,
-    SshFingerprint, SshIdentity, SshIdentitySource,
+    ProfileId, ProfileSet, ProxyJump, SelectedCredentialBinding, Sha256Digest, SigningFormat,
+    SigningIdentity, SigningPolicy, SshFingerprint, SshIdentity, SshIdentitySource,
 };
 pub use validation::ValidationError;

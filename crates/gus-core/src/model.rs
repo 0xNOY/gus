@@ -115,6 +115,51 @@ pub struct BoundEndpoint {
     endpoint: ResolvedEndpoint,
 }
 
+/// HTTP transport facts which must be known before real Git may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpPreflightDisposition {
+    /// Direct origin authentication can be deferred to the GUS credential
+    /// helper after an HTTP challenge.
+    HelperCompatible,
+    /// A client identity is needed before the credential helper can run.
+    PreHandshakeIdentity,
+    /// A proxy or proxy-bypass policy participates in transport selection.
+    ProxyTransport,
+    /// The resolver could not prove that the transport is helper-compatible.
+    Unresolved,
+}
+
+/// Resolver-sealed preflight evidence for one exact resolved HTTP endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpPreflightEvidence {
+    role: EndpointRole,
+    endpoint_identity_digest: [u8; 32],
+    disposition: HttpPreflightDisposition,
+}
+
+impl HttpPreflightEvidence {
+    #[must_use]
+    pub const fn role(self) -> EndpointRole {
+        self.role
+    }
+
+    #[must_use]
+    pub const fn endpoint_identity_digest(self) -> [u8; 32] {
+        self.endpoint_identity_digest
+    }
+
+    #[must_use]
+    pub const fn disposition(self) -> HttpPreflightDisposition {
+        self.disposition
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundHttpPreflightEvidence {
+    binding: ResolutionBinding,
+    evidence: HttpPreflightEvidence,
+}
+
 /// Resolver proof about whether a syntactically restricted operation can
 /// create an identity-bearing Git object under the complete effective config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +297,7 @@ pub struct ResolutionEvidence {
     binding: ResolutionBinding,
     endpoints: Vec<ResolvedEndpoint>,
     effective_config: EffectiveConfigEvidence,
+    http_preflight: Vec<HttpPreflightEvidence>,
     generations: SnapshotGenerations,
 }
 
@@ -269,6 +315,11 @@ impl ResolutionEvidence {
     #[must_use]
     pub(crate) const fn effective_config(&self) -> EffectiveConfigEvidence {
         self.effective_config
+    }
+
+    #[must_use]
+    pub fn http_preflight(&self) -> &[HttpPreflightEvidence] {
+        &self.http_preflight
     }
 
     #[must_use]
@@ -479,6 +530,22 @@ impl ResolutionRequest {
         EffectiveConfigEvidence::new(self.binding, merge_ff_only, pull_ff_only, lightweight_tag)
     }
 
+    pub(crate) const fn bind_http_preflight(
+        &self,
+        role: EndpointRole,
+        endpoint_identity_digest: [u8; 32],
+        disposition: HttpPreflightDisposition,
+    ) -> BoundHttpPreflightEvidence {
+        BoundHttpPreflightEvidence {
+            binding: self.binding,
+            evidence: HttpPreflightEvidence {
+                role,
+                endpoint_identity_digest,
+                disposition,
+            },
+        }
+    }
+
     /// Finalizes evidence produced by the sealed resolver implementation.
     ///
     /// # Errors
@@ -490,11 +557,15 @@ impl ResolutionRequest {
         self,
         endpoints: Vec<BoundEndpoint>,
         effective_config: EffectiveConfigEvidence,
+        http_preflight: Vec<BoundHttpPreflightEvidence>,
     ) -> Result<ResolvedInvocation, ResolutionError> {
         if effective_config.binding != self.binding
             || endpoints
                 .iter()
                 .any(|endpoint| endpoint.binding != self.binding)
+            || http_preflight
+                .iter()
+                .any(|evidence| evidence.binding != self.binding)
         {
             return Err(ResolutionError::BindingMismatch);
         }
@@ -504,6 +575,13 @@ impl ResolutionRequest {
             .map(|endpoint| endpoint.endpoint)
             .collect::<Vec<_>>();
         if !endpoint_set_matches(self.invocation.operation(), &endpoints) {
+            return Err(ResolutionError::EndpointSetMismatch);
+        }
+        let http_preflight = http_preflight
+            .into_iter()
+            .map(|evidence| evidence.evidence)
+            .collect::<Vec<_>>();
+        if !http_preflight_set_matches(&endpoints, &http_preflight) {
             return Err(ResolutionError::EndpointSetMismatch);
         }
 
@@ -527,10 +605,36 @@ impl ResolutionRequest {
                 binding: self.binding,
                 endpoints,
                 effective_config,
+                http_preflight,
                 generations: self.binding.generations,
             },
         })
     }
+}
+
+fn http_preflight_set_matches(
+    endpoints: &[ResolvedEndpoint],
+    preflight: &[HttpPreflightEvidence],
+) -> bool {
+    let http_endpoints = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.transport == Transport::Http)
+        .collect::<Vec<_>>();
+    if http_endpoints.len() != preflight.len() {
+        return false;
+    }
+    let mut matched = vec![false; preflight.len()];
+    for endpoint in http_endpoints {
+        let Some((index, _)) = preflight.iter().enumerate().find(|(index, evidence)| {
+            !matched[*index]
+                && evidence.role == endpoint.role
+                && evidence.endpoint_identity_digest == endpoint.identity_digest
+        }) else {
+            return false;
+        };
+        matched[index] = true;
+    }
+    matched.into_iter().all(|value| value)
 }
 
 fn endpoint_set_matches(operation: Operation, endpoints: &[ResolvedEndpoint]) -> bool {

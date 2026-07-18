@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt, net::IpAddr, path::PathBuf, str::FromStr};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::validation::{ValidationError, has_forbidden_control};
 
@@ -584,6 +585,50 @@ pub struct CredentialBinding {
     pub backend: CredentialBackend,
 }
 
+/// Immutable evidence that one validated profile selected one exact HTTP
+/// credential binding for a canonical endpoint. Fields are private so callers
+/// cannot assemble cross-profile/backend evidence manually.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedCredentialBinding {
+    profile_id: ProfileId,
+    profile_generation: u64,
+    request: CanonicalCredentialRequest,
+    binding: CredentialBinding,
+    digest: [u8; 32],
+}
+
+impl SelectedCredentialBinding {
+    #[must_use]
+    pub fn profile_id(&self) -> &ProfileId {
+        &self.profile_id
+    }
+
+    #[must_use]
+    pub const fn profile_generation(&self) -> u64 {
+        self.profile_generation
+    }
+
+    #[must_use]
+    pub fn request(&self) -> &CanonicalCredentialRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.binding.username
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> &CredentialBackend {
+        &self.binding.backend
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
 impl CredentialBinding {
     /// Validates a profile-scoped HTTP credential context.
     ///
@@ -726,6 +771,95 @@ impl Profile {
             http.validate()?;
         }
         Ok(())
+    }
+
+    /// Selects and seals the exact profile/backend binding for one endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid profile or ambiguous credential binding set.
+    pub fn select_credential_binding(
+        &self,
+        request: &CanonicalCredentialRequest,
+    ) -> Result<Option<SelectedCredentialBinding>, ValidationError> {
+        self.validate()?;
+        let Some(binding) = self
+            .http
+            .as_ref()
+            .map(|http| http.select_binding(request))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let digest = credential_binding_digest(&self.id, self.generation, request, binding);
+        Ok(Some(SelectedCredentialBinding {
+            profile_id: self.id.clone(),
+            profile_generation: self.generation,
+            request: request.clone(),
+            binding: binding.clone(),
+            digest,
+        }))
+    }
+}
+
+fn credential_binding_digest(
+    profile_id: &ProfileId,
+    profile_generation: u64,
+    request: &CanonicalCredentialRequest,
+    binding: &CredentialBinding,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"gus.selected-credential-binding.v1\0");
+    update_length_prefixed(&mut digest, profile_id.as_str().as_bytes());
+    digest.update(profile_generation.to_le_bytes());
+    digest.update([match request.protocol() {
+        CredentialProtocol::Http => 1,
+        CredentialProtocol::Https => 2,
+    }]);
+    update_length_prefixed(&mut digest, request.host().as_str().as_bytes());
+    digest.update(request.port().to_le_bytes());
+    update_length_prefixed(&mut digest, request.path().as_str().as_bytes());
+    update_length_prefixed(&mut digest, binding.username.as_bytes());
+    match &binding.backend {
+        CredentialBackend::ManagedExecutable { executable } => {
+            digest.update([1]);
+            update_path_digest(&mut digest, &executable.path);
+            digest.update((executable.arguments.len() as u64).to_le_bytes());
+            for argument in &executable.arguments {
+                update_length_prefixed(&mut digest, argument.as_bytes());
+            }
+            digest.update(executable.sha256.as_bytes());
+        }
+        CredentialBackend::SecretStore { service, account } => {
+            digest.update([2]);
+            update_length_prefixed(&mut digest, service.as_bytes());
+            update_length_prefixed(&mut digest, account.as_bytes());
+        }
+    }
+    digest.finalize().into()
+}
+
+fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+#[cfg(unix)]
+fn update_path_digest(digest: &mut Sha256, path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    update_length_prefixed(digest, path.as_os_str().as_bytes());
+}
+
+#[cfg(windows)]
+fn update_path_digest(digest: &mut Sha256, path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    digest.update((units.len() as u64).to_le_bytes());
+    for unit in units {
+        digest.update(unit.to_le_bytes());
     }
 }
 
@@ -1087,5 +1221,66 @@ mod tests {
         assert_eq!(ipv6.host.as_str(), "2001:db8::1");
         assert_eq!(ipv6.port, 8443);
         assert_eq!(ipv6.path.as_str(), "/repository.git");
+    }
+
+    #[test]
+    fn selected_credential_evidence_binds_profile_request_and_backend() {
+        let request = CanonicalCredentialRequest::from_git_protocol(
+            CredentialProtocol::Https,
+            "git.example.test",
+            Some("team/repository.git".into()),
+            None,
+        )
+        .expect("canonical request");
+        let mut value = profile(id("work"));
+        value.generation = 7;
+        value.http = Some(HttpIdentity {
+            bindings: vec![CredentialBinding {
+                protocol: CredentialProtocol::Https,
+                host: host("git.example.test"),
+                port: None,
+                path_prefix: Some(path("/team")),
+                username: "work-user".into(),
+                backend: CredentialBackend::SecretStore {
+                    service: "gus".into(),
+                    account: "work".into(),
+                },
+            }],
+        });
+
+        let selected = value
+            .select_credential_binding(&request)
+            .expect("valid profile")
+            .expect("matching binding");
+        assert_eq!(selected.profile_id(), &id("work"));
+        assert_eq!(selected.profile_generation(), 7);
+        assert_eq!(selected.request(), &request);
+        assert_eq!(selected.username(), "work-user");
+
+        let mut changed_generation = value.clone();
+        changed_generation.generation += 1;
+        let generation_digest = changed_generation
+            .select_credential_binding(&request)
+            .expect("valid profile")
+            .expect("matching binding")
+            .digest();
+        assert_ne!(selected.digest(), generation_digest);
+
+        let mut changed_backend = value;
+        changed_backend
+            .http
+            .as_mut()
+            .expect("HTTP identity")
+            .bindings[0]
+            .backend = CredentialBackend::SecretStore {
+            service: "gus".into(),
+            account: "other".into(),
+        };
+        let backend_digest = changed_backend
+            .select_credential_binding(&request)
+            .expect("valid profile")
+            .expect("matching binding")
+            .digest();
+        assert_ne!(selected.digest(), backend_digest);
     }
 }

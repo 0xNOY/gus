@@ -112,6 +112,7 @@ fn resolved_requirement(
         Some(branch),
         effective_entries(repo, config_names),
         endpoints,
+        Vec::new(),
     )
     .expect("valid real-Git snapshot");
     GitResolver
