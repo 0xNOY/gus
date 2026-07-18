@@ -871,6 +871,7 @@ fn validate_pipe(pipe: &OwnedHandle, expected: PipeEnd) -> Result<(), PeerAuthen
         return Err(last_credential_error());
     }
     let expected_flags = PIPE_TYPE_MESSAGE
+        | PIPE_REJECT_REMOTE_CLIENTS
         | match expected {
             PipeEnd::Server => PIPE_SERVER_END,
             PipeEnd::Client => 0,
