@@ -1,0 +1,38 @@
+{
+  "unicode_version": "17.0.0",
+  "policy": "Cc, Zl, Zp, Default_Ignorable_Code_Point, and assigned Cf",
+  "code_point_count": 4273,
+  "sources": [
+    "https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt",
+    "https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt"
+  ],
+  "ranges": [
+    {"start":"0000","end":"001F"},
+    {"start":"007F","end":"009F"},
+    {"start":"00AD","end":"00AD"},
+    {"start":"034F","end":"034F"},
+    {"start":"0600","end":"0605"},
+    {"start":"061C","end":"061C"},
+    {"start":"06DD","end":"06DD"},
+    {"start":"070F","end":"070F"},
+    {"start":"0890","end":"0891"},
+    {"start":"08E2","end":"08E2"},
+    {"start":"115F","end":"1160"},
+    {"start":"17B4","end":"17B5"},
+    {"start":"180B","end":"180F"},
+    {"start":"200B","end":"200F"},
+    {"start":"2028","end":"202E"},
+    {"start":"2060","end":"206F"},
+    {"start":"3164","end":"3164"},
+    {"start":"FE00","end":"FE0F"},
+    {"start":"FEFF","end":"FEFF"},
+    {"start":"FFA0","end":"FFA0"},
+    {"start":"FFF0","end":"FFFB"},
+    {"start":"110BD","end":"110BD"},
+    {"start":"110CD","end":"110CD"},
+    {"start":"13430","end":"1343F"},
+    {"start":"1BCA0","end":"1BCA3"},
+    {"start":"1D173","end":"1D17A"},
+    {"start":"E0000","end":"E0FFF"}
+  ]
+}
