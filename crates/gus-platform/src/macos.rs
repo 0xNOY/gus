@@ -2,7 +2,7 @@ use std::{io, mem::MaybeUninit, num::NonZeroU32};
 
 use crate::{
     LocalSessionObservation, ObservationError, ObservationResource, PlatformFamily,
-    ProcessTimeDomainIdentity,
+    ProcessIdentity, ProcessTimeDomainIdentity,
     bsd::{ProcessBackend, pid_to_nonzero},
     bsd_model::{ProcessFacts, timeval_start},
 };
@@ -41,6 +41,10 @@ impl ProcessBackend for MacOsBackend {
 
 pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationError> {
     crate::bsd::observe_current::<MacOsBackend>()
+}
+
+pub(super) fn observe_process(pid: NonZeroU32) -> Result<ProcessIdentity, ObservationError> {
+    crate::bsd::observe_process::<MacOsBackend>(pid)
 }
 
 fn read_process(

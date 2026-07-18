@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::{
-    LocalSessionObservation, ObservationError, ObservationResource, PlatformFamily,
-    ProcessTimeDomainIdentity,
+    LocalSessionObservation, ObservationError, ObservationResource, OsUserIdentity, PlatformFamily,
+    ProcessIdentity, ProcessTimeDomainIdentity,
     bsd_model::{ProcessFacts, TerminalEvidence, TerminalFacts, assemble_observation},
 };
 
@@ -45,7 +45,11 @@ pub(super) fn observe_current<B: ProcessBackend>()
                 caller_first.session_id,
                 ObservationResource::TerminalAnchorProcess,
             )?;
-            let monitor = ProcessExitMonitor::new(caller_first.session_id)?;
+            let monitor = ProcessExitMonitor::new(
+                caller_first.session_id,
+                ObservationResource::TerminalAnchorProcess,
+                ObservationError::TerminalAnchorChanged,
+            )?;
             let leader_second = normalize_anchor_recheck(B::read_process(
                 caller_first.session_id,
                 ObservationResource::TerminalAnchorProcess,
@@ -87,21 +91,71 @@ pub(super) fn observe_current<B: ProcessBackend>()
     Ok(observation)
 }
 
+pub(super) fn observe_process<B: ProcessBackend>(
+    pid: NonZeroU32,
+) -> Result<ProcessIdentity, ObservationError> {
+    let time_domain = B::time_domain()?;
+    let monitor = ProcessExitMonitor::new(
+        pid,
+        ObservationResource::TargetProcess,
+        ObservationError::ProcessChanged,
+    )?;
+    let first = B::read_process(pid, ObservationResource::TargetProcess)?;
+    let second =
+        normalize_process_recheck(B::read_process(pid, ObservationResource::TargetProcess))?;
+    if first != second || first.pid != pid || B::time_domain()? != time_domain {
+        return Err(ObservationError::ProcessChanged);
+    }
+    monitor.ensure_live()?;
+    let mut user_native = [0_u8; 8];
+    user_native[0..4].copy_from_slice(&first.effective_uid.to_le_bytes());
+    user_native[4..8].copy_from_slice(&first.user_namespace.to_le_bytes());
+    let user = OsUserIdentity::from_native_bytes(B::FAMILY, &user_native);
+    Ok(ProcessIdentity::from_observation(
+        time_domain,
+        first.pid,
+        first.start_time,
+        user,
+    ))
+}
+
+fn normalize_process_recheck<T>(
+    result: Result<T, ObservationError>,
+) -> Result<T, ObservationError> {
+    match result {
+        Err(ObservationError::Read {
+            resource: ObservationResource::TargetProcess | ObservationResource::TargetUser,
+            kind: io::ErrorKind::NotFound,
+        }) => Err(ObservationError::ProcessChanged),
+        other => other,
+    }
+}
+
 struct ProcessExitMonitor {
     queue: OwnedFd,
+    resource: ObservationResource,
+    changed: ObservationError,
 }
 
 impl ProcessExitMonitor {
-    fn new(pid: NonZeroU32) -> Result<Self, ObservationError> {
+    fn new(
+        pid: NonZeroU32,
+        resource: ObservationResource,
+        changed: ObservationError,
+    ) -> Result<Self, ObservationError> {
         // SAFETY: `kqueue` has no arguments and returns a new descriptor.
         let raw = unsafe { libc::kqueue() };
         if raw == -1 {
-            return Err(last_anchor_monitor_error());
+            return Err(last_monitor_error(resource, changed));
         }
         // SAFETY: `kqueue` returned a new descriptor transferred exactly once.
         let queue = unsafe { OwnedFd::from_raw_fd(raw) };
-        set_close_on_exec(queue.as_raw_fd())?;
-        let monitor = Self { queue };
+        set_close_on_exec(queue.as_raw_fd(), resource)?;
+        let monitor = Self {
+            queue,
+            resource,
+            changed,
+        };
         let change = process_event(pid, libc::EV_ADD | libc::EV_ENABLE, libc::NOTE_EXIT);
         monitor.poll(Some(&change))?;
         Ok(monitor)
@@ -131,7 +185,7 @@ impl ProcessExitMonitor {
             )
         };
         if count == -1 {
-            return Err(last_anchor_monitor_error());
+            return Err(last_monitor_error(self.resource, self.changed));
         }
         if count == 0 {
             return Ok(());
@@ -141,48 +195,54 @@ impl ProcessExitMonitor {
         if flags & libc::EV_ERROR != 0 {
             if data == 0 {
                 return Err(ObservationError::Malformed {
-                    resource: ObservationResource::TerminalAnchorProcess,
+                    resource: self.resource,
                 });
             }
             if data == i64::from(libc::ESRCH) {
-                return Err(ObservationError::TerminalAnchorChanged);
+                return Err(self.changed);
             }
             return Err(ObservationError::Read {
-                resource: ObservationResource::TerminalAnchorProcess,
+                resource: self.resource,
                 kind: io::Error::from_raw_os_error(i32::try_from(data).unwrap_or(i32::MAX)).kind(),
             });
         }
         if event_filter(&event) == libc::EVFILT_PROC && event_fflags(&event) & libc::NOTE_EXIT != 0
         {
-            return Err(ObservationError::TerminalAnchorChanged);
+            return Err(self.changed);
         }
         Err(ObservationError::Malformed {
-            resource: ObservationResource::TerminalAnchorProcess,
+            resource: self.resource,
         })
     }
 }
 
-fn last_anchor_monitor_error() -> ObservationError {
+fn last_monitor_error(
+    resource: ObservationResource,
+    changed: ObservationError,
+) -> ObservationError {
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
-        ObservationError::TerminalAnchorChanged
+        changed
     } else {
         ObservationError::Read {
-            resource: ObservationResource::TerminalAnchorProcess,
+            resource,
             kind: error.kind(),
         }
     }
 }
 
-fn set_close_on_exec(descriptor: std::os::fd::RawFd) -> Result<(), ObservationError> {
+fn set_close_on_exec(
+    descriptor: std::os::fd::RawFd,
+    resource: ObservationResource,
+) -> Result<(), ObservationError> {
     // SAFETY: the descriptor is live and borrowed by the caller.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
     if flags == -1 {
-        return Err(last_read_error(ObservationResource::TerminalAnchorProcess));
+        return Err(last_read_error(resource));
     }
     // SAFETY: this updates flags on the same live descriptor.
     if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-        return Err(last_read_error(ObservationResource::TerminalAnchorProcess));
+        return Err(last_read_error(resource));
     }
     Ok(())
 }

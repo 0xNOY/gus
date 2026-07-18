@@ -2,7 +2,7 @@ use std::{io, mem::MaybeUninit, num::NonZeroU32, ptr::NonNull};
 
 use crate::{
     LocalSessionObservation, ObservationError, ObservationResource, PlatformFamily,
-    ProcessTimeDomainIdentity,
+    ProcessIdentity, ProcessTimeDomainIdentity,
     bsd::{ProcessBackend, pid_to_nonzero},
     bsd_model::{ProcessFacts, timeval_start},
 };
@@ -38,6 +38,10 @@ impl ProcessBackend for FreeBsdBackend {
 
 pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationError> {
     crate::bsd::observe_current::<FreeBsdBackend>()
+}
+
+pub(super) fn observe_process(pid: NonZeroU32) -> Result<ProcessIdentity, ObservationError> {
+    crate::bsd::observe_process::<FreeBsdBackend>(pid)
 }
 
 fn read_boot_id() -> Result<[u8; 16], ObservationError> {

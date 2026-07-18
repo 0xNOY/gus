@@ -14,7 +14,7 @@ path = "src/lib.rs"
 sha2.workspace = true
 thiserror.workspace = true
 
-[target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))'.dependencies]
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]

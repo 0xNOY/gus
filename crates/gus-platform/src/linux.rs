@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::Read,
     num::{NonZeroU32, NonZeroU64},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::Path,
 };
 
@@ -88,6 +89,116 @@ pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationEr
     )
 }
 
+pub(super) fn observe_process(pid: NonZeroU32) -> Result<ProcessIdentity, ObservationError> {
+    let process = ProcessLivenessHandle::open(pid)?;
+    process.ensure_live()?;
+    let boot_first = read_process_time_domain()?;
+    let stat_path = format!("/proc/{pid}/stat");
+    let status_path = format!("/proc/{pid}/status");
+    let first = normalize_process_recheck(read_proc_stat(
+        Path::new(&stat_path),
+        ObservationResource::TargetProcess,
+    ))?;
+    let uid_first = normalize_process_recheck(read_effective_uid(
+        Path::new(&status_path),
+        ObservationResource::TargetUser,
+    ))?;
+    let uid_second = normalize_process_recheck(read_effective_uid(
+        Path::new(&status_path),
+        ObservationResource::TargetUser,
+    ))?;
+    let second = normalize_process_recheck(read_proc_stat(
+        Path::new(&stat_path),
+        ObservationResource::TargetProcess,
+    ))?;
+    let boot_second = read_process_time_domain()?;
+    if first != second || uid_first != uid_second || first.pid != pid || boot_first != boot_second {
+        return Err(ObservationError::ProcessChanged);
+    }
+    process.ensure_live()?;
+    let user = OsUserIdentity::from_native_bytes(PlatformFamily::Linux, &uid_first.to_le_bytes());
+    Ok(ProcessIdentity::from_observation(
+        boot_first,
+        first.pid,
+        first.start_time,
+        user,
+    ))
+}
+
+struct ProcessLivenessHandle(OwnedFd);
+
+impl ProcessLivenessHandle {
+    fn open(pid: NonZeroU32) -> Result<Self, ObservationError> {
+        // SAFETY: `pidfd_open` receives a positive PID and zero reserved flags;
+        // success returns a new close-on-exec descriptor owned by the caller.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.get(), 0_u32) };
+        let descriptor = i32::try_from(descriptor).map_err(|_| ObservationError::Malformed {
+            resource: ObservationResource::TargetProcess,
+        })?;
+        if descriptor == -1 {
+            return Err(last_read_error(ObservationResource::TargetProcess));
+        }
+        // SAFETY: successful `pidfd_open` returned one new owned descriptor.
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(descriptor) }))
+    }
+
+    fn ensure_live(&self) -> Result<(), ObservationError> {
+        let mut descriptor = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the one-element poll array remains writable for the call and
+        // a zero timeout performs a nonblocking liveness probe.
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+        if result == -1 {
+            return Err(last_read_error(ObservationResource::TargetProcess));
+        }
+        if result == 0 {
+            return Ok(());
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(ObservationError::Malformed {
+                resource: ObservationResource::TargetProcess,
+            });
+        }
+        Err(ObservationError::ProcessChanged)
+    }
+}
+
+fn last_read_error(resource: ObservationResource) -> ObservationError {
+    let error = std::io::Error::last_os_error();
+    ObservationError::Read {
+        resource,
+        kind: if error.raw_os_error() == Some(libc::ESRCH) {
+            std::io::ErrorKind::NotFound
+        } else {
+            error.kind()
+        },
+    }
+}
+
+fn read_process_time_domain() -> Result<ProcessTimeDomainIdentity, ObservationError> {
+    let boot_id = read_bounded(
+        Path::new("/proc/sys/kernel/random/boot_id"),
+        MAX_BOOT_ID_BYTES,
+        ObservationResource::ProcessTimeDomain,
+    )?;
+    parse_boot_identity(&boot_id)
+}
+
+fn normalize_process_recheck<T>(
+    result: Result<T, ObservationError>,
+) -> Result<T, ObservationError> {
+    match result {
+        Err(ObservationError::Read {
+            resource: ObservationResource::TargetProcess | ObservationResource::TargetUser,
+            kind: std::io::ErrorKind::NotFound,
+        }) => Err(ObservationError::ProcessChanged),
+        other => other,
+    }
+}
+
 fn normalize_anchor_recheck<T>(result: Result<T, ObservationError>) -> Result<T, ObservationError> {
     match result {
         Err(ObservationError::Read {
@@ -172,6 +283,15 @@ fn parse_proc_stat(
     let fields: Vec<&str> = suffix.split_ascii_whitespace().collect();
     if fields.len() <= 19 || fields[0].len() != 1 {
         return Err(ObservationError::Malformed { resource });
+    }
+    if matches!(fields[0].as_bytes()[0], b'Z' | b'X' | b'x') {
+        return Err(match resource {
+            ObservationResource::TerminalAnchorProcess => ObservationError::TerminalAnchorChanged,
+            ObservationResource::CallerProcess | ObservationResource::TargetProcess => {
+                ObservationError::ProcessChanged
+            }
+            _ => ObservationError::Malformed { resource },
+        });
     }
     let parent_pid = NonZeroU32::new(parse_u32(fields[1].as_bytes(), resource)?);
     let session_id = parse_nonzero_u32(fields[3].as_bytes(), resource)?;
@@ -352,6 +472,50 @@ mod tests {
         );
         assert!(parse_effective_uid(b"Uid:\t1000\n", ObservationResource::CallerUser).is_err());
     }
+
+    #[test]
+    fn proc_stat_rejects_dead_process_states() {
+        let fields_8_through_21 = ["0"; 14].join(" ");
+        for state in ['Z', 'X', 'x'] {
+            let input = format!("42 (dead) {state} 7 8 9 0 {fields_8_through_21} 12345");
+            assert_eq!(
+                parse_proc_stat(input.as_bytes(), ObservationResource::TargetProcess),
+                Err(ObservationError::ProcessChanged)
+            );
+        }
+    }
+
+    #[test]
+    fn native_process_observer_rejects_an_unreaped_zombie() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg("linux::tests::native_process_zombie_child")
+            .arg("--ignored")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("launch managed zombie child");
+        let pid = NonZeroU32::new(child.id()).expect("child PID is nonzero");
+        let liveness = ProcessLivenessHandle::open(pid).expect("open child pidfd");
+        let mut descriptor = libc::pollfd {
+            fd: liveness.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the one-element poll array is writable and the bounded wait
+        // only observes the managed child pidfd.
+        let ready = unsafe { libc::poll(&raw mut descriptor, 1, 5_000) };
+        assert_eq!(ready, 1, "managed child did not exit within five seconds");
+
+        assert_eq!(observe_process(pid), Err(ObservationError::ProcessChanged));
+        child.wait().expect("reap managed zombie child");
+    }
+
+    #[test]
+    #[ignore = "internal child process for native zombie observation"]
+    fn native_process_zombie_child() {}
 
     #[test]
     fn observation_binds_terminal_to_same_live_session_leader() {

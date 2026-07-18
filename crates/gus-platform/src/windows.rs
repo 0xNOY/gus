@@ -228,6 +228,53 @@ pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationEr
     ))
 }
 
+pub(super) fn observe_target_process(pid: NonZeroU32) -> Result<ProcessIdentity, ObservationError> {
+    let time_domain = ProcessTimeDomainIdentity::from_native_bytes(
+        PlatformFamily::Windows,
+        WINDOWS_PROCESS_TIME_DOMAIN,
+    );
+    let process = observe_process(
+        pid,
+        ObservationResource::TargetProcess,
+        ObservationResource::TargetUser,
+    )?;
+    let second = normalize_target_process_recheck(read_process_facts(
+        &process.handle,
+        pid,
+        ObservationResource::TargetProcess,
+        ObservationResource::TargetUser,
+    ))?;
+    require_stable_process_facts(&process.facts, &second)?;
+    match handle_liveness(&process.handle, ObservationResource::TargetProcess) {
+        Ok(true) => Ok(process_identity(time_domain, &process.facts)),
+        Ok(false) => Err(ObservationError::ProcessChanged),
+        Err(error) => Err(error),
+    }
+}
+
+fn require_stable_process_facts(
+    first: &ProcessFacts,
+    second: &ProcessFacts,
+) -> Result<(), ObservationError> {
+    if first == second {
+        Ok(())
+    } else {
+        Err(ObservationError::ProcessChanged)
+    }
+}
+
+fn normalize_target_process_recheck<T>(
+    result: Result<T, ObservationError>,
+) -> Result<T, ObservationError> {
+    match result {
+        Err(ObservationError::Read {
+            resource: ObservationResource::TargetProcess | ObservationResource::TargetUser,
+            kind: io::ErrorKind::NotFound,
+        }) => Err(ObservationError::ProcessChanged),
+        other => other,
+    }
+}
+
 fn process_identity(
     time_domain: ProcessTimeDomainIdentity,
     facts: &ProcessFacts,
@@ -258,19 +305,26 @@ fn observe_process(
     user_resource: ObservationResource,
 ) -> Result<ObservedProcess, ObservationError> {
     let handle = open_process_handle(pid, process_resource)?;
+    let facts = read_process_facts(&handle, pid, process_resource, user_resource)?;
+    Ok(ObservedProcess { handle, facts })
+}
+
+fn read_process_facts(
+    handle: &OwnedHandle,
+    pid: NonZeroU32,
+    process_resource: ObservationResource,
+    user_resource: ObservationResource,
+) -> Result<ProcessFacts, ObservationError> {
     require_handle_live(&handle, process_resource)?;
     let start_time = process_start_time(&handle, process_resource)?;
     let user_sid = process_user_sid(&handle, user_resource)?;
     let session_id = process_session_id(&handle, pid, process_resource)?;
     require_handle_live(&handle, process_resource)?;
-    Ok(ObservedProcess {
-        handle,
-        facts: ProcessFacts {
-            pid,
-            start_time,
-            user_sid,
-            session_id,
-        },
+    Ok(ProcessFacts {
+        pid,
+        start_time,
+        user_sid,
+        session_id,
     })
 }
 
@@ -725,6 +779,7 @@ mod tests {
         path::{Path, PathBuf},
         process::{Command, Output},
         thread,
+        time::Duration,
     };
 
     use std::os::windows::process::CommandExt;
@@ -761,6 +816,9 @@ mod tests {
     const CONPTY_MARKER_FILE: &str = "gus-conpty-identity";
     const MAX_CONPTY_OUTPUT_BYTES: u64 = 1024 * 1024;
     const CONPTY_CHILD_TIMEOUT_MS: u32 = 30_000;
+    const TARGET_PROCESS_TEST_NAME: &str = "windows::tests::native_target_process_child_probe";
+    const TARGET_PROCESS_CHILD_ENV: &str = "GUS_WINDOWS_TARGET_PROCESS_CHILD";
+    const TARGET_PROCESS_CHILD_TOKEN: &str = "managed-v1";
 
     #[test]
     fn current_process_observation_uses_native_windows_evidence() {
@@ -857,6 +915,63 @@ mod tests {
             value.console.host_start_time = NonZeroU64::new(501).expect("nonzero host start time");
         });
         assert_changed(&first, |value| value.console.session_id = 8);
+    }
+
+    #[test]
+    fn target_process_recheck_rejects_every_identity_mutation() {
+        fn assert_changed(first: &ProcessFacts, mutate: impl FnOnce(&mut ProcessFacts)) {
+            let mut second = first.clone();
+            mutate(&mut second);
+            assert_eq!(
+                require_stable_process_facts(first, &second),
+                Err(ObservationError::ProcessChanged)
+            );
+        }
+
+        let first = ProcessFacts {
+            pid: NonZeroU32::new(40).expect("nonzero synthetic PID"),
+            start_time: NonZeroU64::new(400).expect("nonzero synthetic start time"),
+            user_sid: vec![1],
+            session_id: 7,
+        };
+        assert_eq!(require_stable_process_facts(&first, &first), Ok(()));
+        assert_changed(&first, |value| {
+            value.pid = NonZeroU32::new(41).expect("nonzero synthetic PID");
+        });
+        assert_changed(&first, |value| {
+            value.start_time = NonZeroU64::new(401).expect("nonzero synthetic start time");
+        });
+        assert_changed(&first, |value| value.user_sid = vec![2]);
+        assert_changed(&first, |value| value.session_id = 8);
+    }
+
+    #[test]
+    fn native_target_process_observation_rejects_an_exited_child() {
+        let mut child = Command::new(env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg(TARGET_PROCESS_TEST_NAME)
+            .arg("--ignored")
+            .env(TARGET_PROCESS_CHILD_ENV, TARGET_PROCESS_CHILD_TOKEN)
+            .spawn()
+            .expect("launch managed target child");
+        let pid = NonZeroU32::new(child.id()).expect("child PID is nonzero");
+        let observed = observe_target_process(pid).expect("observe live managed child");
+        assert_eq!(observed.pid(), pid);
+
+        child.kill().expect("terminate managed target child");
+        child.wait().expect("reap managed target child");
+        assert!(
+            observe_target_process(pid).is_err(),
+            "an exited child must never yield a process identity"
+        );
+    }
+
+    #[test]
+    #[ignore = "internal child process for native Windows target observation"]
+    fn native_target_process_child_probe() {
+        if env::var(TARGET_PROCESS_CHILD_ENV).as_deref() == Ok(TARGET_PROCESS_CHILD_TOKEN) {
+            thread::sleep(Duration::from_secs(30));
+        }
     }
 
     #[test]

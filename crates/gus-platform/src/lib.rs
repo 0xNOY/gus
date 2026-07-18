@@ -349,6 +349,61 @@ impl CurrentSessionObserver {
     }
 }
 
+/// Native observer for a process identifier.
+///
+/// A PID is not itself an identity. The resulting value also binds the native
+/// process start time, OS user, and platform time domain so a recycled PID does
+/// not compare equal to the original process. This observer does **not** prove
+/// that a PID came from a particular socket or pipe; IPC authority must be
+/// created by a platform transport which atomically binds its peer credentials
+/// and process-liveness handle before decoding a frame.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeProcessObserver {
+    pid: NonZeroU32,
+}
+
+impl NativeProcessObserver {
+    #[must_use]
+    pub const fn new(pid: NonZeroU32) -> Self {
+        Self { pid }
+    }
+
+    /// Observes the process which owns this PID at the start of observation,
+    /// without trusting process-supplied command-line or environment data.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if the platform cannot observe the process, access is
+    /// denied, or the process exits or changes during the observation window.
+    pub fn observe(self) -> Result<ProcessIdentity, ObservationError> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::observe_process(self.pid)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::observe_target_process(self.pid)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos::observe_process(self.pid)
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            freebsd::observe_process(self.pid)
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "windows"
+        )))]
+        {
+            Err(ObservationError::UnsupportedPlatform)
+        }
+    }
+}
+
 /// Bounded native resource consulted during observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -360,6 +415,8 @@ pub enum ObservationResource {
     TerminalSession,
     TerminalAnchorProcess,
     TerminalAnchorUser,
+    TargetProcess,
+    TargetUser,
 }
 
 impl fmt::Display for ObservationResource {
@@ -372,6 +429,8 @@ impl fmt::Display for ObservationResource {
             Self::TerminalSession => "terminal session",
             Self::TerminalAnchorProcess => "terminal anchor process",
             Self::TerminalAnchorUser => "terminal anchor user",
+            Self::TargetProcess => "target process",
+            Self::TargetUser => "target process user",
         };
         formatter.write_str(name)
     }
@@ -391,7 +450,7 @@ pub enum ObservationError {
     Oversized { resource: ObservationResource },
     #[error("{resource} had a malformed native representation")]
     Malformed { resource: ObservationResource },
-    #[error("caller process changed during observation")]
+    #[error("observed process changed during observation")]
     ProcessChanged,
     #[error("terminal anchor changed during observation")]
     TerminalAnchorChanged,
@@ -438,4 +497,26 @@ fn identity_digest(
     );
     hasher.update(native);
     hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod process_observer_tests {
+    use super::*;
+
+    #[test]
+    fn native_process_identity_is_stable_and_redacts_its_user() {
+        let pid = NonZeroU32::new(std::process::id()).expect("current process PID is nonzero");
+        let first = NativeProcessObserver::new(pid)
+            .observe()
+            .expect("first process observation");
+        let second = NativeProcessObserver::new(pid)
+            .observe()
+            .expect("second process observation");
+
+        assert_eq!(first, second);
+        assert_eq!(first.pid(), pid);
+        let debug = format!("{first:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("digest"));
+    }
 }
