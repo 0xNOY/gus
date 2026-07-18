@@ -315,11 +315,11 @@ fn read_process_facts(
     process_resource: ObservationResource,
     user_resource: ObservationResource,
 ) -> Result<ProcessFacts, ObservationError> {
-    require_handle_live(&handle, process_resource)?;
-    let start_time = process_start_time(&handle, process_resource)?;
-    let user_sid = process_user_sid(&handle, user_resource)?;
-    let session_id = process_session_id(&handle, pid, process_resource)?;
-    require_handle_live(&handle, process_resource)?;
+    require_handle_live(handle, process_resource)?;
+    let start_time = process_start_time(handle, process_resource)?;
+    let user_sid = process_user_sid(handle, user_resource)?;
+    let session_id = process_session_id(handle, pid, process_resource)?;
+    require_handle_live(handle, process_resource)?;
     Ok(ProcessFacts {
         pid,
         start_time,
