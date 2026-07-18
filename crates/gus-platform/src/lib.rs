@@ -30,10 +30,15 @@ mod freebsd;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "linux")]
+mod peer_linux;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(any(target_os = "windows", test))]
 mod windows_model;
+
+#[cfg(target_os = "linux")]
+pub use peer_linux::{AuthenticatedUnixStream, PeerAuthenticationError};
 
 const IDENTITY_DIGEST_BYTES: usize = 32;
 
