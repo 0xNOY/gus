@@ -268,6 +268,7 @@ impl BrokerIssuer {
                     IssuanceLease {
                         state: Arc::downgrade(&self.state),
                         handle_tag: tag,
+                        expires_at,
                         released: false,
                     },
                     issued_at,
@@ -294,6 +295,7 @@ impl BrokerIssuer {
 struct IssuanceLease {
     state: Weak<IssuerState>,
     handle_tag: [u8; 32],
+    expires_at: MonotonicInstant,
     released: bool,
 }
 
@@ -311,6 +313,10 @@ impl IssuanceLease {
             .active_handle_tags
             .lock()
             .map_err(|_| CapabilityError::IssuerUnavailable)?;
+        if now >= self.expires_at {
+            active.remove(&self.handle_tag);
+            return Err(CapabilityError::Expired);
+        }
         let Some(expires_at) = active.get(&self.handle_tag).copied() else {
             return Err(CapabilityError::Revoked);
         };
@@ -722,7 +728,12 @@ impl SingleUseCapability {
             .claims
             .validate_call(parent, plan_digest, helper_identity)
         {
-            if error == CapabilityError::Expired {
+            if matches!(
+                error,
+                CapabilityError::Expired
+                    | CapabilityError::Revoked
+                    | CapabilityError::IssuerUnavailable
+            ) {
                 self.status = CapabilityStatus::Revoked;
                 self.claims.release();
             }
@@ -1573,7 +1584,12 @@ impl HttpCredentialCapability {
             .claims
             .validate_call(parent, plan_digest, helper_identity)
         {
-            if error == CapabilityError::Expired {
+            if matches!(
+                error,
+                CapabilityError::Expired
+                    | CapabilityError::Revoked
+                    | CapabilityError::IssuerUnavailable
+            ) {
                 self.status = CapabilityStatus::Revoked;
                 self.claims.release();
             }
@@ -2667,11 +2683,21 @@ mod tests {
             )
             .expect("valid bounded capability");
         clock.advance(90);
+        let mut fresh = issuer
+            .issue_single_use(
+                [3; 32],
+                process(10),
+                [4; 32],
+                expected.clone(),
+                Duration::from_millis(90),
+            )
+            .expect("new issuance sweeps expired registry entries");
         assert_eq!(
             capability.claim(process(10), [3; 32], [4; 32], &expected),
             Err(CapabilityError::Expired)
         );
         assert_eq!(capability.status(), CapabilityStatus::Revoked);
+        fresh.revoke();
         assert_eq!(issuer.active_issuance_count(), 0);
         assert!(matches!(
             issuer.issue_single_use(
