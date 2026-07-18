@@ -1306,13 +1306,18 @@ export function createProviderSelectionResponseFrame(
     promptFrame.message_family !== "provider_response" ||
     !isRequestId(promptFrame.request_id) ||
     !isProviderResponse(promptFrame.message) ||
-    promptFrame.message.type !== "selection_prompt" ||
-    !isProviderDecision(decision)
+    promptFrame.message.type !== "selection_prompt"
   ) {
     throw new Error("selection response requires an unconsumed decoded broker prompt");
   }
+  // Reserve before touching caller-controlled decision data. Its getters and
+  // Proxy traps may synchronously reenter this factory.
+  consumedSelectionPrompts.add(promptFrame);
+  if (!isProviderDecision(decision)) {
+    throw new Error("selection response requires a valid provider decision");
+  }
   const prompt = promptFrame.message.body;
-  const response = authorizeProviderRequest({
+  return authorizeProviderRequest({
     protocol_version: PROTOCOL_VERSION,
     message_family: "provider_request",
     request_id: promptFrame.request_id,
@@ -1326,6 +1331,4 @@ export function createProviderSelectionResponseFrame(
       },
     },
   });
-  consumedSelectionPrompts.add(promptFrame);
-  return response;
 }

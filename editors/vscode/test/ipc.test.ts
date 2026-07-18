@@ -450,6 +450,50 @@ test("provider factories enforce request ID roles and prompt correlation", async
     );
   }
 
+  const reentrantPrompt = decodeProviderResponse(record(promptCase.payload));
+  let attemptedReentry = false;
+  let reentrantWire: Uint8Array | undefined;
+  let reentrantError: unknown;
+  const reentrantDecision = new Proxy(
+    { result: "cancelled" } as const,
+    {
+      get(target, property, receiver) {
+        if (property === "result" && !attemptedReentry) {
+          attemptedReentry = true;
+          try {
+            const nestedResponse = createProviderSelectionResponseFrame(reentrantPrompt, {
+              result: "unavailable",
+            });
+            reentrantWire = encodeProviderRequest(nestedResponse);
+          } catch (error: unknown) {
+            reentrantError = error;
+          }
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    },
+  );
+  const reentrySafeResponse = createProviderSelectionResponseFrame(
+    reentrantPrompt,
+    reentrantDecision,
+  );
+  assert(attemptedReentry);
+  assert.equal(reentrantWire, undefined);
+  assert(reentrantError instanceof Error);
+  encodeProviderRequest(reentrySafeResponse);
+  assert.throws(() => encodeProviderRequest(reentrySafeResponse));
+
+  const invalidDecisionPrompt = decodeProviderResponse(record(promptCase.payload));
+  assert.throws(() =>
+    createProviderSelectionResponseFrame(
+      invalidDecisionPrompt,
+      { result: "not-a-decision" } as unknown as { result: "cancelled" },
+    ),
+  );
+  assert.throws(() =>
+    createProviderSelectionResponseFrame(invalidDecisionPrompt, { result: "cancelled" }),
+  );
+
   const acknowledged = corpus.valid.find(
     (entry) =>
       entry.direction === "provider_response" &&
