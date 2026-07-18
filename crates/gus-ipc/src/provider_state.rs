@@ -272,16 +272,25 @@ impl ProviderCorrelation {
     ///
     /// Rejects non-unregister messages and stale registration bindings. The
     /// state is consumed on both success and error, so an invalid unregister
-    /// fails the connection closed.
+    /// fails the connection closed. The error retains every outstanding ID so
+    /// callers can still complete those waiters as provider-unavailable.
     pub fn accept_unregister(
         mut self,
         frame: &ProviderRequestFrame,
-    ) -> Result<Vec<RequestId>, ProviderCorrelationError> {
-        let ProviderRequest::Unregister(request) = frame.message() else {
-            return Err(ProviderCorrelationError::UnexpectedMessageRole);
+    ) -> Result<Vec<RequestId>, ProviderTerminationError> {
+        let validation = if let ProviderRequest::Unregister(request) = frame.message() {
+            self.validate_binding(request.registration_id(), request.provider_generation())
+        } else {
+            Err(ProviderCorrelationError::UnexpectedMessageRole)
         };
-        self.validate_binding(request.registration_id(), request.provider_generation())?;
-        Ok(self.drain_prompts())
+        let outstanding_prompt_ids = self.drain_prompts();
+        match validation {
+            Ok(()) => Ok(outstanding_prompt_ids),
+            Err(cause) => Err(ProviderTerminationError {
+                cause,
+                outstanding_prompt_ids,
+            }),
+        }
     }
 
     /// Consumes the connection state and returns every waiter that must be
@@ -389,4 +398,29 @@ pub enum ProviderCorrelationError {
     ProfileNotOffered,
     #[error("repository membership generation is stale or replayed")]
     StaleMembership,
+}
+
+/// Fail-closed provider termination with every waiter retained for completion.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("{cause}")]
+pub struct ProviderTerminationError {
+    cause: ProviderCorrelationError,
+    outstanding_prompt_ids: Vec<RequestId>,
+}
+
+impl ProviderTerminationError {
+    #[must_use]
+    pub const fn cause(&self) -> ProviderCorrelationError {
+        self.cause
+    }
+
+    #[must_use]
+    pub fn outstanding_prompt_ids(&self) -> &[RequestId] {
+        &self.outstanding_prompt_ids
+    }
+
+    #[must_use]
+    pub fn into_outstanding_prompt_ids(self) -> Vec<RequestId> {
+        self.outstanding_prompt_ids
+    }
 }

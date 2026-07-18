@@ -48,4 +48,4 @@ pub use messages::{
     SelectionPrompt, SelectionScopePresentation, SelectionStatus, ShimRequest, ShimRequestFrame,
     ShimResponseFrame, StatusRequest, WireFrame, WireMessage,
 };
-pub use provider_state::{ProviderCorrelation, ProviderCorrelationError};
+pub use provider_state::{ProviderCorrelation, ProviderCorrelationError, ProviderTerminationError};

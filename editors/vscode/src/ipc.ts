@@ -242,6 +242,11 @@ export type ProviderResponseFrame = WireFrame<
   BrokerProviderMessage
 >;
 
+declare const decodedProviderResponseBrand: unique symbol;
+export type DecodedProviderResponseFrame = ProviderResponseFrame & {
+  readonly [decodedProviderResponseBrand]: true;
+};
+
 declare const encodableProviderRequestBrand: unique symbol;
 export type EncodableProviderRequestFrame = ProviderRequestFrame & {
   readonly [encodableProviderRequestBrand]: true;
@@ -256,6 +261,8 @@ const digestPattern = /^[0-9a-f]{64}$/u;
 const generationPattern = /^(?:[1-9][0-9]*)$/u;
 const profileIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const u64Maximum = 18_446_744_073_709_551_615n;
+const decodedProviderResponses = new WeakSet<object>();
+const consumedSelectionPrompts = new WeakSet<object>();
 
 const operationValues = new Set<OperationPresentation>([
   "local_read",
@@ -1132,8 +1139,12 @@ export function decodeProviderRequest(record: Uint8Array): ProviderRequestFrame 
   return decodeRecord(record, "provider_request", isProviderRequest);
 }
 
-export function decodeProviderResponse(record: Uint8Array): ProviderResponseFrame {
-  return decodeRecord(record, "provider_response", isProviderResponse);
+export function decodeProviderResponse(record: Uint8Array): DecodedProviderResponseFrame {
+  const decoded = deepFreezeJson(
+    decodeRecord(record, "provider_response", isProviderResponse),
+  ) as DecodedProviderResponseFrame;
+  decodedProviderResponses.add(decoded);
+  return decoded;
 }
 
 function cloneCanonicalJson(value: unknown, depth = 0): unknown {
@@ -1245,7 +1256,7 @@ function newRequestId(): RequestId {
 }
 
 export function encodeProviderRequest(frame: EncodableProviderRequestFrame): Uint8Array {
-  if (!authorizedProviderRequests.has(frame)) {
+  if (!authorizedProviderRequests.delete(frame)) {
     throw new Error("provider request was not created by a GUS role factory");
   }
   return encodeFrame(frame);
@@ -1285,10 +1296,12 @@ export function createProviderControlFrame(
 }
 
 export function createProviderSelectionResponseFrame(
-  promptFrame: ProviderResponseFrame,
+  promptFrame: DecodedProviderResponseFrame,
   decision: ProviderDecision,
 ): EncodableProviderRequestFrame {
   if (
+    !decodedProviderResponses.has(promptFrame) ||
+    consumedSelectionPrompts.has(promptFrame) ||
     promptFrame.protocol_version !== PROTOCOL_VERSION ||
     promptFrame.message_family !== "provider_response" ||
     !isRequestId(promptFrame.request_id) ||
@@ -1296,10 +1309,10 @@ export function createProviderSelectionResponseFrame(
     promptFrame.message.type !== "selection_prompt" ||
     !isProviderDecision(decision)
   ) {
-    throw new Error("selection response requires a valid broker prompt");
+    throw new Error("selection response requires an unconsumed decoded broker prompt");
   }
   const prompt = promptFrame.message.body;
-  return authorizeProviderRequest({
+  const response = authorizeProviderRequest({
     protocol_version: PROTOCOL_VERSION,
     message_family: "provider_request",
     request_id: promptFrame.request_id,
@@ -1313,4 +1326,6 @@ export function createProviderSelectionResponseFrame(
       },
     },
   });
+  consumedSelectionPrompts.add(promptFrame);
+  return response;
 }

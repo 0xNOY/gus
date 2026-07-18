@@ -741,6 +741,63 @@ fn provider_unregister_consumes_state_and_returns_every_waiter() {
 }
 
 #[test]
+fn invalid_provider_unregister_retains_every_waiter() {
+    let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
+    let provider_generation = generation(3);
+    let cases = [
+        (
+            ProviderRequestFrame::control(ProviderRequest::Heartbeat(ProviderControlRequest::new(
+                registration_id,
+                provider_generation,
+            )))
+            .expect("heartbeat frame"),
+            ProviderCorrelationError::UnexpectedMessageRole,
+        ),
+        (
+            ProviderRequestFrame::control(ProviderRequest::Unregister(
+                ProviderControlRequest::new(
+                    request_id("34de3f03-36f9-49cb-8b1d-f090991b854e"),
+                    provider_generation,
+                ),
+            ))
+            .expect("wrong registration frame"),
+            ProviderCorrelationError::RegistrationMismatch,
+        ),
+        (
+            ProviderRequestFrame::control(ProviderRequest::Unregister(
+                ProviderControlRequest::new(registration_id, generation(4)),
+            ))
+            .expect("stale generation frame"),
+            ProviderCorrelationError::ProviderGenerationMismatch,
+        ),
+    ];
+
+    for (frame, expected_cause) in cases {
+        let mut correlation = provider_correlation(
+            registration_id,
+            provider_generation,
+            vec![digest(0x33)],
+            vec![ProviderCapability::ProfileQuickPick],
+        );
+        let prompt_frame = ProviderResponseFrame::selection_prompt(prompt(
+            registration_id,
+            provider_generation,
+            generation(1),
+        ))
+        .expect("prompt frame");
+        correlation
+            .track_prompt(&prompt_frame, Instant::now())
+            .expect("tracked prompt");
+
+        let error = correlation
+            .accept_unregister(&frame)
+            .expect_err("invalid unregister must fail closed");
+        assert_eq!(error.cause(), expected_cause);
+        assert_eq!(error.outstanding_prompt_ids(), &[prompt_frame.request_id()]);
+    }
+}
+
+#[test]
 fn provider_cancel_and_unavailable_each_consume_one_live_prompt() {
     let registration_id = request_id("43d84d56-2cc8-41d0-a3b0-1146cb337eac");
     let provider_generation = generation(3);

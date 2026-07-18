@@ -4,10 +4,10 @@ import test from "node:test";
 
 import {
   FRAME_HEADER_BYTES,
+  type DecodedProviderResponseFrame,
   type MessageFamily,
   type ProviderControlMessage,
   type ProviderRegistrationRequest,
-  type ProviderResponseFrame,
   createProviderControlFrame,
   createProviderRegistrationFrame,
   createProviderSelectionResponseFrame,
@@ -328,6 +328,13 @@ test("provider encoder canonicalizes data properties and rejects smuggling surfa
   const extra = { ...frame, unexpected: "TOKEN=secret" } as typeof frame;
   assert.throws(() => encodeProviderRequest(extra));
 
+  const registrationWire = encodeProviderRequest(frame);
+  assert.equal(
+    JSON.stringify(decodeProviderRequest(registrationWire)),
+    JSON.stringify(frame),
+  );
+  assert.throws(() => encodeProviderRequest(frame));
+
   const inheritedRegistration = Object.assign(
     Object.create({
       toJSON: () => ({ TOKEN: "secret" }),
@@ -380,10 +387,12 @@ test("provider factories enforce request ID roles and prompt correlation", async
   };
   const controlFrame = createProviderControlFrame(control);
   assert.notEqual(controlFrame.request_id, registrationFrame.request_id);
+  const controlWire = encodeProviderRequest(controlFrame);
   assert.equal(
-    JSON.stringify(decodeProviderRequest(encodeProviderRequest(controlFrame))),
+    JSON.stringify(decodeProviderRequest(controlWire)),
     JSON.stringify(controlFrame),
   );
+  assert.throws(() => encodeProviderRequest(controlFrame));
   assert.throws(() =>
     createProviderControlFrame({
       type: "register",
@@ -410,13 +419,22 @@ test("provider factories enforce request ID roles and prompt correlation", async
   );
   assert(promptCase !== undefined);
   const promptFrame = decodeProviderResponse(record(promptCase.payload));
+  const forgedPrompt = structuredClone(promptFrame) as DecodedProviderResponseFrame;
+  assert.throws(() =>
+    createProviderSelectionResponseFrame(forgedPrompt, { result: "cancelled" }),
+  );
   const response = createProviderSelectionResponseFrame(promptFrame, { result: "cancelled" });
+  assert.throws(() =>
+    createProviderSelectionResponseFrame(promptFrame, { result: "unavailable" }),
+  );
   assert.equal(response.request_id, promptFrame.request_id);
   assert.equal(response.message.type, "selection_decision");
+  const responseWire = encodeProviderRequest(response);
   assert.equal(
-    JSON.stringify(decodeProviderRequest(encodeProviderRequest(response))),
+    JSON.stringify(decodeProviderRequest(responseWire)),
     JSON.stringify(response),
   );
+  assert.throws(() => encodeProviderRequest(response));
   if (response.message.type === "selection_decision" && promptFrame.message.type === "selection_prompt") {
     assert.equal(
       response.message.body.registration_id,
@@ -440,7 +458,7 @@ test("provider factories enforce request ID roles and prompt correlation", async
   assert(acknowledged !== undefined);
   assert.throws(() =>
     createProviderSelectionResponseFrame(
-      decodeProviderResponse(record(acknowledged.payload)) as ProviderResponseFrame,
+      decodeProviderResponse(record(acknowledged.payload)),
       { result: "unavailable" },
     ),
   );
