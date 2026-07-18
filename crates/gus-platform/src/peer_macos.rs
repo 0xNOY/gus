@@ -1091,7 +1091,9 @@ mod tests {
             .expect("write tampered response");
             let mut acknowledgement = [0];
             assert!(
-                client.read_exact(&mut acknowledgement).is_err(),
+                handshake
+                    .read_exact(&mut client, &mut acknowledgement)
+                    .is_err(),
                 "server must close without acknowledging a tampered proof"
             );
         });
