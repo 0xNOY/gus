@@ -105,14 +105,15 @@ fn assemble_observation(
         ProcessIdentity::from_observation(boot, caller_first.pid, caller_first.start_time, user);
     let terminal = match terminal {
         Some((device, leader_first, leader_uid_first, leader_second, leader_uid_second)) => {
-            if leader_first != leader_second
-                || leader_uid_first != leader_uid_second
-                || leader_first.pid != caller_first.session_id
+            if leader_first != leader_second || leader_uid_first != leader_uid_second {
+                return Err(ObservationError::SessionLeaderChanged);
+            }
+            if leader_first.pid != caller_first.session_id
                 || leader_first.session_id != caller_first.session_id
                 || leader_first.terminal_device != Some(device)
                 || leader_uid_first != caller_uid_first
             {
-                return Err(ObservationError::SessionLeaderMismatch);
+                return Err(ObservationError::SessionLeaderBindingMismatch);
             }
             let leader = ProcessIdentity::from_observation(
                 boot,
@@ -278,7 +279,18 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::File,
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::process::CommandExt,
+        },
+        process::{Command, Stdio},
+    };
+
     use super::*;
+
+    const NATIVE_PROBE_EXPECTATION: &str = "GUS_PLATFORM_NATIVE_PROBE_EXPECTATION";
 
     fn stat(pid: u32, parent: u32, session: u32, tty: i32, start: u64) -> ProcStat {
         ProcStat {
@@ -343,7 +355,7 @@ mod tests {
             1000,
         )
         .expect("observation");
-        assert!(observation.is_interactive());
+        assert!(observation.has_controlling_terminal());
         assert_eq!(observation.caller().pid().get(), 42);
         assert_eq!(observation.parent_pid().expect("parent").get(), 7);
         assert_eq!(
@@ -390,7 +402,7 @@ mod tests {
                     caller,
                     1000,
                 ),
-                Err(ObservationError::SessionLeaderMismatch)
+                Err(ObservationError::SessionLeaderBindingMismatch)
             );
         }
         assert_eq!(
@@ -408,17 +420,22 @@ mod tests {
                 caller,
                 1000,
             ),
-            Err(ObservationError::SessionLeaderMismatch)
+            Err(ObservationError::SessionLeaderChanged)
         );
     }
 
     #[test]
-    fn pid_one_may_have_no_parent() {
+    fn headless_pid_one_has_no_parent_and_no_terminal() {
         let fields_8_through_21 = ["0"; 14].join(" ");
         let input = format!("1 (init) S 0 1 1 0 {fields_8_through_21} 1");
         let parsed = parse_proc_stat(input.as_bytes(), ObservationResource::CallerProcess)
             .expect("PID 1 stat");
         assert_eq!(parsed.parent_pid, None);
+        let observation = assemble_observation(boot(), parsed, 1000, None, parsed, 1000)
+            .expect("headless PID 1 observation");
+        assert_eq!(observation.parent_pid(), None);
+        assert_eq!(observation.terminal(), None);
+        assert!(!observation.has_controlling_terminal());
     }
 
     #[test]
@@ -430,5 +447,168 @@ mod tests {
         let debug = format!("{observation:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("opaque_digest"));
+    }
+
+    #[test]
+    fn native_observation_child_probe() {
+        let Ok(expectation) = std::env::var(NATIVE_PROBE_EXPECTATION) else {
+            return;
+        };
+        let observation = crate::CurrentSessionObserver::new()
+            .observe()
+            .expect("child native observation");
+        assert_eq!(observation.has_controlling_terminal(), expectation == "tty");
+    }
+
+    #[test]
+    fn native_observation_distinguishes_detached_and_pty_sessions() {
+        let executable = std::env::current_exe().expect("current test executable");
+
+        let mut detached = native_probe_command(&executable, "headless");
+        detached
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the callback invokes only async-signal-safe `setsid` and
+        // constructs an `io::Error` if it fails. It does not allocate on the
+        // success path between fork and exec.
+        unsafe {
+            detached.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(detached.status().expect("detached probe status").success());
+
+        let (master, slave) = open_pty().expect("open PTY");
+        let slave_fd = slave.as_raw_fd();
+        let slave_file = File::from(slave);
+        let mut attached = native_probe_command(&executable, "tty");
+        attached
+            .stdin(Stdio::from(
+                slave_file.try_clone().expect("clone PTY stdin"),
+            ))
+            .stdout(Stdio::from(
+                slave_file.try_clone().expect("clone PTY stdout"),
+            ))
+            .stderr(Stdio::from(slave_file));
+        // SAFETY: `slave_fd` is an inherited descriptor returned by `openpty`.
+        // `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe system calls;
+        // no non-signal-safe work occurs on their success paths.
+        unsafe {
+            attached.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(attached.status().expect("PTY probe status").success());
+        drop(master);
+    }
+
+    fn native_probe_command(executable: &Path, expectation: &str) -> Command {
+        let mut command = Command::new(executable);
+        command
+            .arg("--exact")
+            .arg("linux::tests::native_observation_child_probe")
+            .arg("--nocapture")
+            .env(NATIVE_PROBE_EXPECTATION, expectation);
+        command
+    }
+
+    fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd)> {
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: `openpty` initializes both integer descriptors when it
+        // succeeds. Optional name and terminal-setting pointers are null.
+        let result = unsafe {
+            libc::openpty(
+                &raw mut master,
+                &raw mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful `openpty` returned two new owned descriptors.
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        // SAFETY: ownership of the distinct slave descriptor is transferred
+        // exactly once.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        Ok((master, slave))
+    }
+
+    #[test]
+    fn leader_uid_change_is_distinct_from_binding_mismatch() {
+        let caller = stat(42, 7, 9, 34817, 12345);
+        let leader = stat(9, 1, 9, 34817, 12000);
+        assert_eq!(
+            assemble_observation(
+                boot(),
+                caller,
+                1000,
+                Some((34817, leader, 1000, leader, 1001)),
+                caller,
+                1000,
+            ),
+            Err(ObservationError::SessionLeaderChanged)
+        );
+    }
+
+    #[test]
+    fn bounded_reads_keep_resource_specific_error_taxonomy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let oversized = directory.path().join("oversized");
+        std::fs::write(&oversized, b"12345").expect("write fixture");
+        assert_eq!(
+            read_bounded(&oversized, 4, ObservationResource::BootIdentity),
+            Err(ObservationError::Oversized {
+                resource: ObservationResource::BootIdentity,
+            })
+        );
+
+        let missing = directory.path().join("missing");
+        assert_eq!(
+            read_bounded(&missing, 4, ObservationResource::SessionLeaderUser),
+            Err(ObservationError::Read {
+                resource: ObservationResource::SessionLeaderUser,
+                kind: std::io::ErrorKind::NotFound,
+            })
+        );
+    }
+
+    #[test]
+    fn native_user_boot_and_terminal_values_are_absent_from_every_debug_surface() {
+        let native_boot = b"01234567-89ab-cdef-8123-456789abcdef";
+        let boot = parse_boot_identity(native_boot).expect("boot identity");
+        let native_uid = 4_242_424_u32;
+        let user =
+            OsUserIdentity::from_native_bytes(PlatformFamily::Linux, &native_uid.to_le_bytes());
+        let native_tty = 3_484_817_u32;
+        let terminal =
+            TerminalIdentity::from_native_bytes(PlatformFamily::Linux, &native_tty.to_le_bytes());
+        let process = ProcessIdentity::from_observation(
+            boot,
+            NonZeroU32::new(42).expect("pid"),
+            NonZeroU64::new(12_345).expect("start"),
+            user,
+        );
+        let session = TerminalSessionIdentity::from_observation(terminal, process);
+        let observation = LocalSessionObservation::from_observation(process, None, Some(session));
+        let debug =
+            format!("{boot:?} {user:?} {terminal:?} {process:?} {session:?} {observation:?}");
+        assert!(!debug.contains(std::str::from_utf8(native_boot).expect("ASCII boot ID")));
+        assert!(!debug.contains(&native_uid.to_string()));
+        assert!(!debug.contains(&native_tty.to_string()));
+        assert!(debug.matches("[REDACTED]").count() >= 6);
     }
 }

@@ -133,7 +133,9 @@ dependencies = [
 name = "gus-platform"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 

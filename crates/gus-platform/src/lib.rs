@@ -18,6 +18,7 @@ const IDENTITY_DIGEST_BYTES: usize = 32;
 
 /// Operating-system family that produced an observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PlatformFamily {
     Linux,
     MacOs,
@@ -213,7 +214,7 @@ impl LocalSessionObservation {
     }
 
     #[must_use]
-    pub const fn is_interactive(self) -> bool {
+    pub const fn has_controlling_terminal(self) -> bool {
         self.terminal.is_some()
     }
 
@@ -261,6 +262,7 @@ impl CurrentSessionObserver {
 
 /// Bounded native resource consulted during observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ObservationResource {
     BootIdentity,
     CallerProcess,
@@ -283,6 +285,7 @@ impl fmt::Display for ObservationResource {
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ObservationError {
     #[error("native session observation is unsupported on this platform")]
     UnsupportedPlatform,
@@ -297,8 +300,10 @@ pub enum ObservationError {
     Malformed { resource: ObservationResource },
     #[error("caller process changed during observation")]
     ProcessChanged,
-    #[error("controlling terminal has no live, matching session leader")]
-    SessionLeaderMismatch,
+    #[error("session leader changed during observation")]
+    SessionLeaderChanged,
+    #[error("controlling terminal is not bound to the observed user and session leader")]
+    SessionLeaderBindingMismatch,
 }
 
 fn identity_digest(
