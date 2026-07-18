@@ -110,6 +110,14 @@ struct ObservedConsole {
     facts: ConsoleFacts,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct TerminalEvidence {
+    caller_parent_pid: u32,
+    chain_pids: Vec<u32>,
+    chain_facts: Vec<ProcessFacts>,
+    console: ConsoleFacts,
+}
+
 pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationError> {
     let time_domain = ProcessTimeDomainIdentity::from_native_bytes(
         PlatformFamily::Windows,
@@ -176,17 +184,22 @@ pub(super) fn observe_current() -> Result<LocalSessionObservation, ObservationEr
     let chain_pids_second =
         derive_terminal_chain(caller_pid.get(), &attached_second, &snapshot_second)
             .map_err(|_| ObservationError::TerminalAnchorChanged)?;
-    if parent_second != parent_pid_raw || chain_pids_first != chain_pids_second {
-        return Err(ObservationError::TerminalAnchorChanged);
-    }
 
     let chain_second = normalize_terminal_recheck(observe_chain(&chain_pids_second))?;
     normalize_terminal_recheck(validate_terminal_chain(&caller_first.facts, &chain_second))?;
-    if !same_process_chain(&chain_first, &chain_second)
-        || console_first.facts != console_second.facts
-    {
-        return Err(ObservationError::TerminalAnchorChanged);
-    }
+    let evidence_first = terminal_evidence(
+        parent_pid_raw,
+        &chain_pids_first,
+        &chain_first,
+        console_first.facts,
+    );
+    let evidence_second = terminal_evidence(
+        parent_second,
+        &chain_pids_second,
+        &chain_second,
+        console_second.facts,
+    );
+    require_stable_terminal_evidence(&evidence_first, &evidence_second)?;
     require_live(&caller_first, ObservationError::ProcessChanged)?;
     for process in chain_first.iter().chain(&chain_second) {
         require_live(process, ObservationError::TerminalAnchorChanged)?;
@@ -494,12 +507,29 @@ fn validate_terminal_chain(
     Ok(())
 }
 
-fn same_process_chain(first: &[ObservedProcess], second: &[ObservedProcess]) -> bool {
-    first.len() == second.len()
-        && first
-            .iter()
-            .zip(second)
-            .all(|(first, second)| first.facts == second.facts)
+fn terminal_evidence(
+    caller_parent_pid: u32,
+    chain_pids: &[u32],
+    chain: &[ObservedProcess],
+    console: ConsoleFacts,
+) -> TerminalEvidence {
+    TerminalEvidence {
+        caller_parent_pid,
+        chain_pids: chain_pids.to_vec(),
+        chain_facts: chain.iter().map(|process| process.facts.clone()).collect(),
+        console,
+    }
+}
+
+fn require_stable_terminal_evidence(
+    first: &TerminalEvidence,
+    second: &TerminalEvidence,
+) -> Result<(), ObservationError> {
+    if first == second {
+        Ok(())
+    } else {
+        Err(ObservationError::TerminalAnchorChanged)
+    }
 }
 
 fn require_live(
@@ -772,6 +802,89 @@ mod tests {
     }
 
     #[test]
+    fn terminal_recheck_rejects_every_identity_mutation() {
+        fn assert_changed(first: &TerminalEvidence, mutate: impl FnOnce(&mut TerminalEvidence)) {
+            let mut second = first.clone();
+            mutate(&mut second);
+            assert_eq!(
+                require_stable_terminal_evidence(first, &second),
+                Err(ObservationError::TerminalAnchorChanged)
+            );
+        }
+
+        let process = |pid, start_time, user_sid: u8, session_id| ProcessFacts {
+            pid: NonZeroU32::new(pid).expect("nonzero synthetic PID"),
+            start_time: NonZeroU64::new(start_time).expect("nonzero synthetic start time"),
+            user_sid: vec![user_sid],
+            session_id,
+        };
+        let first = TerminalEvidence {
+            caller_parent_pid: 30,
+            chain_pids: vec![40, 30],
+            chain_facts: vec![process(40, 400, 1, 7), process(30, 300, 1, 7)],
+            console: ConsoleFacts {
+                window_handle: 100,
+                host_pid: NonZeroU32::new(50).expect("nonzero synthetic host PID"),
+                host_start_time: NonZeroU64::new(500).expect("nonzero synthetic host start time"),
+                session_id: 7,
+            },
+        };
+        assert_eq!(require_stable_terminal_evidence(&first, &first), Ok(()));
+
+        assert_changed(&first, |value| value.caller_parent_pid = 20);
+        assert_changed(&first, |value| value.chain_pids[1] = 20);
+        assert_changed(&first, |value| {
+            value.chain_facts[0].pid = NonZeroU32::new(41).expect("nonzero PID");
+        });
+        assert_changed(&first, |value| {
+            value.chain_facts[0].start_time = NonZeroU64::new(401).expect("nonzero start time");
+        });
+        assert_changed(&first, |value| value.chain_facts[0].user_sid = vec![2]);
+        assert_changed(&first, |value| value.chain_facts[0].session_id = 8);
+        assert_changed(&first, |value| {
+            value.chain_facts[1].pid = NonZeroU32::new(31).expect("nonzero PID");
+        });
+        assert_changed(&first, |value| {
+            value.chain_facts[1].start_time = NonZeroU64::new(301).expect("nonzero start time");
+        });
+        assert_changed(&first, |value| value.chain_facts[1].user_sid = vec![2]);
+        assert_changed(&first, |value| value.chain_facts[1].session_id = 8);
+        assert_changed(&first, |value| value.console.window_handle = 101);
+        assert_changed(&first, |value| {
+            value.console.host_pid = NonZeroU32::new(51).expect("nonzero host PID");
+        });
+        assert_changed(&first, |value| {
+            value.console.host_start_time = NonZeroU64::new(501).expect("nonzero host start time");
+        });
+        assert_changed(&first, |value| value.console.session_id = 8);
+    }
+
+    #[test]
+    fn every_terminal_recheck_error_is_normalized_to_anchor_change() {
+        for error in [
+            ObservationError::UnsupportedPlatform,
+            ObservationError::Read {
+                resource: ObservationResource::TerminalSession,
+                kind: io::ErrorKind::PermissionDenied,
+            },
+            ObservationError::Oversized {
+                resource: ObservationResource::TerminalSession,
+            },
+            ObservationError::Malformed {
+                resource: ObservationResource::TerminalSession,
+            },
+            ObservationError::ProcessChanged,
+            ObservationError::TerminalAnchorChanged,
+            ObservationError::TerminalBindingMismatch,
+        ] {
+            assert_eq!(
+                normalize_terminal_recheck::<()>(Err(error)),
+                Err(ObservationError::TerminalAnchorChanged)
+            );
+        }
+    }
+
+    #[test]
     fn native_observation_distinguishes_detached_and_replaced_consoles() {
         run_native_child("detached", b"detached");
         run_native_child("switch-console", b"switched");
@@ -1014,6 +1127,10 @@ mod tests {
                 "initialize process attribute list: {:?}",
                 io::Error::last_os_error()
             );
+            let attributes = Self {
+                _storage: storage,
+                pointer,
+            };
             // The ConPTY API contract passes the HPCON value itself as the
             // attribute payload, rather than a pointer to local storage.
             // SAFETY: The initialized list and live pseudoconsole handle meet
@@ -1021,7 +1138,7 @@ mod tests {
             assert_ne!(
                 unsafe {
                     UpdateProcThreadAttribute(
-                        pointer,
+                        attributes.pointer,
                         0,
                         usize::try_from(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE)
                             .expect("pseudoconsole attribute fits usize"),
@@ -1035,10 +1152,7 @@ mod tests {
                 "set pseudoconsole process attribute: {:?}",
                 io::Error::last_os_error()
             );
-            Self {
-                _storage: storage,
-                pointer,
-            }
+            attributes
         }
     }
 
