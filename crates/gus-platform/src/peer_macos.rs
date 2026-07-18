@@ -4,6 +4,7 @@ use std::{
     mem::{MaybeUninit, size_of},
     num::NonZeroU32,
     os::{fd::AsRawFd, unix::net::UnixStream},
+    ptr,
     time::{Duration, Instant},
 };
 
@@ -244,6 +245,8 @@ pub enum PeerAuthenticationError {
     Credential { kind: io::ErrorKind },
     #[error("peer credential had a malformed native representation")]
     MalformedCredential,
+    /// Both the absolute handshake deadline and a shorter pre-existing socket
+    /// timeout are reported as [`io::ErrorKind::TimedOut`].
     #[error("failed to transfer the bounded peer-authentication handshake: {kind:?}")]
     Handshake { kind: io::ErrorKind },
     #[error("peer-authentication handshake was malformed or unsupported")]
@@ -309,6 +312,7 @@ struct HandshakeIo {
     deadline: Instant,
     original_read_timeout: Option<Duration>,
     original_write_timeout: Option<Duration>,
+    original_status_flags: libc::c_int,
 }
 
 impl HandshakeIo {
@@ -330,10 +334,24 @@ impl HandshakeIo {
         let original_write_timeout = stream
             .write_timeout()
             .map_err(|error| handshake_error(&error))?;
+        let original_status_flags = socket_status_flags(stream)?;
+        // SAFETY: `F_SETFL` changes only status flags for this fresh, unshared
+        // socket. `restore` reinstates the exact original flags afterward.
+        if unsafe {
+            libc::fcntl(
+                stream.as_raw_fd(),
+                libc::F_SETFL,
+                original_status_flags | libc::O_NONBLOCK,
+            )
+        } == -1
+        {
+            return Err(handshake_error(&io::Error::last_os_error()));
+        }
         Ok(Self {
             deadline,
             original_read_timeout,
             original_write_timeout,
+            original_status_flags,
         })
     }
 
@@ -343,18 +361,25 @@ impl HandshakeIo {
         mut buffer: &mut [u8],
     ) -> Result<(), PeerAuthenticationError> {
         while !buffer.is_empty() {
-            stream
-                .set_read_timeout(Some(self.remaining(self.original_read_timeout)?))
-                .map_err(|error| handshake_error(&error))?;
-            match stream.read(buffer) {
-                Ok(0) => {
-                    return Err(PeerAuthenticationError::Handshake {
-                        kind: io::ErrorKind::UnexpectedEof,
-                    });
+            let operation_deadline = self.operation_deadline(self.original_read_timeout)?;
+            loop {
+                self.wait_ready(stream, libc::POLLIN, operation_deadline)?;
+                match stream.read(buffer) {
+                    Ok(0) => {
+                        return Err(PeerAuthenticationError::Handshake {
+                            kind: io::ErrorKind::UnexpectedEof,
+                        });
+                    }
+                    Ok(read) => {
+                        buffer = &mut buffer[read..];
+                        self.require_deadline(operation_deadline)?;
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(self.normalize_io_error(&error)),
                 }
-                Ok(read) => buffer = &mut buffer[read..],
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(self.normalize_io_error(&error)),
+                self.require_deadline(operation_deadline)?;
             }
         }
         Ok(())
@@ -366,42 +391,109 @@ impl HandshakeIo {
         mut buffer: &[u8],
     ) -> Result<(), PeerAuthenticationError> {
         while !buffer.is_empty() {
-            stream
-                .set_write_timeout(Some(self.remaining(self.original_write_timeout)?))
-                .map_err(|error| handshake_error(&error))?;
-            match stream.write(buffer) {
-                Ok(0) => {
-                    return Err(PeerAuthenticationError::Handshake {
-                        kind: io::ErrorKind::WriteZero,
-                    });
+            let operation_deadline = self.operation_deadline(self.original_write_timeout)?;
+            loop {
+                self.wait_ready(stream, libc::POLLOUT, operation_deadline)?;
+                match stream.write(buffer) {
+                    Ok(0) => {
+                        return Err(PeerAuthenticationError::Handshake {
+                            kind: io::ErrorKind::WriteZero,
+                        });
+                    }
+                    Ok(written) => {
+                        buffer = &buffer[written..];
+                        self.require_deadline(operation_deadline)?;
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(self.normalize_io_error(&error)),
                 }
-                Ok(written) => buffer = &buffer[written..],
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(self.normalize_io_error(&error)),
+                self.require_deadline(operation_deadline)?;
             }
         }
         Ok(())
     }
 
     fn restore(&self, stream: &UnixStream) -> Result<(), PeerAuthenticationError> {
-        stream
-            .set_read_timeout(self.original_read_timeout)
-            .map_err(|error| handshake_error(&error))?;
-        stream
-            .set_write_timeout(self.original_write_timeout)
-            .map_err(|error| handshake_error(&error))
+        // SAFETY: the descriptor is live and the saved flags came from this
+        // exact socket before authentication changed it.
+        if unsafe {
+            libc::fcntl(
+                stream.as_raw_fd(),
+                libc::F_SETFL,
+                self.original_status_flags,
+            )
+        } == -1
+        {
+            return Err(handshake_error(&io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
-    fn remaining(
+    fn wait_ready(
+        &self,
+        stream: &UnixStream,
+        events: libc::c_short,
+        operation_deadline: Instant,
+    ) -> Result<(), PeerAuthenticationError> {
+        loop {
+            let timeout = operation_deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(handshake_timeout)?;
+            let mut descriptor = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            // SAFETY: the single pollfd is writable and remains live for this
+            // bounded call. Its descriptor is borrowed from `stream`.
+            let ready = unsafe {
+                libc::poll(
+                    ptr::addr_of_mut!(descriptor),
+                    1,
+                    poll_timeout_millis(timeout),
+                )
+            };
+            if ready > 0 {
+                self.require_deadline(operation_deadline)?;
+                if descriptor.revents & libc::POLLNVAL != 0 {
+                    return Err(handshake_error(&io::Error::from_raw_os_error(libc::EBADF)));
+                }
+                return Ok(());
+            }
+            if ready == 0 {
+                return Err(handshake_timeout());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(handshake_error(&error));
+            }
+        }
+    }
+
+    fn operation_deadline(
         &self,
         original_timeout: Option<Duration>,
-    ) -> Result<Duration, PeerAuthenticationError> {
+    ) -> Result<Instant, PeerAuthenticationError> {
+        let now = Instant::now();
         let remaining = self
             .deadline
-            .checked_duration_since(Instant::now())
+            .checked_duration_since(now)
             .filter(|duration| !duration.is_zero())
             .ok_or_else(handshake_timeout)?;
-        Ok(original_timeout.map_or(remaining, |original| original.min(remaining)))
+        now.checked_add(original_timeout.map_or(remaining, |original| original.min(remaining)))
+            .ok_or_else(handshake_timeout)
+    }
+
+    fn require_deadline(&self, operation_deadline: Instant) -> Result<(), PeerAuthenticationError> {
+        let now = Instant::now();
+        if now >= self.deadline || now >= operation_deadline {
+            Err(handshake_timeout())
+        } else {
+            Ok(())
+        }
     }
 
     fn normalize_io_error(&self, error: &io::Error) -> PeerAuthenticationError {
@@ -416,6 +508,23 @@ impl HandshakeIo {
             handshake_error(error)
         }
     }
+}
+
+fn socket_status_flags(stream: &UnixStream) -> Result<libc::c_int, PeerAuthenticationError> {
+    // SAFETY: `F_GETFL` reads status flags from the live borrowed descriptor.
+    let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        Err(handshake_error(&io::Error::last_os_error()))
+    } else {
+        Ok(flags)
+    }
+}
+
+fn poll_timeout_millis(timeout: Duration) -> libc::c_int {
+    let rounded = timeout
+        .as_millis()
+        .saturating_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0));
+    libc::c_int::try_from(rounded).unwrap_or(libc::c_int::MAX)
 }
 
 fn require_close_on_exec(stream: &UnixStream) -> Result<(), PeerAuthenticationError> {
@@ -1161,8 +1270,40 @@ mod tests {
     }
 
     #[test]
-    fn successful_handshake_restores_both_socket_timeouts() {
+    fn preexisting_socket_timeout_bounds_handshake_without_mutation() {
+        let (mut server, _client) = UnixStream::pair().expect("create peer pair");
+        let original_timeout = Duration::from_millis(40);
+        server
+            .set_read_timeout(Some(original_timeout))
+            .expect("set original read timeout");
+        let original_flags = socket_status_flags(&server).expect("original status flags");
+        let handshake = HandshakeIo::begin_with_budget(&server, Duration::from_secs(1))
+            .expect("begin bounded handshake");
+        let started = Instant::now();
+        let mut input = [0_u8; 1];
+        assert_eq!(
+            handshake
+                .read_exact(&mut server, &mut input)
+                .expect_err("original timeout must bound the read"),
+            handshake_timeout()
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        handshake.restore(&server).expect("restore status flags");
+        assert_eq!(
+            server.read_timeout().expect("read original timeout"),
+            Some(original_timeout)
+        );
+        assert_eq!(
+            socket_status_flags(&server).expect("restored status flags"),
+            original_flags
+        );
+    }
+
+    #[test]
+    fn successful_handshake_preserves_socket_timeouts_and_status_flags() {
         let (server, client) = UnixStream::pair().expect("create peer pair");
+        let server_flags = socket_status_flags(&server).expect("server status flags");
+        let client_flags = socket_status_flags(&client).expect("client status flags");
         let server_read = Duration::from_millis(700);
         let server_write = Duration::from_millis(900);
         let client_read = Duration::from_millis(800);
@@ -1196,6 +1337,10 @@ mod tests {
                     .expect("client write timeout"),
                 Some(client_write)
             );
+            assert_eq!(
+                socket_status_flags(&authenticated.stream).expect("restored client status flags"),
+                client_flags
+            );
         });
         let authenticated = AuthenticatedUnixStream::authenticate_incoming(server)
             .expect("authenticate incoming peer");
@@ -1212,6 +1357,10 @@ mod tests {
                 .write_timeout()
                 .expect("server write timeout"),
             Some(server_write)
+        );
+        assert_eq!(
+            socket_status_flags(&authenticated.stream).expect("restored server status flags"),
+            server_flags
         );
         client_thread.join().expect("join authenticated client");
     }
