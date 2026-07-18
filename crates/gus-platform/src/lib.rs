@@ -30,6 +30,8 @@ mod freebsd;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "freebsd")]
+mod peer_freebsd;
 #[cfg(target_os = "linux")]
 mod peer_linux;
 #[cfg(target_os = "macos")]
@@ -41,6 +43,8 @@ mod windows;
 #[cfg(any(target_os = "windows", test))]
 mod windows_model;
 
+#[cfg(target_os = "freebsd")]
+pub use peer_freebsd::{AuthenticatedUnixStream, PeerAuthenticationError};
 #[cfg(target_os = "linux")]
 pub use peer_linux::{AuthenticatedUnixStream, PeerAuthenticationError};
 #[cfg(target_os = "macos")]
@@ -187,7 +191,7 @@ impl ProcessIdentity {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "windows"))]
 fn process_identity_proof_digest(identity: ProcessIdentity) -> [u8; IDENTITY_DIGEST_BYTES] {
     let mut native = [0_u8; 76];
     native[0..32].copy_from_slice(&identity.time_domain.0);
