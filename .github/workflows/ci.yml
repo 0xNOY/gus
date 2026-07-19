@@ -154,6 +154,10 @@ jobs:
             }
             $copiedBinary = Join-Path $probeRoot "gus-platform-tests.exe"
             Copy-Item $testBinary.FullName $copiedBinary
+            & icacls.exe $probeRoot /setowner "${env:COMPUTERNAME}\${userName}" /T /C | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to assign the standard-user probe directory"
+            }
             $stdout = Join-Path $probeRoot "stdout.txt"
             $stderr = Join-Path $probeRoot "stderr.txt"
             $arguments = "--exact real_git::resolver_windows::tests::native_standard_user_resolver_probe --nocapture --test-threads=1"
