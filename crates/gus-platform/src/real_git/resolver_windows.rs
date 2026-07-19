@@ -705,37 +705,47 @@ fn read_reparse_data(file: &File, expected_tag: u32) -> Result<ReparseData, Real
         return Err(RealGitArtifactError::InvalidReparsePoint);
     }
     buffer.truncate(returned);
-    let tag = read_u32(&buffer, 0)?;
-    let data_length = usize::from(read_u16(&buffer, 4)?);
-    if tag != expected_tag || data_length.checked_add(8) != Some(returned) {
+    parse_reparse_buffer(&buffer, expected_tag)
+}
+
+fn parse_reparse_buffer(
+    buffer: &[u8],
+    expected_tag: u32,
+) -> Result<ReparseData, RealGitArtifactError> {
+    if buffer.len() < 8 || buffer.len() > MAXIMUM_REPARSE_DATA_BUFFER_SIZE {
+        return Err(RealGitArtifactError::InvalidReparsePoint);
+    }
+    let tag = read_u32(buffer, 0)?;
+    let data_length = usize::from(read_u16(buffer, 4)?);
+    if tag != expected_tag || data_length.checked_add(8) != Some(buffer.len()) {
         return Err(RealGitArtifactError::InvalidReparsePoint);
     }
     let (path_start, flags) = match tag {
         IO_REPARSE_TAG_SYMLINK => {
-            if data_length < 12 || returned < 20 {
+            if data_length < 12 || buffer.len() < 20 {
                 return Err(RealGitArtifactError::InvalidReparsePoint);
             }
-            let flags = read_u32(&buffer, 16)?;
+            let flags = read_u32(buffer, 16)?;
             if flags & !SYMLINK_FLAG_RELATIVE != 0 {
                 return Err(RealGitArtifactError::InvalidReparsePoint);
             }
             (20, flags)
         }
         IO_REPARSE_TAG_MOUNT_POINT => {
-            if data_length < 8 || returned < 16 {
+            if data_length < 8 || buffer.len() < 16 {
                 return Err(RealGitArtifactError::InvalidReparsePoint);
             }
             (16, 0)
         }
         _ => return Err(RealGitArtifactError::ReparsePointUnsupported),
     };
-    let substitute_offset = usize::from(read_u16(&buffer, 8)?);
-    let substitute_length = usize::from(read_u16(&buffer, 10)?);
-    let print_offset = usize::from(read_u16(&buffer, 12)?);
-    let print_length = usize::from(read_u16(&buffer, 14)?);
-    validate_reparse_string(&buffer, path_start, print_offset, print_length, true)?;
+    let substitute_offset = usize::from(read_u16(buffer, 8)?);
+    let substitute_length = usize::from(read_u16(buffer, 10)?);
+    let print_offset = usize::from(read_u16(buffer, 12)?);
+    let print_length = usize::from(read_u16(buffer, 14)?);
+    validate_reparse_string(buffer, path_start, print_offset, print_length, true)?;
     let target = validate_reparse_string(
-        &buffer,
+        buffer,
         path_start,
         substitute_offset,
         substitute_length,
@@ -743,7 +753,7 @@ fn read_reparse_data(file: &File, expected_tag: u32) -> Result<ReparseData, Real
     )?;
     Ok(ReparseData {
         tag,
-        raw: buffer,
+        raw: buffer.to_vec(),
         target,
         relative: flags & SYMLINK_FLAG_RELATIVE != 0,
     })
@@ -1238,27 +1248,42 @@ mod tests {
     fn reparse_parser_rejects_unknown_truncated_odd_and_embedded_nul_data() {
         let unknown = synthetic_reparse(0xa000_001b, r"\??\C:\git.exe", false);
         assert_eq!(
-            parse_reparse_buffer_for_test(&unknown).expect_err("unknown tag"),
+            parse_reparse_buffer(&unknown, 0xa000_001b).expect_err("unknown tag"),
             RealGitArtifactError::ReparsePointUnsupported
         );
 
         let mut truncated = synthetic_reparse(IO_REPARSE_TAG_SYMLINK, r"\??\C:\git.exe", false);
         truncated.pop();
         assert_eq!(
-            parse_reparse_buffer_for_test(&truncated).expect_err("truncated data"),
+            parse_reparse_buffer(&truncated, IO_REPARSE_TAG_SYMLINK).expect_err("truncated data"),
             RealGitArtifactError::InvalidReparsePoint
         );
 
         let mut odd = synthetic_reparse(IO_REPARSE_TAG_SYMLINK, r"\??\C:\git.exe", false);
         odd[10..12].copy_from_slice(&3_u16.to_le_bytes());
         assert_eq!(
-            parse_reparse_buffer_for_test(&odd).expect_err("odd UTF-16 length"),
+            parse_reparse_buffer(&odd, IO_REPARSE_TAG_SYMLINK).expect_err("odd UTF-16 length"),
             RealGitArtifactError::InvalidReparsePoint
         );
 
         let embedded = synthetic_reparse(IO_REPARSE_TAG_SYMLINK, "\\??\\C:\\git\0.exe", false);
         assert_eq!(
-            parse_reparse_buffer_for_test(&embedded).expect_err("embedded NUL"),
+            parse_reparse_buffer(&embedded, IO_REPARSE_TAG_SYMLINK).expect_err("embedded NUL"),
+            RealGitArtifactError::InvalidReparsePoint
+        );
+
+        let valid = synthetic_reparse(IO_REPARSE_TAG_SYMLINK, r"\??\C:\git.exe", false);
+        assert_eq!(
+            parse_reparse_buffer(&valid, IO_REPARSE_TAG_MOUNT_POINT)
+                .expect_err("metadata tag mismatch"),
+            RealGitArtifactError::InvalidReparsePoint
+        );
+
+        let mut unknown_flags = valid;
+        unknown_flags[16..20].copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            parse_reparse_buffer(&unknown_flags, IO_REPARSE_TAG_SYMLINK)
+                .expect_err("unknown symlink flags"),
             RealGitArtifactError::InvalidReparsePoint
         );
     }
@@ -1338,32 +1363,6 @@ mod tests {
             buffer[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
         }
         buffer
-    }
-
-    fn parse_reparse_buffer_for_test(buffer: &[u8]) -> Result<ReparseData, RealGitArtifactError> {
-        let tag = read_u32(buffer, 0)?;
-        let data_length = usize::from(read_u16(buffer, 4)?);
-        if data_length.checked_add(8) != Some(buffer.len()) {
-            return Err(RealGitArtifactError::InvalidReparsePoint);
-        }
-        let (path_start, flags) = match tag {
-            IO_REPARSE_TAG_SYMLINK => (20, read_u32(buffer, 16)?),
-            IO_REPARSE_TAG_MOUNT_POINT => (16, 0),
-            _ => return Err(RealGitArtifactError::ReparsePointUnsupported),
-        };
-        let target = validate_reparse_string(
-            buffer,
-            path_start,
-            usize::from(read_u16(buffer, 8)?),
-            usize::from(read_u16(buffer, 10)?),
-            false,
-        )?;
-        Ok(ReparseData {
-            tag,
-            raw: buffer.to_vec(),
-            target,
-            relative: flags & SYMLINK_FLAG_RELATIVE != 0,
-        })
     }
 
     fn exclusion_fixture() -> (tempfile::TempDir, ExecutableExclusionSet) {

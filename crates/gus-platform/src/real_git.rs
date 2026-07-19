@@ -505,6 +505,18 @@ impl fmt::Debug for DiscoveryChainBinding {
 }
 
 #[cfg(any(unix, windows))]
+impl DiscoveryChainBinding {
+    /// Returns the versioned digest of the complete ordered discovery chain.
+    ///
+    /// This value is manifest evidence only. It does not grant authority to
+    /// reopen or launch the represented executable.
+    #[must_use]
+    pub const fn digest(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+#[cfg(any(unix, windows))]
 impl fmt::Debug for DiscoveryInspection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("DiscoveryInspection([REDACTED])")
@@ -830,7 +842,7 @@ pub enum RealGitArtifactError {
         "symbolic-link resolution is forbidden by the current filesystem, mount, or process policy"
     )]
     SymbolicLinkPolicyDenied,
-    #[error("Windows reparse points are unsupported in real Git candidate paths")]
+    #[error("this kind of Windows reparse point is unsupported in real Git candidate paths")]
     ReparsePointUnsupported,
     #[error("the real Git discovery path contains a Windows reparse-point loop")]
     ReparsePointLoop,
@@ -842,8 +854,11 @@ pub enum RealGitArtifactError {
     WindowsFilesystemUnsupported,
     #[error("Windows requires a trusted pre-launch current-image lease")]
     CurrentImageEvidenceRequired,
-    #[error("failed to inspect the real Git candidate: {kind:?}")]
-    Io { kind: io::ErrorKind },
+    #[error("failed to inspect the real Git candidate: {kind:?} (OS code: {raw_os_error:?})")]
+    Io {
+        kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
     #[error("the real Git candidate is not a regular executable file")]
     NotExecutable,
     #[error("the real Git candidate exceeds the executable size limit")]
@@ -864,8 +879,9 @@ pub enum RealGitArtifactError {
 
 fn io_error(error: io::Error) -> RealGitArtifactError {
     let kind = error.kind();
+    let raw_os_error = error.raw_os_error();
     drop(error);
-    RealGitArtifactError::Io { kind }
+    RealGitArtifactError::Io { kind, raw_os_error }
 }
 
 #[derive(Clone, Copy)]
