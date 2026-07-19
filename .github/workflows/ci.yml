@@ -137,13 +137,19 @@ jobs:
           $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
           $credential = [pscredential]::new(".\$userName", $securePassword)
           $probeRoot = "C:\gus-standard-$env:GITHUB_RUN_ID"
-          $probeTemp = Join-Path $probeRoot "temp"
           try {
             New-LocalUser -Name $userName -Password $securePassword -PasswordNeverExpires | Out-Null
-            New-Item -ItemType Directory -Path $probeTemp -Force | Out-Null
-            & icacls.exe $probeRoot /grant "${env:COMPUTERNAME}\${userName}:(OI)(CI)F" | Out-Null
+            New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
+            & icacls.exe $probeRoot /inheritance:r | Out-Null
             if ($LASTEXITCODE -ne 0) {
-              throw "failed to grant the standard-user probe directory"
+              throw "failed to isolate the standard-user probe ACL"
+            }
+            & icacls.exe $probeRoot /grant:r `
+              "${env:COMPUTERNAME}\${userName}:(OI)(CI)F" `
+              "*S-1-5-18:(OI)(CI)F" `
+              "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to grant the standard-user probe ACL"
             }
 
             $testBinary = Get-ChildItem "target\debug\deps\gus_platform-*.exe" |
@@ -154,7 +160,7 @@ jobs:
             }
             $copiedBinary = Join-Path $probeRoot "gus-platform-tests.exe"
             Copy-Item $testBinary.FullName $copiedBinary
-            & icacls.exe $probeRoot /setowner "${env:COMPUTERNAME}\${userName}" /T /C | Out-Null
+            & icacls.exe $probeRoot /setowner "${env:COMPUTERNAME}\${userName}" | Out-Null
             if ($LASTEXITCODE -ne 0) {
               throw "failed to assign the standard-user probe directory"
             }
@@ -168,8 +174,8 @@ jobs:
               -LoadUserProfile `
               -Environment @{
                 GUS_WINDOWS_STANDARD_USER_TEST = "1"
-                TEMP = $probeTemp
-                TMP = $probeTemp
+                TEMP = $probeRoot
+                TMP = $probeRoot
               } `
               -RedirectStandardOutput $stdout `
               -RedirectStandardError $stderr `
