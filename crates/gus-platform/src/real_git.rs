@@ -7,13 +7,15 @@ use std::{
 
 #[cfg(unix)]
 mod resolver_unix;
+#[cfg(windows)]
+mod resolver_windows;
 
 #[cfg(unix)]
 use std::ffi::{CString, OsString};
 #[cfg(any(target_os = "linux", windows))]
 use std::fs::OpenOptions;
 #[cfg(windows)]
-use std::mem::size_of;
+use std::{ffi::c_void, mem::size_of, ptr};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -37,17 +39,39 @@ use std::os::windows::{
 };
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Security::{
+    ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation,
+    Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+    CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid,
+    GetTokenInformation, INHERIT_ONLY_ACE, IsValidAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
+    SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+    WinCreatorOwnerRightsSid, WinLocalSystemSid,
+};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DELETE_CHILD,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_ID_INFO,
-    FILE_NAME_NORMALIZED, FILE_SHARE_READ, FILE_TYPE_DISK, FileIdInfo, GetDriveTypeW,
-    GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, ReOpenFile,
-    VOLUME_NAME_GUID,
+    FILE_NAME_NORMALIZED, FILE_SHARE_READ, FILE_STANDARD_INFO, FILE_TYPE_DISK,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo, FileBasicInfo,
+    FileIdInfo, FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, GetFileType,
+    GetFinalPathNameByHandleW, ReOpenFile, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+#[cfg(windows)]
+use windows_sys::Win32::System::{
+    SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, ACCESS_DENIED_CALLBACK_ACE_TYPE,
+        ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_DENIED_OBJECT_ACE_TYPE,
+    },
+    Threading::{GetCurrentProcess, OpenProcessToken},
+};
 
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 32 * 1024;
@@ -87,7 +111,7 @@ pub struct ExecutablePathBinding([u8; 32]);
 /// This is deliberately separate from both artifact identity and the final
 /// diagnostic path. Two discovery paths that reach the same inode therefore
 /// retain distinct evidence.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DiscoveryChainBinding([u8; 32]);
 
@@ -238,10 +262,13 @@ pub struct ExecutableCandidate {
 /// raw descriptors nor launch authority. Future execution code must consume a
 /// higher-level authority derived from this value after provenance and Git
 /// probes have also succeeded.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct DiscoveryInspection {
     candidate: ExecutableCandidate,
+    #[cfg(unix)]
     chain: resolver_unix::UnixResolutionLeaseSet,
+    #[cfg(windows)]
+    chain: resolver_windows::WindowsResolutionLeaseSet,
 }
 
 /// GUS-owned filesystem objects that may never be selected as real Git.
@@ -470,14 +497,14 @@ impl fmt::Debug for ExecutableCandidate {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl fmt::Debug for DiscoveryChainBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("DiscoveryChainBinding([REDACTED])")
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl fmt::Debug for DiscoveryInspection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("DiscoveryInspection([REDACTED])")
@@ -554,6 +581,78 @@ impl DiscoveryInspection {
     }
 }
 
+#[cfg(windows)]
+impl DiscoveryInspection {
+    /// Resolves and inspects one absolute drive-letter Windows path without
+    /// invoking it or reopening its final file between resolution and
+    /// inspection.
+    ///
+    /// Supported symbolic-link and junction reparse points are opened as
+    /// objects, retained, parsed with bounded UTF-16 rules, and replayed from
+    /// the original namespace. Unknown, remote, device-namespace, cross-volume,
+    /// and non-name-surrogate reparse points fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded, fail-closed discovery or artifact-inspection error.
+    pub fn inspect(
+        path: &Path,
+        exclusions: &ExecutableExclusionSet,
+    ) -> Result<Self, RealGitArtifactError> {
+        let resolved = resolver_windows::resolve(path)?;
+        resolved.chain.revalidate(&resolved.final_snapshot)?;
+        #[cfg(test)]
+        resolver_windows::run_test_barrier(
+            resolver_windows::ResolverTestStage::BeforeInspection,
+            path.as_os_str(),
+        );
+        let candidate = ExecutableCandidate::inspect_opened(resolved.opened, exclusions)?;
+        #[cfg(test)]
+        resolver_windows::run_test_barrier(
+            resolver_windows::ResolverTestStage::AfterInspection,
+            path.as_os_str(),
+        );
+        resolved.chain.revalidate(&candidate.snapshot)?;
+        Ok(Self {
+            candidate,
+            chain: resolved.chain,
+        })
+    }
+
+    /// Returns the inspection-only artifact evidence.
+    #[must_use]
+    pub const fn candidate(&self) -> &ExecutableCandidate {
+        &self.candidate
+    }
+
+    /// Returns the opaque binding to the complete ordered discovery chain.
+    #[must_use]
+    pub const fn chain_binding(&self) -> DiscoveryChainBinding {
+        self.chain.binding()
+    }
+
+    /// Revalidates retained reparse/component leases, the original namespace,
+    /// artifact bytes, and the exact exclusion snapshot.
+    ///
+    /// This remains inspection evidence only and grants no launch authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns fail-closed if any discovery binding, artifact, ACL, or
+    /// exclusion observation changed.
+    pub fn revalidate(
+        &self,
+        exclusions: &ExecutableExclusionSet,
+    ) -> Result<(), RealGitArtifactError> {
+        self.chain.revalidate(&self.candidate.snapshot)?;
+        self.candidate.reinspect_retained()?;
+        if !self.candidate.matches_exclusion_snapshot(exclusions)? {
+            return Err(RealGitArtifactError::ExclusionSnapshotStale);
+        }
+        self.chain.revalidate(&self.candidate.snapshot)
+    }
+}
+
 impl ExecutableCandidate {
     /// Opens and inspects an already-resolved absolute native executable
     /// without invoking it.
@@ -575,8 +674,8 @@ impl ExecutableCandidate {
     ///
     /// Returns a fail-closed classification or the underlying bounded I/O
     /// error kind.
-    #[cfg(windows)]
-    pub fn inspect_resolved(
+    #[cfg(all(windows, test))]
+    pub(crate) fn inspect_resolved(
         path: &Path,
         exclusions: &ExecutableExclusionSet,
     ) -> Result<Self, RealGitArtifactError> {
@@ -733,8 +832,14 @@ pub enum RealGitArtifactError {
     SymbolicLinkPolicyDenied,
     #[error("Windows reparse points are unsupported in real Git candidate paths")]
     ReparsePointUnsupported,
+    #[error("the real Git discovery path contains a Windows reparse-point loop")]
+    ReparsePointLoop,
+    #[error("the real Git discovery path contains an invalid Windows reparse point")]
+    InvalidReparsePoint,
     #[error("remote and non-fixed Windows volumes are unsupported for real Git")]
     RemotePathUnsupported,
+    #[error("the Windows filesystem lacks the required NTFS identity and ACL semantics")]
+    WindowsFilesystemUnsupported,
     #[error("Windows requires a trusted pre-launch current-image lease")]
     CurrentImageEvidenceRequired,
     #[error("failed to inspect the real Git candidate: {kind:?}")]
@@ -1131,6 +1236,424 @@ fn windows_file_key(file: &File) -> Result<NativeFileKey, RealGitArtifactError> 
         volume_serial: identity.VolumeSerialNumber,
         file_id: identity.FileId.Identifier,
     })
+}
+
+#[cfg(windows)]
+fn windows_file_information<T: Default>(
+    file: &File,
+    class: i32,
+) -> Result<T, RealGitArtifactError> {
+    let mut information = T::default();
+    // SAFETY: the handle is a live disk-file handle and `information` is
+    // writable for exactly one value of the class-selected output type.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            class,
+            (&raw mut information).cast::<c_void>(),
+            u32::try_from(size_of::<T>()).map_err(|_| RealGitArtifactError::UnsafePath)?,
+        )
+    } == 0
+    {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    Ok(information)
+}
+
+#[cfg(windows)]
+struct WindowsOwnedHandle(HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsOwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper is created only from a successful Win32 call
+        // returning one owned kernel handle.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct LocalSecurityDescriptor(*mut c_void);
+
+#[cfg(windows)]
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsSecurityTrust {
+    owner: Vec<u8>,
+    current: Vec<u8>,
+    system: Vec<u8>,
+    administrators: Vec<u8>,
+    creator_owner: Vec<u8>,
+    trusted_installer: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl WindowsSecurityTrust {
+    fn capture(owner: *mut c_void) -> Result<Self, RealGitArtifactError> {
+        let trust = Self {
+            owner: copy_windows_sid(owner, 8)?,
+            current: current_process_user_sid()?,
+            system: well_known_sid(WinLocalSystemSid)?,
+            administrators: well_known_sid(WinBuiltinAdministratorsSid)?,
+            creator_owner: well_known_sid(WinCreatorOwnerRightsSid)?,
+            trusted_installer: trusted_installer_sid(),
+        };
+        if !sid_is_one_of(
+            &trust.owner,
+            [
+                trust.current.as_slice(),
+                trust.system.as_slice(),
+                trust.administrators.as_slice(),
+                trust.trusted_installer.as_slice(),
+            ],
+        ) {
+            return Err(RealGitArtifactError::UnsafePath);
+        }
+        Ok(trust)
+    }
+
+    fn writer_is_trusted(&self, sid: &[u8]) -> bool {
+        sid_is_one_of(
+            sid,
+            [
+                self.owner.as_slice(),
+                self.current.as_slice(),
+                self.system.as_slice(),
+                self.administrators.as_slice(),
+                self.trusted_installer.as_slice(),
+                self.creator_owner.as_slice(),
+            ],
+        )
+    }
+}
+
+#[cfg(windows)]
+fn windows_security_binding(file: &File) -> Result<[u8; 32], RealGitArtifactError> {
+    let mut owner = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: every output pointer is writable and the file was opened with
+    // FILE_GENERIC_READ, which includes READ_CONTROL.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            ptr::null_mut(),
+            &raw mut dacl,
+            ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() || dacl.is_null() {
+        if !descriptor.is_null() {
+            drop(LocalSecurityDescriptor(descriptor));
+        }
+        return Err(if status == ERROR_SUCCESS {
+            RealGitArtifactError::UnsafePath
+        } else {
+            io_error(io::Error::from_raw_os_error(
+                i32::try_from(status).unwrap_or(i32::MAX),
+            ))
+        });
+    }
+    let _descriptor = LocalSecurityDescriptor(descriptor);
+    let trust = WindowsSecurityTrust::capture(owner)?;
+    // SAFETY: `dacl` points inside the live security descriptor.
+    if unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    windows_dacl_binding(dacl, &trust)
+}
+
+#[cfg(windows)]
+fn windows_dacl_binding(
+    dacl: *mut windows_sys::Win32::Security::ACL,
+    trust: &WindowsSecurityTrust,
+) -> Result<[u8; 32], RealGitArtifactError> {
+    const MAX_ACL_BYTES: usize = 64 * 1024;
+
+    let mut information = ACL_SIZE_INFORMATION::default();
+    // SAFETY: the DACL remains live and `information` is exact writable output.
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&raw mut information).cast::<c_void>(),
+            u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).expect("ACL info size fits u32"),
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    let bytes_in_use =
+        usize::try_from(information.AclBytesInUse).map_err(|_| RealGitArtifactError::UnsafePath)?;
+    if bytes_in_use < size_of::<windows_sys::Win32::Security::ACL>() || bytes_in_use > MAX_ACL_BYTES
+    {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"gus.platform.windows-security.v1\0");
+    update_length_prefixed_bytes(&mut digest, &trust.owner);
+    digest.update(information.AceCount.to_le_bytes());
+    let dacl_start = dacl as usize;
+    let dacl_end = dacl_start
+        .checked_add(bytes_in_use)
+        .ok_or(RealGitArtifactError::UnsafePath)?;
+    for index in 0..information.AceCount {
+        let (header, raw) = bounded_windows_ace(dacl, index, dacl_start, dacl_end)?;
+        update_length_prefixed_bytes(&mut digest, &raw);
+        validate_windows_ace(header, &raw, trust)?;
+    }
+    Ok(digest.finalize().into())
+}
+
+#[cfg(windows)]
+fn bounded_windows_ace(
+    dacl: *mut windows_sys::Win32::Security::ACL,
+    index: u32,
+    dacl_start: usize,
+    dacl_end: usize,
+) -> Result<(ACE_HEADER, Vec<u8>), RealGitArtifactError> {
+    let mut raw_ace = ptr::null_mut();
+    // SAFETY: `index` is bounded by the queried ACE count and the output
+    // pointer is writable.
+    if unsafe { GetAce(dacl, index, &raw mut raw_ace) } == 0 || raw_ace.is_null() {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    let ace_start = raw_ace as usize;
+    if ace_start < dacl_start
+        || ace_start
+            .checked_add(size_of::<ACE_HEADER>())
+            .is_none_or(|end| end > dacl_end)
+    {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    // SAFETY: the pointer range covers one ACE_HEADER; use unaligned read so
+    // validation does not depend on ACL allocation alignment.
+    let header = unsafe { ptr::read_unaligned(raw_ace.cast::<ACE_HEADER>()) };
+    let ace_size = usize::from(header.AceSize);
+    if ace_size < size_of::<ACE_HEADER>()
+        || ace_start
+            .checked_add(ace_size)
+            .is_none_or(|end| end > dacl_end)
+    {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    // SAFETY: the complete ACE was bounded inside the valid DACL.
+    let raw = unsafe { std::slice::from_raw_parts(raw_ace.cast::<u8>(), ace_size) }.to_vec();
+    Ok((header, raw))
+}
+
+#[cfg(windows)]
+fn validate_windows_ace(
+    header: ACE_HEADER,
+    raw: &[u8],
+    trust: &WindowsSecurityTrust,
+) -> Result<(), RealGitArtifactError> {
+    let ace_type = u32::from(header.AceType);
+    if matches!(
+        ace_type,
+        ACCESS_DENIED_ACE_TYPE
+            | ACCESS_DENIED_OBJECT_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE
+    ) {
+        return Ok(());
+    }
+    if ace_type != ACCESS_ALLOWED_ACE_TYPE {
+        // Object-specific and callback allow ACEs require conditional or
+        // GUID-aware evaluation. MVP rejects them rather than approximating.
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    if raw.len() < 16 || u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 {
+        return if raw.len() < 16 {
+            Err(RealGitArtifactError::UnsafePath)
+        } else {
+            Ok(())
+        };
+    }
+    let mask = u32::from_le_bytes(
+        raw[4..8]
+            .try_into()
+            .expect("bounded access-allowed ACE mask"),
+    );
+    let sid = copy_sid_from_ace(&raw[8..], 8)?;
+    let dangerous = FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_DELETE_CHILD
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER
+        | GENERIC_WRITE
+        | GENERIC_ALL;
+    if mask & dangerous != 0 && !trust.writer_is_trusted(&sid) {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_process_user_sid() -> Result<Vec<u8>, RealGitArtifactError> {
+    const MAX_TOKEN_USER_BYTES: usize = 4096;
+    let mut token = ptr::null_mut();
+    // SAFETY: `token` is writable and the pseudo process handle is always live.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    let token = WindowsOwnedHandle(token);
+    let mut required = 0_u32;
+    // SAFETY: null/zero is the documented size query and `required` is writable.
+    let first =
+        unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &raw mut required) };
+    // SAFETY: GetLastError has no preconditions and is sampled immediately
+    // after the size query.
+    let first_error = unsafe { GetLastError() };
+    if first != 0 || first_error != ERROR_INSUFFICIENT_BUFFER || required == 0 {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    let required = usize::try_from(required).map_err(|_| RealGitArtifactError::UnsafePath)?;
+    if required > MAX_TOKEN_USER_BYTES || required < size_of::<TOKEN_USER>() {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    let mut buffer = vec![0_u8; required];
+    let mut returned = 0_u32;
+    // SAFETY: the token remains live and the byte buffer/length are writable.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            u32::try_from(buffer.len()).expect("bounded token buffer"),
+            &raw mut returned,
+        )
+    } == 0
+        || usize::try_from(returned).ok() != Some(buffer.len())
+    {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    // Vec alignment is not guaranteed, so read the fixed TOKEN_USER prefix
+    // unaligned before validating the embedded pointer against the buffer.
+    let user = unsafe { ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    let start = buffer.as_ptr() as usize;
+    let end = start
+        .checked_add(buffer.len())
+        .ok_or(RealGitArtifactError::UnsafePath)?;
+    let sid = user.User.Sid as usize;
+    if sid < start
+        || sid
+            .checked_add(8)
+            .is_none_or(|minimum_end| minimum_end > end)
+    {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    let sid_bytes = copy_windows_sid(user.User.Sid, 8)?;
+    if sid
+        .checked_add(sid_bytes.len())
+        .is_none_or(|sid_end| sid_end > end)
+    {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    Ok(sid_bytes)
+}
+
+#[cfg(windows)]
+fn copy_windows_sid(sid: *mut c_void, minimum: usize) -> Result<Vec<u8>, RealGitArtifactError> {
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    // SAFETY: IsValidSid accepted the SID pointer.
+    let length = usize::try_from(unsafe { GetLengthSid(sid) })
+        .map_err(|_| RealGitArtifactError::UnsafePath)?;
+    if length < minimum || length > SECURITY_MAX_SID_SIZE as usize {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    // SAFETY: GetLengthSid returned the validated SID extent.
+    Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec())
+}
+
+#[cfg(windows)]
+fn copy_sid_from_ace(bytes: &[u8], minimum: usize) -> Result<Vec<u8>, RealGitArtifactError> {
+    if bytes.len() < minimum || bytes[0] != 1 {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    let length = minimum
+        .checked_add(usize::from(bytes[1]).saturating_mul(size_of::<u32>()))
+        .ok_or(RealGitArtifactError::UnsafePath)?;
+    if length > bytes.len() || length > SECURITY_MAX_SID_SIZE as usize {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    let sid = &bytes[..length];
+    // SAFETY: the slice covers the complete binary SID encoded by its header.
+    if unsafe { IsValidSid(sid.as_ptr().cast_mut().cast::<c_void>()) } == 0 {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    Ok(sid.to_vec())
+}
+
+#[cfg(windows)]
+fn well_known_sid(kind: i32) -> Result<Vec<u8>, RealGitArtifactError> {
+    let mut sid = vec![0_u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut length = u32::try_from(sid.len()).expect("maximum SID size fits u32");
+    // SAFETY: the output buffer and its in/out length are writable.
+    if unsafe {
+        CreateWellKnownSid(
+            kind,
+            ptr::null_mut(),
+            sid.as_mut_ptr().cast::<c_void>(),
+            &raw mut length,
+        )
+    } == 0
+    {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    let length = usize::try_from(length).map_err(|_| RealGitArtifactError::UnsafePath)?;
+    if length < 8 || length > sid.len() {
+        return Err(RealGitArtifactError::UnsafePath);
+    }
+    sid.truncate(length);
+    Ok(sid)
+}
+
+#[cfg(windows)]
+fn trusted_installer_sid() -> Vec<u8> {
+    let mut sid = vec![1, 6, 0, 0, 0, 0, 0, 5];
+    for authority in [
+        80_u32,
+        956_008_885,
+        3_418_522_649,
+        1_831_038_044,
+        1_853_292_631,
+        2_271_478_464,
+    ] {
+        sid.extend_from_slice(&authority.to_le_bytes());
+    }
+    sid
+}
+
+#[cfg(windows)]
+fn sid_is_one_of<'a>(sid: &[u8], trusted: impl IntoIterator<Item = &'a [u8]>) -> bool {
+    trusted.into_iter().any(|candidate| sid == candidate)
+}
+
+#[cfg(windows)]
+fn update_length_prefixed_bytes(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
 }
 
 #[cfg(windows)]
@@ -2107,22 +2630,49 @@ struct NativeFileSnapshot {
     file_id: [u8; 16],
     final_path_digest: [u8; 32],
     attributes: u32,
+    reparse_tag: u32,
+    creation_time: i64,
+    last_access_time: i64,
+    change_time: i64,
+    allocation_size: i64,
     size: u64,
     last_write: u64,
+    number_of_links: u32,
+    delete_pending: bool,
+    security_digest: [u8; 32],
 }
 
 #[cfg(windows)]
 impl NativeFileSnapshot {
     fn capture(file: &File) -> Result<Self, RealGitArtifactError> {
-        let metadata = file.metadata().map_err(io_error)?;
         let identity = windows_file_key(file)?;
+        let basic = windows_file_information::<FILE_BASIC_INFO>(file, FileBasicInfo)?;
+        let standard = windows_file_information::<FILE_STANDARD_INFO>(file, FileStandardInfo)?;
+        let tag = windows_file_information::<FILE_ATTRIBUTE_TAG_INFO>(file, FileAttributeTagInfo)?;
+        if basic.FileAttributes != tag.FileAttributes
+            || standard.Directory != (basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0)
+            || standard.EndOfFile < 0
+            || standard.AllocationSize < 0
+            || standard.DeletePending
+        {
+            return Err(RealGitArtifactError::UnsafePath);
+        }
         Ok(Self {
             volume_serial: identity.volume_serial,
             file_id: identity.file_id,
             final_path_digest: final_windows_path_digest(file)?,
-            attributes: metadata.file_attributes(),
-            size: metadata.file_size(),
-            last_write: metadata.last_write_time(),
+            attributes: basic.FileAttributes,
+            reparse_tag: tag.ReparseTag,
+            creation_time: basic.CreationTime,
+            last_access_time: basic.LastAccessTime,
+            change_time: basic.ChangeTime,
+            allocation_size: standard.AllocationSize,
+            size: u64::try_from(standard.EndOfFile)
+                .map_err(|_| RealGitArtifactError::UnsafePath)?,
+            last_write: u64::from_ne_bytes(basic.LastWriteTime.to_ne_bytes()),
+            number_of_links: standard.NumberOfLinks,
+            delete_pending: standard.DeletePending,
+            security_digest: windows_security_binding(file)?,
         })
     }
 
@@ -2173,6 +2723,10 @@ impl NativeFileSnapshot {
         self == *other
     }
 
+    fn same_discovery_artifact(self, other: &Self) -> bool {
+        self == *other
+    }
+
     fn same_owned_directory(self, other: &Self) -> bool {
         self.same_file(other) && self.is_directory() && self.attributes == other.attributes
     }
@@ -2183,8 +2737,16 @@ impl NativeFileSnapshot {
         digest.update(self.volume_serial.to_le_bytes());
         digest.update(self.file_id);
         digest.update(self.attributes.to_le_bytes());
+        digest.update(self.reparse_tag.to_le_bytes());
+        digest.update(self.creation_time.to_le_bytes());
+        digest.update(self.last_access_time.to_le_bytes());
+        digest.update(self.change_time.to_le_bytes());
+        digest.update(self.allocation_size.to_le_bytes());
         digest.update(self.size.to_le_bytes());
         digest.update(self.last_write.to_le_bytes());
+        digest.update(self.number_of_links.to_le_bytes());
+        digest.update([u8::from(self.delete_pending)]);
+        digest.update(self.security_digest);
         digest.update(content_digest);
         digest.finalize().into()
     }
@@ -2444,8 +3006,16 @@ mod tests {
             file_id: [2; 16],
             final_path_digest: [3; 32],
             attributes: FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
+            reparse_tag: 0xa000_000c,
+            creation_time: 0,
+            last_access_time: 0,
+            change_time: 0,
+            allocation_size: 0,
             size: 0,
             last_write: 0,
+            number_of_links: 1,
+            delete_pending: false,
+            security_digest: [4; 32],
         };
         assert_eq!(
             ExpectedFileKind::Directory
