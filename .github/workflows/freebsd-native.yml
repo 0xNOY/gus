@@ -44,6 +44,15 @@ jobs:
           prepare: |
             set -eu
             pkg install -y ca_root_nss curl git
+            pw useradd gusci -m -s /bin/sh
+
+            acl_md="$(mdconfig -a -t swap -s 256m)"
+            newfs -U "/dev/${acl_md}"
+            tunefs -a enable "/dev/${acl_md}"
+            mkdir -p /gus-ci-tmp
+            mount "/dev/${acl_md}" /gus-ci-tmp
+            chown gusci:gusci /gus-ci-tmp
+            chmod 700 /gus-ci-tmp
 
             rustup_url="https://static.rust-lang.org/rustup/dist/x86_64-unknown-freebsd/rustup-init"
             curl --fail --location --retry 5 --proto '=https' --tlsv1.2 \
@@ -55,18 +64,12 @@ jobs:
             actual_rustup_sha="$(sha256 -q /tmp/rustup-init)"
             test "${actual_rustup_sha}" = "${expected_rustup_sha}"
 
-            chmod 700 /tmp/rustup-init
-            /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
-            export PATH="${HOME}/.cargo/bin:${PATH}"
-            rustup toolchain install stable --profile minimal \
-              --component clippy --component rustfmt
-            rustup toolchain install 1.85.0 --profile minimal
+            install -o gusci -g gusci -m 700 /tmp/rustup-init /home/gusci/rustup-init
+            su -l gusci -c '/home/gusci/rustup-init -y --no-modify-path --profile minimal --default-toolchain none'
+            su -l gusci -c '/home/gusci/.cargo/bin/rustup toolchain install stable --profile minimal --component clippy --component rustfmt'
+            su -l gusci -c '/home/gusci/.cargo/bin/rustup toolchain install 1.85.0 --profile minimal'
           run: |
             set -eu
-            export PATH="${HOME}/.cargo/bin:${PATH}"
-            export CARGO_TERM_COLOR=always
-            export RUST_BACKTRACE=1
-
             expected_release="${{ matrix.release }}"
             kernel_release="$(freebsd-version -k)"
             userland_release="$(freebsd-version -u)"
@@ -88,8 +91,22 @@ jobs:
             freebsd-version -ku
             uname -a
             sysctl kern.osreldate
-            cargo +stable fmt --all -- --check
-            cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
-            cargo +stable test --workspace --all-targets --all-features
-            cargo +1.85.0 check --workspace --all-targets --all-features
-            RUSTDOCFLAGS="-D warnings" cargo +stable doc --workspace --all-features --no-deps
+            test "$(id -u)" -eq 0
+            mount | grep 'on /gus-ci-tmp '
+
+            workspace="$(pwd)"
+            chown -R gusci:gusci "${workspace}"
+            su -l gusci -c "
+              set -eu
+              cd '${workspace}'
+              test \"\$(id -u)\" -ne 0
+              export PATH='/home/gusci/.cargo/bin:/usr/local/bin:/usr/bin:/bin'
+              export CARGO_TERM_COLOR=always
+              export RUST_BACKTRACE=1
+              export TMPDIR='/gus-ci-tmp'
+              cargo +stable fmt --all -- --check
+              cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+              cargo +stable test --workspace --all-targets --all-features
+              cargo +1.85.0 check --workspace --all-targets --all-features
+              RUSTDOCFLAGS='-D warnings' cargo +stable doc --workspace --all-features --no-deps
+            "
