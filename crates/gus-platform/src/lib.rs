@@ -61,6 +61,8 @@ pub use real_git::{
     CurrentExecutableEvidence, ExclusionSnapshotId, ExecutableCandidate, ExecutableExclusionSet,
     ExecutableIdentity, ExecutablePathBinding, RealGitArtifactError,
 };
+#[cfg(unix)]
+pub use real_git::{DiscoveryChainBinding, DiscoveryInspection};
 
 const IDENTITY_DIGEST_BYTES: usize = 32;
 

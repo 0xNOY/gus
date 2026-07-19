@@ -6,6 +6,9 @@ use std::{
 };
 
 #[cfg(unix)]
+mod resolver_unix;
+
+#[cfg(unix)]
 use std::ffi::{CString, OsString};
 #[cfg(any(target_os = "linux", windows))]
 use std::fs::OpenOptions;
@@ -51,6 +54,7 @@ const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_PATH_COMPONENTS: usize = 1024;
 const INSPECTION_BUFFER_BYTES: usize = 16 * 1024;
 const NATIVE_HEADER_BYTES: usize = 4096;
+const MAX_GUS_OWNED_PATHS: usize = 32;
 #[cfg(target_os = "macos")]
 const MAX_LOAD_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 
@@ -77,6 +81,15 @@ pub struct ExclusionSnapshotId([u8; 32]);
 /// may have several hard-link paths.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExecutablePathBinding([u8; 32]);
+
+/// Opaque binding to the complete discovery path and symbolic-link chain.
+///
+/// This is deliberately separate from both artifact identity and the final
+/// diagnostic path. Two discovery paths that reach the same inode therefore
+/// retain distinct evidence.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiscoveryChainBinding([u8; 32]);
 
 /// Kernel-backed identity of the executable containing this inspector.
 ///
@@ -218,6 +231,19 @@ pub struct ExecutableCandidate {
     manifest_generation: u64,
 }
 
+/// An inspected executable together with every lease needed to revalidate its
+/// Unix discovery chain.
+///
+/// The type has no public constructor, is not cloneable, and exposes neither
+/// raw descriptors nor launch authority. Future execution code must consume a
+/// higher-level authority derived from this value after provenance and Git
+/// probes have also succeeded.
+#[cfg(unix)]
+pub struct DiscoveryInspection {
+    candidate: ExecutableCandidate,
+    chain: resolver_unix::UnixResolutionLeaseSet,
+}
+
 /// GUS-owned filesystem objects that may never be selected as real Git.
 ///
 /// Construction always records the currently running image and requires one
@@ -336,6 +362,14 @@ impl ExecutableExclusionSet {
     /// Returns an error when the path cannot be inspected safely or is not a
     /// directory.
     pub fn add_owned_root(&mut self, path: &Path) -> Result<(), RealGitArtifactError> {
+        if self
+            .owned_roots
+            .len()
+            .saturating_add(self.owned_artifacts.len())
+            >= MAX_GUS_OWNED_PATHS
+        {
+            return Err(RealGitArtifactError::PathLimitExceeded);
+        }
         self.owned_roots
             .push(OwnedPath::inspect(path, ExpectedFileKind::Directory)?);
         Ok(())
@@ -348,6 +382,14 @@ impl ExecutableExclusionSet {
     /// Returns an error when the path cannot be inspected safely or is not a
     /// regular file.
     pub fn add_owned_artifact(&mut self, path: &Path) -> Result<(), RealGitArtifactError> {
+        if self
+            .owned_roots
+            .len()
+            .saturating_add(self.owned_artifacts.len())
+            >= MAX_GUS_OWNED_PATHS
+        {
+            return Err(RealGitArtifactError::PathLimitExceeded);
+        }
         self.owned_artifacts
             .push(OwnedPath::inspect(path, ExpectedFileKind::RegularFile)?);
         Ok(())
@@ -428,6 +470,90 @@ impl fmt::Debug for ExecutableCandidate {
     }
 }
 
+#[cfg(unix)]
+impl fmt::Debug for DiscoveryChainBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DiscoveryChainBinding([REDACTED])")
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for DiscoveryInspection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DiscoveryInspection([REDACTED])")
+    }
+}
+
+#[cfg(unix)]
+impl DiscoveryInspection {
+    /// Resolves and inspects an absolute Unix discovery path without invoking
+    /// it or reopening its final file by pathname.
+    ///
+    /// Symbolic links are resolved component by component with retained
+    /// directory and link leases. The original namespace is replayed before
+    /// and after artifact inspection; a changed binding fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded, fail-closed discovery or artifact-inspection error.
+    pub fn inspect(
+        path: &Path,
+        exclusions: &ExecutableExclusionSet,
+    ) -> Result<Self, RealGitArtifactError> {
+        let resolved = resolver_unix::resolve(path)?;
+        resolved.chain.revalidate(&resolved.final_key)?;
+        #[cfg(test)]
+        resolver_unix::run_test_barrier(
+            resolver_unix::ResolverTestStage::BeforeInspection,
+            path.as_os_str(),
+        );
+        let candidate = ExecutableCandidate::inspect_opened(resolved.opened, exclusions)?;
+        #[cfg(test)]
+        resolver_unix::run_test_barrier(
+            resolver_unix::ResolverTestStage::AfterInspection,
+            path.as_os_str(),
+        );
+        resolved.chain.revalidate(&candidate.snapshot.file_key())?;
+        Ok(Self {
+            candidate,
+            chain: resolved.chain,
+        })
+    }
+
+    /// Returns the inspection-only artifact evidence.
+    #[must_use]
+    pub const fn candidate(&self) -> &ExecutableCandidate {
+        &self.candidate
+    }
+
+    /// Returns the opaque binding to the complete ordered discovery chain.
+    #[must_use]
+    pub const fn chain_binding(&self) -> DiscoveryChainBinding {
+        self.chain.binding()
+    }
+
+    /// Revalidates retained leases, the current root-to-target namespace, the
+    /// artifact bytes, and the exclusion snapshot.
+    ///
+    /// This remains inspection evidence only and grants no launch authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns fail-closed if any discovery binding, artifact, or exclusion
+    /// observation changed.
+    pub fn revalidate(
+        &self,
+        exclusions: &ExecutableExclusionSet,
+    ) -> Result<(), RealGitArtifactError> {
+        self.chain.revalidate(&self.candidate.snapshot.file_key())?;
+        self.candidate.reinspect_retained()?;
+        if !self.candidate.matches_exclusion_snapshot(exclusions)? {
+            return Err(RealGitArtifactError::ExclusionSnapshotStale);
+        }
+        self.chain.revalidate(&self.candidate.snapshot.file_key())
+    }
+}
+
 impl ExecutableCandidate {
     /// Opens and inspects an already-resolved absolute native executable
     /// without invoking it.
@@ -440,16 +566,40 @@ impl ExecutableCandidate {
     /// owned artifacts, scripts, oversized files, and changing files fail
     /// closed.
     ///
+    /// On Windows this is a temporary inspection-only API until the sealed
+    /// reparse resolver is implemented. Its result must never be accepted as
+    /// provenance, probe, or launch authority, and the method will become
+    /// crate-private when the Windows `DiscoveryInspection` backend lands.
+    ///
     /// # Errors
     ///
     /// Returns a fail-closed classification or the underlying bounded I/O
     /// error kind.
+    #[cfg(windows)]
     pub fn inspect_resolved(
         path: &Path,
         exclusions: &ExecutableExclusionSet,
     ) -> Result<Self, RealGitArtifactError> {
         exclusions.validate()?;
         let opened = open_path_safely(path, ExpectedFileKind::RegularFile)?;
+        Self::inspect_opened(opened, exclusions)
+    }
+
+    #[cfg(all(unix, test))]
+    pub(crate) fn inspect_resolved(
+        path: &Path,
+        exclusions: &ExecutableExclusionSet,
+    ) -> Result<Self, RealGitArtifactError> {
+        exclusions.validate()?;
+        let opened = open_path_safely(path, ExpectedFileKind::RegularFile)?;
+        Self::inspect_opened(opened, exclusions)
+    }
+
+    fn inspect_opened(
+        opened: SafelyOpenedPath,
+        exclusions: &ExecutableExclusionSet,
+    ) -> Result<Self, RealGitArtifactError> {
+        exclusions.validate()?;
         let inspected_path = opened.normalized_path;
         let lease = opened.lease;
         let snapshot = NativeFileSnapshot::capture(&lease)?;
@@ -571,6 +721,16 @@ pub enum RealGitArtifactError {
     PathLimitExceeded,
     #[error("symbolic links are unsupported in real Git candidate paths")]
     SymbolicLinkUnsupported,
+    #[error("the real Git discovery path contains a symbolic-link loop")]
+    SymbolicLinkLoop,
+    #[error("the real Git discovery path contains an invalid symbolic link")]
+    InvalidSymbolicLink,
+    #[error("the real Git discovery chain changed during verification")]
+    DiscoveryChainStale,
+    #[error(
+        "symbolic-link resolution is forbidden by the current filesystem, mount, or process policy"
+    )]
+    SymbolicLinkPolicyDenied,
     #[error("Windows reparse points are unsupported in real Git candidate paths")]
     ReparsePointUnsupported,
     #[error("remote and non-fixed Windows volumes are unsupported for real Git")]
@@ -1079,7 +1239,8 @@ struct MacOsProcessRegionWithPath {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn _dyld_get_image_header(image_index: u32) -> *const core::ffi::c_void;
+    #[link_name = "_dyld_get_image_header"]
+    fn dyld_get_image_header(image_index: u32) -> *const core::ffi::c_void;
 }
 
 #[cfg(target_os = "macos")]
@@ -1090,7 +1251,7 @@ fn current_image_key() -> Result<NativeFileKey, RealGitArtifactError> {
     let size = std::mem::size_of::<MacOsProcessRegionWithPath>();
     // SAFETY: dyld image zero is the main executable. Unlike a Rust function
     // address, this cannot accidentally anchor a future dylib build.
-    let main_header = unsafe { _dyld_get_image_header(0) };
+    let main_header = unsafe { dyld_get_image_header(0) };
     if main_header.is_null() {
         return Err(RealGitArtifactError::UnsafePath);
     }
@@ -1880,6 +2041,12 @@ impl NativeFileSnapshot {
             && self.size == other.size
             && self.modified_seconds == other.modified_seconds
             && self.modified_nanoseconds == other.modified_nanoseconds
+    }
+
+    fn same_discovery_artifact(self, other: &Self) -> bool {
+        self.same_retained_artifact(other)
+            && self.changed_seconds == other.changed_seconds
+            && self.changed_nanoseconds == other.changed_nanoseconds
     }
 
     fn same_owned_directory(self, other: &Self) -> bool {
