@@ -48,9 +48,9 @@ use windows_sys::Win32::Security::{
     ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation,
     Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid,
-    GetTokenInformation, INHERIT_ONLY_ACE, IsValidAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
-    SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
-    WinCreatorOwnerRightsSid, WinLocalSystemSid,
+    GetSecurityDescriptorControl, GetTokenInformation, INHERIT_ONLY_ACE, IsValidAcl, IsValidSid,
+    OWNER_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinLocalSystemSid,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -1392,7 +1392,26 @@ fn windows_security_binding(file: &File) -> Result<[u8; 32], RealGitArtifactErro
     }
     let attributes =
         windows_file_information::<FILE_BASIC_INFO>(file, FileBasicInfo)?.FileAttributes;
-    windows_dacl_binding(dacl, &trust, attributes)
+    let mut descriptor_control = 0_u16;
+    let mut descriptor_revision = 0_u32;
+    // SAFETY: `descriptor` remains live and both scalar outputs are writable.
+    if unsafe {
+        GetSecurityDescriptorControl(
+            descriptor,
+            &raw mut descriptor_control,
+            &raw mut descriptor_revision,
+        )
+    } == 0
+    {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    windows_dacl_binding(
+        dacl,
+        &trust,
+        attributes,
+        descriptor_control,
+        descriptor_revision,
+    )
 }
 
 #[cfg(windows)]
@@ -1400,6 +1419,8 @@ fn windows_dacl_binding(
     dacl: *mut windows_sys::Win32::Security::ACL,
     trust: &WindowsSecurityTrust,
     attributes: u32,
+    descriptor_control: u16,
+    descriptor_revision: u32,
 ) -> Result<[u8; 32], RealGitArtifactError> {
     const MAX_ACL_BYTES: usize = 64 * 1024;
 
@@ -1424,16 +1445,20 @@ fn windows_dacl_binding(
     }
 
     let mut digest = Sha256::new();
-    digest.update(b"gus.platform.windows-security.v1\0");
+    digest.update(b"gus.platform.windows-security.v2\0");
     update_length_prefixed_bytes(&mut digest, &trust.owner);
-    digest.update(information.AceCount.to_le_bytes());
+    digest.update(descriptor_control.to_le_bytes());
+    digest.update(descriptor_revision.to_le_bytes());
     let dacl_start = dacl as usize;
     let dacl_end = dacl_start
         .checked_add(bytes_in_use)
         .ok_or(RealGitArtifactError::UnsafePath)?;
+    // SAFETY: IsValidAcl accepted the DACL and GetAclInformation bounded its
+    // complete in-use extent before this slice is formed.
+    let raw_dacl = unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), bytes_in_use) };
+    update_length_prefixed_bytes(&mut digest, raw_dacl);
     for index in 0..information.AceCount {
         let (header, raw) = bounded_windows_ace(dacl, index, dacl_start, dacl_end)?;
-        update_length_prefixed_bytes(&mut digest, &raw);
         validate_windows_ace(header, &raw, trust, attributes)?;
     }
     Ok(digest.finalize().into())
