@@ -677,10 +677,10 @@ impl ExecutableCandidate {
     /// owned artifacts, scripts, oversized files, and changing files fail
     /// closed.
     ///
-    /// On Windows this is a temporary inspection-only API until the sealed
-    /// reparse resolver is implemented. Its result must never be accepted as
-    /// provenance, probe, or launch authority, and the method will become
-    /// crate-private when the Windows `DiscoveryInspection` backend lands.
+    /// On Windows this artifact-only entry point is test-private; production
+    /// discovery must use `DiscoveryInspection` so the sealed reparse chain is
+    /// retained and replayed. Its result must never be accepted as provenance,
+    /// probe, or launch authority.
     ///
     /// # Errors
     ///
