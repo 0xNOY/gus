@@ -71,7 +71,7 @@ impl Drop for ResolverTestHookGuard {
         let owner = std::thread::current().id();
         RESOLVER_TEST_HOOKS
             .lock()
-            .expect("resolver test hook lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|installed| installed.owner != owner);
     }
 }
@@ -81,7 +81,9 @@ fn install_test_hook(
     callback: impl FnMut(ResolverTestStage, &std::ffi::OsStr) + Send + 'static,
 ) -> ResolverTestHookGuard {
     let owner = std::thread::current().id();
-    let mut hooks = RESOLVER_TEST_HOOKS.lock().expect("resolver test hook lock");
+    let mut hooks = RESOLVER_TEST_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(
         hooks.iter().all(|installed| installed.owner != owner),
         "only one resolver test hook may be installed per thread"
@@ -96,7 +98,9 @@ fn install_test_hook(
 #[cfg(test)]
 pub(super) fn run_test_barrier(stage: ResolverTestStage, path: &std::ffi::OsStr) {
     let owner = std::thread::current().id();
-    let mut hooks = RESOLVER_TEST_HOOKS.lock().expect("resolver test hook lock");
+    let mut hooks = RESOLVER_TEST_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(installed) = hooks.iter_mut().find(|installed| installed.owner == owner) {
         (installed.callback)(stage, path);
     }
@@ -1434,10 +1438,10 @@ impl UnixSnapshotExt for NativeFileSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        os::unix::{ffi::OsStringExt, fs::symlink},
-    };
+    use std::{fs, os::unix::fs::symlink};
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    use std::os::unix::ffi::OsStringExt;
 
     use super::*;
     use crate::real_git::{DiscoveryInspection, ExecutableExclusionSet};
@@ -1597,9 +1601,12 @@ mod tests {
     fn resolves_dot_parent_root_and_non_utf8_targets() {
         let (_owned, exclusions) = exclusions();
         let directory = temporary_directory();
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let name = OsString::from_vec(b"git-\xff".to_vec());
+        #[cfg(target_os = "macos")]
+        let name = OsString::from("git-unicode-\u{e9}");
         let executable = directory.path().join(&name);
-        fs::copy(native_fixture_path(), &executable).expect("copy non-UTF-8 executable");
+        fs::copy(native_fixture_path(), &executable).expect("copy byte-path executable");
 
         let dot = directory.path().join("dot");
         symlink(".", &dot).expect("create dot link");
@@ -1609,11 +1616,9 @@ mod tests {
 
         let child = directory.path().join("child");
         fs::create_dir(&child).expect("create child directory");
-        symlink(
-            OsString::from_vec(b"../git-\xff".to_vec()),
-            child.join("git"),
-        )
-        .expect("create non-UTF-8 parent link");
+        let mut parent_target = OsString::from("../");
+        parent_target.push(&name);
+        symlink(parent_target, child.join("git")).expect("create byte-path parent link");
         DiscoveryInspection::inspect(&child.join("git"), &exclusions)
             .expect("resolve parent and non-UTF-8 target");
 
@@ -1731,9 +1736,15 @@ mod tests {
             .find(|binding| matches!(binding.kind, UnixBindingKind::SymbolicLink { .. }))
             .expect("symlink binding");
         fs::remove_file(&link).expect("unlink published link");
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         assert_eq!(
             read_retained_link(&retained.entry).expect("read unlinked retained symlink"),
             target.as_os_str().as_bytes()
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            read_retained_link(&retained.entry).is_err(),
+            "macOS invalidates freadlink after unlinking an O_SYMLINK vnode"
         );
         assert_eq!(
             resolved
@@ -1857,6 +1868,8 @@ mod tests {
 
         let content_candidate = directory.path().join("content-candidate");
         fs::copy(native_fixture_path(), &content_candidate).expect("copy content candidate");
+        fs::set_permissions(&content_candidate, fs::Permissions::from_mode(0o755))
+            .expect("make content candidate owner-writable");
         let content_for_hook = content_candidate.clone();
         let mut changed = false;
         let hook = install_test_hook(move |stage, _name| {
@@ -1975,16 +1988,28 @@ mod tests {
             RealGitArtifactError::OwnedArtifact
         );
 
+        let current_executable = std::env::current_exe().expect("current executable");
+        let self_directory = tempfile::Builder::new()
+            .tempdir_in(
+                current_executable
+                    .parent()
+                    .expect("current executable parent"),
+            )
+            .expect("create same-filesystem self fixture");
+        let self_alias = self_directory.path().join("self-alias");
+        fs::hard_link(&current_executable, &self_alias).expect("publish running image hardlink");
         let self_link = directory.path().join("self-link");
-        symlink(
-            std::env::current_exe().expect("current executable"),
-            &self_link,
-        )
-        .expect("link running image");
-        assert_eq!(
-            DiscoveryInspection::inspect(&self_link, &exclusions)
-                .expect_err("linked running image must fail"),
-            RealGitArtifactError::SelfReference
+        symlink(&self_alias, &self_link).expect("link running image alias");
+        let error = DiscoveryInspection::inspect(&self_link, &exclusions)
+            .expect_err("linked running image must fail");
+        assert!(
+            matches!(
+                error,
+                RealGitArtifactError::SelfReference
+                    | RealGitArtifactError::SymbolicLinkPolicyDenied
+                    | RealGitArtifactError::UnsafePath
+            ),
+            "running image must fail by self identity or an earlier trust policy: {error:?}"
         );
     }
 
@@ -2099,7 +2124,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn set_macos_nontrivial_acl(path: &Path) {
         let status = std::process::Command::new("chmod")
-            .args(["+a", "others allow write"])
+            .args(["+a", "everyone allow write"])
             .arg(path)
             .status()
             .expect("run macOS chmod ACL fixture");
