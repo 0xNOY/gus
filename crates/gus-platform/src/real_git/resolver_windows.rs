@@ -1091,6 +1091,7 @@ const fn is_separator(unit: u16) -> bool {
 mod tests {
     use std::{
         os::windows::fs::{symlink_dir, symlink_file},
+        process::Command,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1101,6 +1102,9 @@ mod tests {
     use crate::real_git::{
         CurrentExecutableEvidence, DiscoveryInspection, ExecutableExclusionSet,
         TrustedPrelaunchExecutableLease,
+    };
+    use windows_sys::Win32::Security::{
+        CheckTokenMembership, SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_WRITE,
@@ -1159,6 +1163,240 @@ mod tests {
         );
         assert_ne!(direct.chain_binding(), file.chain_binding());
         assert_ne!(file.chain_binding(), directory.chain_binding());
+    }
+
+    #[test]
+    fn resolves_absolute_multihop_links_and_a_real_junction() {
+        let (_owned, exclusions) = exclusion_fixture();
+        let directory = tempfile::tempdir().expect("create extended reparse fixture");
+        let target_directory = directory.path().join("target");
+        std::fs::create_dir(&target_directory).expect("create junction target directory");
+        let target = target_directory.join("git.exe");
+        std::fs::copy(native_fixture_path(), &target).expect("copy extended reparse target");
+
+        let absolute = directory.path().join("absolute.exe");
+        symlink_file(&target, &absolute).expect("create absolute file symlink");
+        let second = directory.path().join("second.exe");
+        symlink_file("target\\git.exe", &second).expect("create second symlink hop");
+        let first = directory.path().join("first.exe");
+        symlink_file("second.exe", &first).expect("create first symlink hop");
+
+        let junction = directory.path().join("junction");
+        let output = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target_directory)
+            .output()
+            .expect("run native junction creator");
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let direct = DiscoveryInspection::inspect(&target, &exclusions).expect("inspect direct");
+        let absolute =
+            DiscoveryInspection::inspect(&absolute, &exclusions).expect("inspect absolute link");
+        let multihop =
+            DiscoveryInspection::inspect(&first, &exclusions).expect("inspect multihop link");
+        let junction = DiscoveryInspection::inspect(&junction.join("git.exe"), &exclusions)
+            .expect("inspect junction path");
+        assert_eq!(
+            direct.candidate().identity(),
+            absolute.candidate().identity()
+        );
+        assert_eq!(
+            direct.candidate().identity(),
+            multihop.candidate().identity()
+        );
+        assert_eq!(
+            direct.candidate().identity(),
+            junction.candidate().identity()
+        );
+        assert_ne!(
+            direct.chain_binding().digest(),
+            junction.chain_binding().digest()
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_looping_and_cross_volume_symbolic_links() {
+        let (_owned, exclusions) = exclusion_fixture();
+        let directory = tempfile::tempdir().expect("create rejected reparse fixture");
+        let dangling = directory.path().join("dangling.exe");
+        symlink_file("missing.exe", &dangling).expect("create dangling symlink");
+        assert!(matches!(
+            DiscoveryInspection::inspect(&dangling, &exclusions),
+            Err(RealGitArtifactError::Io {
+                kind: io::ErrorKind::NotFound,
+                ..
+            })
+        ));
+
+        let first = directory.path().join("loop-a.exe");
+        let second = directory.path().join("loop-b.exe");
+        symlink_file("loop-b.exe", &first).expect("create first loop hop");
+        symlink_file("loop-a.exe", &second).expect("create second loop hop");
+        assert_eq!(
+            DiscoveryInspection::inspect(&first, &exclusions).expect_err("loop must fail"),
+            RealGitArtifactError::ReparsePointLoop
+        );
+
+        let current = std::env::current_exe().expect("current test executable");
+        if drive_of(&current) == drive_of(directory.path()) {
+            assert_ne!(
+                std::env::var_os("GITHUB_ACTIONS").as_deref(),
+                Some(OsStr::new("true")),
+                "Windows CI must provide distinct system and workspace volumes"
+            );
+        } else {
+            let cross_volume = directory.path().join("cross-volume.exe");
+            symlink_file(&current, &cross_volume).expect("create cross-volume symlink");
+            assert_eq!(
+                DiscoveryInspection::inspect(&cross_volume, &exclusions)
+                    .expect_err("cross-volume target must fail"),
+                RealGitArtifactError::RemotePathUnsupported
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_subst_drive_aliases() {
+        let (_owned, exclusions) = exclusion_fixture();
+        let directory = tempfile::tempdir().expect("create SUBST fixture");
+        let target = directory.path().join("git.exe");
+        std::fs::copy(native_fixture_path(), &target).expect("copy SUBST target");
+        let drive = unused_drive_letter().expect("find an unused drive letter");
+        let drive_name = format!("{drive}:");
+        let output = Command::new("subst.exe")
+            .arg(&drive_name)
+            .arg(directory.path())
+            .output()
+            .expect("create SUBST mapping");
+        assert!(
+            output.status.success(),
+            "subst failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _mapping = SubstMapping(drive_name.clone());
+        assert_eq!(
+            DiscoveryInspection::inspect(
+                &PathBuf::from(format!(r"{drive}:\git.exe")),
+                &exclusions,
+            )
+            .expect_err("SUBST path must fail"),
+            RealGitArtifactError::RemotePathUnsupported
+        );
+    }
+
+    #[test]
+    fn validates_real_git_for_windows_acl_when_ci_provides_it() {
+        let (_owned, exclusions) = exclusion_fixture();
+        let git = PathBuf::from(std::env::var_os("ProgramFiles").expect("Windows ProgramFiles"))
+            .join("Git")
+            .join("cmd")
+            .join("git.exe");
+        if !git.is_file() {
+            assert_ne!(
+                std::env::var_os("GITHUB_ACTIONS").as_deref(),
+                Some(OsStr::new("true")),
+                "the Windows CI image must include machine-wide Git for Windows"
+            );
+            return;
+        }
+        DiscoveryInspection::inspect(&git, &exclusions)
+            .expect("inspect the machine-wide Git for Windows executable");
+    }
+
+    #[test]
+    fn rejects_untrusted_file_writers_and_detects_acl_mutation() {
+        let (_owned, exclusions) = exclusion_fixture();
+        let directory = tempfile::tempdir().expect("create ACL fixture");
+        let unsafe_candidate = directory.path().join("unsafe.exe");
+        std::fs::copy(native_fixture_path(), &unsafe_candidate).expect("copy unsafe ACL target");
+        grant_builtin_users(&unsafe_candidate, "(M)");
+        assert_eq!(
+            DiscoveryInspection::inspect(&unsafe_candidate, &exclusions)
+                .expect_err("untrusted writer must fail"),
+            RealGitArtifactError::UnsafePath
+        );
+
+        let mutable = directory.path().join("mutable.exe");
+        std::fs::copy(native_fixture_path(), &mutable).expect("copy ACL mutation target");
+        let inspected =
+            DiscoveryInspection::inspect(&mutable, &exclusions).expect("inspect ACL target");
+        let output = Command::new("icacls.exe")
+            .arg(&mutable)
+            .arg("/inheritance:d")
+            .output()
+            .expect("change retained ACL");
+        assert!(
+            output.status.success(),
+            "icacls ACL mutation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            inspected
+                .revalidate(&exclusions)
+                .expect_err("ACL mutation must stale the inspection"),
+            RealGitArtifactError::DiscoveryChainStale
+        );
+    }
+
+    #[test]
+    fn native_standard_user_resolver_probe() {
+        if std::env::var_os("GUS_WINDOWS_STANDARD_USER_TEST").as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        let administrators =
+            crate::real_git::well_known_sid(WinBuiltinAdministratorsSid).expect("admin SID");
+        assert!(administrators.len() <= SECURITY_MAX_SID_SIZE as usize);
+        let mut is_administrator = 0;
+        // SAFETY: a null token selects the effective thread/process token, the
+        // SID bytes are validated by `well_known_sid`, and the BOOL is writable.
+        assert_ne!(
+            unsafe {
+                CheckTokenMembership(
+                    ptr::null_mut(),
+                    administrators.as_ptr().cast_mut().cast::<c_void>(),
+                    &raw mut is_administrator,
+                )
+            },
+            0,
+            "query standard-user Administrators membership"
+        );
+        assert_eq!(is_administrator, 0, "probe must not run as Administrator");
+
+        let (_owned, exclusions) = exclusion_fixture();
+        let directory = tempfile::tempdir().expect("create standard-user fixture");
+        let target_directory = directory.path().join("target");
+        std::fs::create_dir(&target_directory).expect("create standard-user target directory");
+        let target = target_directory.join("git.exe");
+        std::fs::copy(native_fixture_path(), &target).expect("copy standard-user target");
+        DiscoveryInspection::inspect(&target, &exclusions)
+            .expect("standard user inspects owned target");
+
+        let junction = directory.path().join("junction");
+        let output = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target_directory)
+            .output()
+            .expect("create standard-user junction");
+        assert!(
+            output.status.success(),
+            "standard-user mklink /J failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        DiscoveryInspection::inspect(&junction.join("git.exe"), &exclusions)
+            .expect("standard user resolves junction");
+
+        let git = PathBuf::from(std::env::var_os("ProgramFiles").expect("Windows ProgramFiles"))
+            .join("Git")
+            .join("cmd")
+            .join("git.exe");
+        DiscoveryInspection::inspect(&git, &exclusions)
+            .expect("standard user inspects machine-wide Git for Windows");
     }
 
     #[test]
@@ -1332,6 +1570,46 @@ mod tests {
             delete_pending: false,
             security_digest: [8; 32],
         }
+    }
+
+    fn drive_of(path: &Path) -> Option<u8> {
+        let std::path::Component::Prefix(prefix) = path.components().next()? else {
+            return None;
+        };
+        match prefix.kind() {
+            std::path::Prefix::Disk(drive) | std::path::Prefix::VerbatimDisk(drive) => {
+                Some(drive.to_ascii_uppercase())
+            }
+            _ => None,
+        }
+    }
+
+    fn unused_drive_letter() -> Option<char> {
+        ('T'..='Z')
+            .rev()
+            .find(|drive| !PathBuf::from(format!(r"{drive}:\")).exists())
+    }
+
+    struct SubstMapping(String);
+
+    impl Drop for SubstMapping {
+        fn drop(&mut self) {
+            let _ = Command::new("subst.exe").args([&self.0, "/D"]).status();
+        }
+    }
+
+    fn grant_builtin_users(path: &Path, rights: &str) {
+        let output = Command::new("icacls.exe")
+            .arg(path)
+            .arg("/grant")
+            .arg(format!("*S-1-5-32-545:{rights}"))
+            .output()
+            .expect("grant ACL fixture rights");
+        assert!(
+            output.status.success(),
+            "icacls grant failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn synthetic_reparse(tag: u32, target: &str, relative: bool) -> Vec<u8> {

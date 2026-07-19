@@ -109,6 +109,77 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo +stable doc --workspace --all-features --no-deps
 
+  windows-standard-user:
+    name: Windows standard-user resolver
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+
+      - name: Build resolver test binary
+        shell: pwsh
+        run: cargo +stable test -p gus-platform --lib --no-run
+
+      - name: Run resolver as a non-Administrator
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $userName = "gusci"
+          $plainPassword = "Gus-CI-$env:GITHUB_RUN_ID-Aa1!"
+          $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+          $credential = [pscredential]::new(".\$userName", $securePassword)
+          $probeRoot = "C:\gus-standard-$env:GITHUB_RUN_ID"
+          $probeTemp = Join-Path $probeRoot "temp"
+          try {
+            New-LocalUser -Name $userName -Password $securePassword -PasswordNeverExpires | Out-Null
+            New-Item -ItemType Directory -Path $probeTemp -Force | Out-Null
+            & icacls.exe $probeRoot /grant "${env:COMPUTERNAME}\${userName}:(OI)(CI)F" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to grant the standard-user probe directory"
+            }
+
+            $testBinary = Get-ChildItem "target\debug\deps\gus_platform-*.exe" |
+              Sort-Object LastWriteTimeUtc -Descending |
+              Select-Object -First 1
+            if ($null -eq $testBinary) {
+              throw "gus-platform test binary was not produced"
+            }
+            $copiedBinary = Join-Path $probeRoot "gus-platform-tests.exe"
+            Copy-Item $testBinary.FullName $copiedBinary
+            $stdout = Join-Path $probeRoot "stdout.txt"
+            $stderr = Join-Path $probeRoot "stderr.txt"
+            $arguments = "--exact real_git::resolver_windows::tests::native_standard_user_resolver_probe --nocapture --test-threads=1"
+            $process = Start-Process `
+              -FilePath $copiedBinary `
+              -ArgumentList $arguments `
+              -Credential $credential `
+              -LoadUserProfile `
+              -Environment @{
+                GUS_WINDOWS_STANDARD_USER_TEST = "1"
+                TEMP = $probeTemp
+                TMP = $probeTemp
+              } `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr `
+              -Wait `
+              -PassThru
+            Get-Content $stdout
+            Get-Content $stderr
+            if ($process.ExitCode -ne 0) {
+              throw "standard-user resolver probe failed with exit code $($process.ExitCode)"
+            }
+          } finally {
+            Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue
+          }
+
   freebsd-cross:
     name: FreeBSD ABI ${{ matrix.abi }} cross-check
     strategy:
