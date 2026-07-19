@@ -1374,13 +1374,16 @@ fn windows_security_binding(file: &File) -> Result<[u8; 32], RealGitArtifactErro
     if unsafe { IsValidAcl(dacl) } == 0 {
         return Err(RealGitArtifactError::UnsafePath);
     }
-    windows_dacl_binding(dacl, &trust)
+    let attributes =
+        windows_file_information::<FILE_BASIC_INFO>(file, FileBasicInfo)?.FileAttributes;
+    windows_dacl_binding(dacl, &trust, attributes)
 }
 
 #[cfg(windows)]
 fn windows_dacl_binding(
     dacl: *mut windows_sys::Win32::Security::ACL,
     trust: &WindowsSecurityTrust,
+    attributes: u32,
 ) -> Result<[u8; 32], RealGitArtifactError> {
     const MAX_ACL_BYTES: usize = 64 * 1024;
 
@@ -1415,7 +1418,7 @@ fn windows_dacl_binding(
     for index in 0..information.AceCount {
         let (header, raw) = bounded_windows_ace(dacl, index, dacl_start, dacl_end)?;
         update_length_prefixed_bytes(&mut digest, &raw);
-        validate_windows_ace(header, &raw, trust)?;
+        validate_windows_ace(header, &raw, trust, attributes)?;
     }
     Ok(digest.finalize().into())
 }
@@ -1462,6 +1465,7 @@ fn validate_windows_ace(
     header: ACE_HEADER,
     raw: &[u8],
     trust: &WindowsSecurityTrust,
+    attributes: u32,
 ) -> Result<(), RealGitArtifactError> {
     let ace_type = u32::from(header.AceType);
     if matches!(
@@ -1491,20 +1495,38 @@ fn validate_windows_ace(
             .expect("bounded access-allowed ACE mask"),
     );
     let sid = copy_sid_from_ace(&raw[8..], 8)?;
-    let dangerous = FILE_WRITE_DATA
-        | FILE_APPEND_DATA
-        | FILE_WRITE_EA
-        | FILE_WRITE_ATTRIBUTES
-        | FILE_DELETE_CHILD
-        | DELETE
-        | WRITE_DAC
-        | WRITE_OWNER
-        | GENERIC_WRITE
-        | GENERIC_ALL;
+    let dangerous = dangerous_windows_access_mask(attributes);
     if mask & dangerous != 0 && !trust.writer_is_trusted(&sid) {
         return Err(RealGitArtifactError::UnsafePath);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+const fn dangerous_windows_access_mask(attributes: u32) -> u32 {
+    let is_plain_directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+        && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+    if is_plain_directory {
+        // Creating a sibling or descendant does not change an already-opened
+        // name binding. Every existing component is retained without
+        // FILE_SHARE_DELETE and the complete namespace is replayed before use.
+        // Windows drive roots commonly grant these create-only rights to
+        // otherwise untrusted principals, so treating them as file-content
+        // writes would make every local path unusable. ACL changes and
+        // metadata changes remain bound into the retained snapshot.
+        DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL
+    } else {
+        FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_DELETE_CHILD
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER
+            | GENERIC_WRITE
+            | GENERIC_ALL
+    }
 }
 
 #[cfg(windows)]
@@ -3022,6 +3044,26 @@ mod tests {
                 .require(snapshot)
                 .expect_err("post-open reparse point must fail"),
             RealGitArtifactError::ReparsePointUnsupported
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_acl_policy_distinguishes_child_creation_from_artifact_writes() {
+        let create_children = FILE_WRITE_DATA | FILE_APPEND_DATA;
+        assert_eq!(
+            dangerous_windows_access_mask(FILE_ATTRIBUTE_DIRECTORY) & create_children,
+            0
+        );
+        assert_ne!(dangerous_windows_access_mask(0) & create_children, 0);
+        assert_ne!(
+            dangerous_windows_access_mask(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+                & create_children,
+            0
+        );
+        assert_ne!(
+            dangerous_windows_access_mask(FILE_ATTRIBUTE_DIRECTORY) & WRITE_DAC,
+            0
         );
     }
 
