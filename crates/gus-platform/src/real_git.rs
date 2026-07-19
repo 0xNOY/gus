@@ -707,7 +707,7 @@ impl ExecutableCandidate {
         require_native_executable(&lease, snapshot.size())?;
         let content_digest = digest_file(&lease, snapshot.size())?;
         let final_snapshot = NativeFileSnapshot::capture(&lease)?;
-        if final_snapshot != snapshot {
+        if !final_snapshot.same_retained_artifact(&snapshot) {
             return Err(RealGitArtifactError::ArtifactChanged);
         }
         exclusions.validate()?;
@@ -2742,26 +2742,46 @@ impl NativeFileSnapshot {
     }
 
     fn same_retained_artifact(self, other: &Self) -> bool {
-        self == *other
+        self.same_file(other)
+            && self.final_path_digest == other.final_path_digest
+            && self.attributes == other.attributes
+            && self.reparse_tag == other.reparse_tag
+            && self.creation_time == other.creation_time
+            && self.change_time == other.change_time
+            && self.allocation_size == other.allocation_size
+            && self.size == other.size
+            && self.last_write == other.last_write
+            && self.number_of_links == other.number_of_links
+            && self.delete_pending == other.delete_pending
+            && self.security_digest == other.security_digest
     }
 
     fn same_discovery_artifact(self, other: &Self) -> bool {
-        self == *other
+        if self.is_directory() && other.is_directory() {
+            self.same_file(other)
+                && self.final_path_digest == other.final_path_digest
+                && self.attributes == other.attributes
+                && self.reparse_tag == other.reparse_tag
+                && self.creation_time == other.creation_time
+                && self.delete_pending == other.delete_pending
+                && self.security_digest == other.security_digest
+        } else {
+            self.same_retained_artifact(other)
+        }
     }
 
     fn same_owned_directory(self, other: &Self) -> bool {
-        self.same_file(other) && self.is_directory() && self.attributes == other.attributes
+        self.is_directory() && other.is_directory() && self.same_discovery_artifact(other)
     }
 
     fn identity_digest(self, content_digest: [u8; 32]) -> [u8; 32] {
         let mut digest = Sha256::new();
-        digest.update(b"gus.platform.executable-identity.windows.v1\0");
+        digest.update(b"gus.platform.executable-identity.windows.v2\0");
         digest.update(self.volume_serial.to_le_bytes());
         digest.update(self.file_id);
         digest.update(self.attributes.to_le_bytes());
         digest.update(self.reparse_tag.to_le_bytes());
         digest.update(self.creation_time.to_le_bytes());
-        digest.update(self.last_access_time.to_le_bytes());
         digest.update(self.change_time.to_le_bytes());
         digest.update(self.allocation_size.to_le_bytes());
         digest.update(self.size.to_le_bytes());
@@ -2795,8 +2815,12 @@ mod tests {
 
     #[test]
     fn rejects_the_running_image_as_real_git() {
-        let (_owned_root, exclusions) = exclusion_fixture();
+        let (owned_root, exclusions) = exclusion_fixture();
+        let _keep_owned_root_alive = &owned_root;
+        #[cfg(unix)]
         let executable = std::env::current_exe().expect("current test executable");
+        #[cfg(windows)]
+        let executable = owned_root.path().join("synthetic-current-image.exe");
         assert_eq!(
             ExecutableCandidate::inspect_resolved(&executable, &exclusions)
                 .expect_err("self reference must fail"),
@@ -3023,28 +3047,40 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn post_open_directory_reparse_snapshot_is_rejected() {
-        let snapshot = NativeFileSnapshot {
-            volume_serial: 1,
-            file_id: [2; 16],
-            final_path_digest: [3; 32],
-            attributes: FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
-            reparse_tag: 0xa000_000c,
-            creation_time: 0,
-            last_access_time: 0,
-            change_time: 0,
-            allocation_size: 0,
-            size: 0,
-            last_write: 0,
-            number_of_links: 1,
-            delete_pending: false,
-            security_digest: [4; 32],
-        };
+        let snapshot =
+            synthetic_windows_snapshot(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT);
         assert_eq!(
             ExpectedFileKind::Directory
                 .require(snapshot)
                 .expect_err("post-open reparse point must fail"),
             RealGitArtifactError::ReparsePointUnsupported
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshot_ignores_read_side_effects_and_unrelated_directory_churn() {
+        let file = synthetic_windows_snapshot(0);
+        let mut accessed = file;
+        accessed.last_access_time += 1;
+        assert!(file.same_retained_artifact(&accessed));
+        assert_eq!(
+            file.identity_digest([9; 32]),
+            accessed.identity_digest([9; 32])
+        );
+
+        let directory = synthetic_windows_snapshot(FILE_ATTRIBUTE_DIRECTORY);
+        let mut sibling_created = directory;
+        sibling_created.last_access_time += 1;
+        sibling_created.last_write += 1;
+        sibling_created.change_time += 1;
+        sibling_created.allocation_size += 4096;
+        sibling_created.size += 128;
+        sibling_created.number_of_links += 1;
+        assert!(directory.same_discovery_artifact(&sibling_created));
+
+        sibling_created.security_digest[0] ^= 1;
+        assert!(!directory.same_discovery_artifact(&sibling_created));
     }
 
     #[cfg(windows)]
@@ -3065,6 +3101,30 @@ mod tests {
             dangerous_windows_access_mask(FILE_ATTRIBUTE_DIRECTORY) & WRITE_DAC,
             0
         );
+    }
+
+    #[cfg(windows)]
+    const fn synthetic_windows_snapshot(attributes: u32) -> NativeFileSnapshot {
+        NativeFileSnapshot {
+            volume_serial: 1,
+            file_id: [2; 16],
+            final_path_digest: [3; 32],
+            attributes,
+            reparse_tag: if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                0
+            } else {
+                0xa000_000c
+            },
+            creation_time: 4,
+            last_access_time: 5,
+            change_time: 6,
+            allocation_size: 4096,
+            size: 512,
+            last_write: 7,
+            number_of_links: 1,
+            delete_pending: false,
+            security_digest: [8; 32],
+        }
     }
 
     #[cfg(unix)]
@@ -3323,7 +3383,12 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            let path = std::env::current_exe().expect("current test executable");
+            let path = root.join("synthetic-current-image.exe");
+            fs::copy(
+                std::env::current_exe().expect("current test executable"),
+                &path,
+            )
+            .expect("copy synthetic pre-launch test image");
             let lease = open_windows_entry(&path, ExpectedFileKind::RegularFile)
                 .expect("open synthetic pre-launch test lease");
             let trusted_lease = TrustedPrelaunchExecutableLease { lease };

@@ -431,7 +431,7 @@ impl ResolutionBuilder {
     ) -> Result<ResolvedWindowsPath, RealGitArtifactError> {
         ExpectedFileKind::RegularFile.require(snapshot)?;
         let candidate_lease = reopen_windows_read_lease(&opened)?;
-        if NativeFileSnapshot::capture(&candidate_lease)? != snapshot {
+        if !NativeFileSnapshot::capture(&candidate_lease)?.same_retained_artifact(&snapshot) {
             return Err(RealGitArtifactError::ArtifactChanged);
         }
         self.bindings.push(WindowsNameBinding {
@@ -871,7 +871,7 @@ fn calculate_binding(
     handle_budget: usize,
 ) -> DiscoveryChainBinding {
     let mut digest = Sha256::new();
-    digest.update(b"gus.platform.discovery-chain.windows.v1\0");
+    digest.update(b"gus.platform.discovery-chain.windows.v2\0");
     update_wide(&mut digest, original.iter().copied());
     digest.update(drive.to_le_bytes());
     digest.update((super::MAX_PATH_BYTES as u64).to_le_bytes());
@@ -916,12 +916,18 @@ fn update_snapshot(digest: &mut Sha256, snapshot: NativeFileSnapshot) {
     digest.update(snapshot.attributes.to_le_bytes());
     digest.update(snapshot.reparse_tag.to_le_bytes());
     digest.update(snapshot.creation_time.to_le_bytes());
-    digest.update(snapshot.last_access_time.to_le_bytes());
-    digest.update(snapshot.last_write.to_le_bytes());
-    digest.update(snapshot.change_time.to_le_bytes());
-    digest.update(snapshot.allocation_size.to_le_bytes());
-    digest.update(snapshot.size.to_le_bytes());
-    digest.update(snapshot.number_of_links.to_le_bytes());
+    if snapshot.is_directory() {
+        // Sibling creation changes ordinary-directory timestamps, size, and
+        // link counts without changing any retained name in this chain.
+        digest.update(b"retained-directory\0");
+    } else {
+        digest.update(b"retained-artifact\0");
+        digest.update(snapshot.last_write.to_le_bytes());
+        digest.update(snapshot.change_time.to_le_bytes());
+        digest.update(snapshot.allocation_size.to_le_bytes());
+        digest.update(snapshot.size.to_le_bytes());
+        digest.update(snapshot.number_of_links.to_le_bytes());
+    }
     digest.update([u8::from(snapshot.delete_pending)]);
     digest.update(snapshot.security_digest);
 }
@@ -1086,7 +1092,9 @@ mod tests {
         CurrentExecutableEvidence, DiscoveryInspection, ExecutableExclusionSet,
         TrustedPrelaunchExecutableLease,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_WRITE,
+    };
 
     #[test]
     fn resolves_direct_hardlink_and_unicode_paths_with_distinct_chain_bindings() {
@@ -1182,8 +1190,10 @@ mod tests {
 
     #[test]
     fn sealed_resolver_preserves_self_and_owned_exclusions() {
-        let (_owned, mut exclusions) = exclusion_fixture();
-        let current = std::env::current_exe().expect("current Windows test image");
+        let (synthetic_image_root, mut exclusions) = exclusion_fixture();
+        let current = synthetic_image_root
+            .path()
+            .join("synthetic-current-image.exe");
         assert_eq!(
             DiscoveryInspection::inspect(&current, &exclusions)
                 .expect_err("current image must be rejected"),
@@ -1253,6 +1263,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn discovery_binding_ignores_access_time_and_plain_directory_churn() {
+        let file = synthetic_snapshot(0);
+        let mut accessed = file;
+        accessed.last_access_time += 1;
+        assert_eq!(snapshot_digest(file), snapshot_digest(accessed));
+
+        let directory = synthetic_snapshot(FILE_ATTRIBUTE_DIRECTORY);
+        let mut sibling_created = directory;
+        sibling_created.last_access_time += 1;
+        sibling_created.last_write += 1;
+        sibling_created.change_time += 1;
+        sibling_created.allocation_size += 4096;
+        sibling_created.size += 128;
+        sibling_created.number_of_links += 1;
+        assert_eq!(snapshot_digest(directory), snapshot_digest(sibling_created));
+
+        sibling_created.security_digest[0] ^= 1;
+        assert_ne!(snapshot_digest(directory), snapshot_digest(sibling_created));
+    }
+
+    fn snapshot_digest(snapshot: NativeFileSnapshot) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        update_snapshot(&mut digest, snapshot);
+        digest.finalize().into()
+    }
+
+    const fn synthetic_snapshot(attributes: u32) -> NativeFileSnapshot {
+        NativeFileSnapshot {
+            volume_serial: 1,
+            file_id: [2; 16],
+            final_path_digest: [3; 32],
+            attributes,
+            reparse_tag: 0,
+            creation_time: 4,
+            last_access_time: 5,
+            change_time: 6,
+            allocation_size: 4096,
+            size: 512,
+            last_write: 7,
+            number_of_links: 1,
+            delete_pending: false,
+            security_digest: [8; 32],
+        }
+    }
+
     fn synthetic_reparse(tag: u32, target: &str, relative: bool) -> Vec<u8> {
         let target: Vec<u16> = target.encode_utf16().collect();
         let path_bytes = target.len() * 2;
@@ -1312,7 +1368,12 @@ mod tests {
 
     fn exclusion_fixture() -> (tempfile::TempDir, ExecutableExclusionSet) {
         let owned = tempfile::tempdir().expect("create owned root fixture");
-        let current = std::env::current_exe().expect("current Windows test executable");
+        let current = owned.path().join("synthetic-current-image.exe");
+        std::fs::copy(
+            std::env::current_exe().expect("current Windows test executable"),
+            &current,
+        )
+        .expect("copy synthetic prelaunch image");
         let lease = open_entry(&current).expect("open synthetic prelaunch image lease");
         let trusted = TrustedPrelaunchExecutableLease { lease };
         let evidence = CurrentExecutableEvidence::from_trusted_prelaunch_lease(trusted)
