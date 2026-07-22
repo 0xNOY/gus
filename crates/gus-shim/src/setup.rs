@@ -78,10 +78,11 @@ fn setup(arguments: &[OsString]) -> Result<(), String> {
         let installed = install_shim(&source, &destination, &owner, &directory)?;
         if let Err(error) = verify_installed_shim(&destination) {
             if installed && is_owned_shim(&destination, &owner) {
-                let _ = fs::remove_file(&destination);
-                let _ = directory.sync_all();
-                let _ = fs::remove_file(&owner);
-                let _ = directory.sync_all();
+                if let Err(cleanup) = rollback_new_install(&destination, &owner, &directory) {
+                    return Err(format!(
+                        "{error}; install rollback is incomplete: {cleanup}"
+                    ));
+                }
             }
             return Err(error);
         }
@@ -249,10 +250,16 @@ fn install_shim(
             .sync_all()
             .map_err(|error| sync_directory_error(&error))?;
         if let Err(error) = publish_no_replace(&staged_shim, destination) {
-            let _ = directory.sync_all();
-            let _ = fs::remove_file(owner);
-            let _ = directory.sync_all();
-            Err(error)
+            let cleanup = directory
+                .sync_all()
+                .and_then(|()| fs::remove_file(owner))
+                .and_then(|()| directory.sync_all());
+            match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!(
+                    "{error}; preserving ownership metadata because rollback is incomplete: {cleanup}"
+                )),
+            }
         } else {
             directory
                 .sync_all()
@@ -457,6 +464,16 @@ fn publish_no_replace(staged: &Path, destination: &Path) -> Result<bool, String>
         };
     }
     Ok(true)
+}
+
+#[cfg(unix)]
+fn rollback_new_install(destination: &Path, owner: &Path, directory: &File) -> Result<(), String> {
+    fs::remove_file(destination)
+        .and_then(|()| directory.sync_all())
+        .map_err(|error| format!("cannot remove {}: {error}", destination.display()))?;
+    fs::remove_file(owner)
+        .and_then(|()| directory.sync_all())
+        .map_err(|error| format!("cannot remove {}: {error}", owner.display()))
 }
 
 #[cfg(unix)]
