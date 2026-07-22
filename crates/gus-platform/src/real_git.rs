@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use gus_core::VerifiedGitSemantics;
+use gus_core::{GitSemanticRuleset, VerifiedGitSemantics};
 
 #[cfg(windows)]
 use std::fs;
@@ -316,6 +316,21 @@ pub(crate) struct RetainedExecutable {
 )]
 pub(crate) struct ProvenanceVerifiedExecutable {
     retained: RetainedExecutable,
+}
+
+/// A system Git executable admitted through trusted platform ownership,
+/// retained-descriptor inspection, and an exact-handle version probe.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub struct VerifiedRealGit {
+    executable: ProvenanceVerifiedExecutable,
+    semantics: VerifiedGitSemantics,
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl fmt::Debug for VerifiedRealGit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedRealGit([REDACTED])")
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -835,6 +850,73 @@ impl DiscoveryInspection {
             exclusions,
             expected_content_digest,
         })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl VerifiedRealGit {
+    /// Inspects and probes the fixed system Git location for this platform.
+    ///
+    /// This first executable slice accepts only a root-owned native binary at
+    /// the fixed system package path. Arbitrary PATH candidates and wrappers
+    /// are deliberately excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns fail-closed if ownership, path binding, retained inspection,
+    /// or the exact-descriptor Git version probe cannot be verified.
+    pub fn discover_system(exclusions: ExecutableExclusionSet) -> Result<Self, RetainedExecError> {
+        #[cfg(target_os = "linux")]
+        let system_path = Path::new("/usr/bin/git");
+        #[cfg(target_os = "freebsd")]
+        let system_path = Path::new("/usr/local/bin/git");
+
+        let inspection = DiscoveryInspection::inspect(system_path, &exclusions)?;
+        if inspection.candidate.inspected_path() != system_path
+            || inspection.candidate.snapshot.owner != 0
+        {
+            return Err(RetainedExecError::UntrustedSystemGit);
+        }
+        let expected = inspection.candidate.content_digest();
+        let executable = ProvenanceVerifiedExecutable {
+            retained: inspection.bind_expected_content(exclusions, expected)?,
+        };
+        let semantics = require_supported_git(executable.probe_git()?)?;
+        Ok(Self {
+            executable,
+            semantics,
+        })
+    }
+
+    /// Returns the verified version semantics bound to the retained image.
+    #[must_use]
+    pub const fn semantics(&self) -> &VerifiedGitSemantics {
+        &self.semantics
+    }
+
+    /// Replaces the current process with the exact retained Git image.
+    ///
+    /// # Errors
+    ///
+    /// Returns if arguments/environment are invalid, retained evidence became
+    /// stale, or descriptor execution failed. Success never returns.
+    pub fn exec(
+        self,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+    ) -> Result<Infallible, RetainedExecError> {
+        self.executable.retained.exec(arguments, environment)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn require_supported_git(
+    semantics: VerifiedGitSemantics,
+) -> Result<VerifiedGitSemantics, RetainedExecError> {
+    if semantics.ruleset() == GitSemanticRuleset::Unsupported {
+        Err(RetainedExecError::UnsupportedGitVersion)
+    } else {
+        Ok(semantics)
     }
 }
 
@@ -1593,9 +1675,13 @@ pub enum RealGitArtifactError {
         reason = "retained by the next verified Git probe/execution layer"
     )
 )]
-pub(crate) enum RetainedExecError {
+pub enum RetainedExecError {
     #[error("the expected content does not match the inspected executable")]
     ContentMismatch,
+    #[error("the fixed system Git path is not a root-owned direct package artifact")]
+    UntrustedSystemGit,
+    #[error("the fixed system Git version has no verified policy ruleset")]
+    UnsupportedGitVersion,
     #[error("descriptor execution requires argv[0]")]
     EmptyArguments,
     #[error("a descriptor-exec argument contains an invalid NUL byte")]
@@ -4236,6 +4322,37 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
+    fn fixed_root_owned_system_git_reaches_verified_authority() {
+        let owned_root = temporary_directory();
+        let exclusions = ExecutableExclusionSet::new(owned_root.path(), 11)
+            .expect("build system Git exclusions");
+        let git = VerifiedRealGit::discover_system(exclusions).expect("verify fixed system Git");
+        assert!(
+            git.semantics()
+                .version_output()
+                .starts_with("git version 2.")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn system_git_authority_rejects_unverified_version_rulesets() {
+        let unsupported =
+            VerifiedGitSemantics::from_version_output([7; 32], "git version 2.54.3.unverified")
+                .expect("well-formed unsupported Git version");
+        assert_eq!(
+            require_supported_git(unsupported).expect_err("unverified minor must reject"),
+            RetainedExecError::UnsupportedGitVersion
+        );
+
+        let ubuntu =
+            VerifiedGitSemantics::from_version_output([7; 32], "git version 2.43.0.ubuntu7.3")
+                .expect("well-formed Ubuntu Git version");
+        require_supported_git(ubuntu).expect("explicit Ubuntu ruleset is supported");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
     fn retained_probe_isolates_stdin_and_inherited_descriptors() {
         use std::io::Write;
         use std::process::Stdio;
@@ -4264,9 +4381,7 @@ mod tests {
             // SAFETY: stderr must be a writable `/dev/null` descriptor and
             // `warning` is readable for its exact length.
             assert_eq!(
-                unsafe {
-                    libc::write(libc::STDERR_FILENO, warning.as_ptr().cast(), warning.len())
-                },
+                unsafe { libc::write(libc::STDERR_FILENO, warning.as_ptr().cast(), warning.len()) },
                 isize::try_from(warning.len()).expect("warning length fits isize"),
                 "probe stderr was not writable"
             );

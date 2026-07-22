@@ -461,7 +461,7 @@ impl VerifiedGitSemantics {
             .ok_or(ResolutionError::InvalidSnapshot)?;
         let _ = patch;
         let ruleset = match (major, minor) {
-            (2, 39) => GitSemanticRuleset::Git2_39,
+            (2, 39 | 43) => GitSemanticRuleset::Git2_39,
             (2, 55) => GitSemanticRuleset::Git2_55,
             _ => GitSemanticRuleset::Unsupported,
         };
@@ -1260,7 +1260,11 @@ mod tests {
 
     #[test]
     fn identity_proofs_are_available_only_for_explicit_git_rulesets() {
-        for version in ["git version 2.39.5", "git version 2.55.0.windows.1"] {
+        for version in [
+            "git version 2.39.5",
+            "git version 2.43.0.ubuntu7.3",
+            "git version 2.55.0.windows.1",
+        ] {
             let semantics = semantics(version);
             assert_ne!(semantics.ruleset(), GitSemanticRuleset::Unsupported);
             let (target, intent) = capture(&["pull", "--ff-only"]);
@@ -1339,6 +1343,17 @@ mod tests {
             ),
             ProfileRequirement::Required(RequirementReason::AuthorIdentity),
             "Git 2.39 ignores pull.autoStash and inherits merge.autoStash"
+        );
+        assert_eq!(
+            resolve_pull_invocation(
+                "git version 2.43.0.ubuntu7.3",
+                &["pull", "--ff-only"],
+                Some("main"),
+                Some([3; 32]),
+                entries(),
+            ),
+            ProfileRequirement::Required(RequirementReason::AuthorIdentity),
+            "verified Ubuntu Git 2.43 uses the legacy autostash ruleset"
         );
         assert_eq!(
             resolve_pull_invocation(
