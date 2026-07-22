@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn git(repo: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
+    Command::new(real_git())
         .current_dir(repo)
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -25,6 +25,20 @@ fn git(repo: &Path, args: &[&str]) -> std::process::Output {
         .expect("test fixture requires Git")
 }
 
+fn real_git() -> std::ffi::OsString {
+    if let Some(path) = std::env::var_os("GUS_TEST_REAL_GIT") {
+        return path;
+    }
+    #[cfg(windows)]
+    {
+        r"C:\Program Files\Git\bin\git.exe".into()
+    }
+    #[cfg(not(windows))]
+    {
+        "git".into()
+    }
+}
+
 fn success(repo: &Path, args: &[&str]) -> std::process::Output {
     let output = git(repo, args);
     assert!(
@@ -37,7 +51,7 @@ fn success(repo: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn neutral_success(repo: &Path, args: &[&str]) -> std::process::Output {
-    let output = Command::new("git")
+    let output = Command::new(real_git())
         .current_dir(repo)
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
