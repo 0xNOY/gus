@@ -1,21 +1,21 @@
-use sha2::{Digest as _, Sha256};
-use std::{
-    env,
-    ffi::OsString,
-    fs::{self, File},
-    io::Read as _,
-    path::{Path, PathBuf},
-    process::{Command, ExitCode},
-};
+use std::{env, ffi::OsString, process::ExitCode};
 
+#[cfg(unix)]
+use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
 use std::os::{
     fd::AsRawFd as _,
     unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
 };
 #[cfg(unix)]
-use std::{fs::OpenOptions, io::Write as _};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read as _, Write as _},
+    path::{Path, PathBuf},
+    process::Command,
+};
 
+#[cfg(unix)]
 const OWNER_FILE: &str = ".gus-git-shim-owner-v1";
 #[cfg(unix)]
 const INSTALL_LOCK_FILE: &str = ".gus-git-shim-install.lock";
@@ -73,14 +73,14 @@ fn setup(arguments: &[OsString]) -> Result<(), String> {
             return Ok(());
         }
 
-        let installed = install_shim(&source, &destination, &owner)?;
+        let directory = open_target_directory(&target)?;
+        let _lock = acquire_install_lock(&target)?;
+        let installed = install_shim(&source, &destination, &owner, &directory)?;
         if let Err(error) = verify_installed_shim(&destination) {
             if installed && is_owned_shim(&destination, &owner) {
                 let _ = fs::remove_file(&destination);
                 let _ = fs::remove_file(&owner);
-                if let Ok(directory) = open_target_directory(&target) {
-                    let _ = directory.sync_all();
-                }
+                let _ = directory.sync_all();
             }
             return Err(error);
         }
@@ -129,6 +129,7 @@ fn shim_source() -> Result<PathBuf, String> {
         .ok_or_else(|| format!("bundled Git shim is missing from {}", directory.display()))
 }
 
+#[cfg(unix)]
 fn executable_path_entries() -> Result<Vec<PathBuf>, String> {
     let raw = env::var_os("PATH").ok_or_else(|| "PATH is not set".to_owned())?;
     let mut entries = Vec::new();
@@ -156,6 +157,7 @@ fn executable_path_entries() -> Result<Vec<PathBuf>, String> {
     Ok(entries)
 }
 
+#[cfg(unix)]
 fn first_git_index(path: &[PathBuf]) -> Option<usize> {
     path.iter()
         .position(|directory| git_path(directory).is_file())
@@ -179,6 +181,7 @@ fn is_owned_shim(shim: &Path, owner: &Path) -> bool {
             .unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn git_path(directory: &Path) -> PathBuf {
     #[cfg(windows)]
     let name = "git.exe";
@@ -218,13 +221,16 @@ fn select_target(
 }
 
 #[cfg(unix)]
-fn install_shim(source: &Path, destination: &Path, owner: &Path) -> Result<bool, String> {
+fn install_shim(
+    source: &Path,
+    destination: &Path,
+    owner: &Path,
+    directory: &File,
+) -> Result<bool, String> {
     let target = destination
         .parent()
         .ok_or_else(|| "install target has no parent".to_owned())?;
-    let directory = open_target_directory(target)?;
-    let _lock = acquire_install_lock(target)?;
-    recover_interrupted_update(target, destination, owner, &directory)?;
+    recover_interrupted_update(target, destination, owner, directory)?;
 
     let suffix = format!("{}-{}", std::process::id(), monotonic_suffix()?);
     let staged_shim = target.join(format!(".gus-git-shim-{suffix}.tmp"));
@@ -270,7 +276,7 @@ fn install_shim(source: &Path, destination: &Path, owner: &Path) -> Result<bool,
                 &staged_owner,
                 &current,
                 &digest,
-                &directory,
+                directory,
             )?;
             Ok(false)
         }
@@ -347,11 +353,6 @@ fn new_file(path: &Path, mode: u32) -> Result<File, String> {
 #[cfg(unix)]
 fn validate_target_directory(path: &Path) -> Result<(), String> {
     open_target_directory(path).map(|_| ())
-}
-
-#[cfg(not(unix))]
-fn validate_target_directory(_path: &Path) -> Result<(), String> {
-    Err("setup is not implemented on this platform yet".to_owned())
 }
 
 #[cfg(unix)]
@@ -481,6 +482,12 @@ fn update_owned_shim(
         format!("old={old_digest}\nnew={new_digest}\n").as_bytes(),
         0o600,
     )?;
+    directory.sync_all().map_err(|error| {
+        format!(
+            "cannot durably publish update journal {}: {error}",
+            journal.display()
+        )
+    })?;
     fs::hard_link(destination, &backup)
         .and_then(|()| directory.sync_all())
         .map_err(|error| format!("cannot retain the previous Git shim: {error}"))?;
@@ -512,10 +519,21 @@ fn recover_interrupted_update(
     directory: &File,
 ) -> Result<(), String> {
     let journal = target.join(UPDATE_JOURNAL_FILE);
+    let backup = target.join(".gus-git-shim-previous-v1");
     if !journal.exists() {
+        if backup.exists() {
+            let active = secure_file_digest(destination)?;
+            let recorded = read_owner_digest(owner)?;
+            let retained = secure_file_digest(&backup)?;
+            if active != recorded || retained != active {
+                return Err("orphaned update backup does not match the active GUS shim".to_owned());
+            }
+            fs::remove_file(&backup)
+                .and_then(|()| directory.sync_all())
+                .map_err(|error| format!("cannot remove orphaned update backup: {error}"))?;
+        }
         return Ok(());
     }
-    let backup = target.join(".gus-git-shim-previous-v1");
     let (old, new) = read_update_journal(&journal)?;
     let active = secure_file_digest(destination)?;
     let recorded = read_owner_digest(owner)?;
@@ -565,12 +583,9 @@ fn read_update_journal(path: &Path) -> Result<(String, String), String> {
     ))
 }
 
+#[cfg(unix)]
 fn file_digest(path: &Path) -> Result<String, String> {
-    #[cfg(unix)]
     let mut file = open_checked_file(path, false)?;
-    #[cfg(not(unix))]
-    let mut file =
-        File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     digest_reader(&mut file, path)
 }
 
@@ -580,6 +595,7 @@ fn secure_file_digest(path: &Path) -> Result<String, String> {
     digest_reader(&mut file, path)
 }
 
+#[cfg(unix)]
 fn digest_reader(file: &mut File, path: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 16 * 1024];
@@ -595,12 +611,9 @@ fn digest_reader(file: &mut File, path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(unix)]
 fn read_owner_digest(path: &Path) -> Result<String, String> {
-    #[cfg(unix)]
     let text = read_checked_text(path, 128)?;
-    #[cfg(not(unix))]
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     text.strip_prefix("sha256=")
         .and_then(|value| value.strip_suffix('\n'))
         .filter(|value| valid_digest(value))
@@ -608,6 +621,7 @@ fn read_owner_digest(path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("{} is not valid GUS ownership metadata", path.display()))
 }
 
+#[cfg(unix)]
 fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -625,6 +639,7 @@ fn read_checked_text(path: &Path, limit: u64) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8", path.display()))
 }
 
+#[cfg(unix)]
 fn verify_installed_shim(path: &Path) -> Result<(), String> {
     let probe = Command::new(path)
         .arg("--gus-shim-probe")
@@ -647,37 +662,50 @@ fn verify_installed_shim(path: &Path) -> Result<(), String> {
     }
 }
 
-fn active_owned_shim() -> Result<(PathBuf, PathBuf), String> {
+#[cfg(unix)]
+fn active_shim_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let path = executable_path_entries()?;
     let index = first_git_index(&path).ok_or_else(|| "Git is not present on PATH".to_owned())?;
     let shim = git_path(&path[index]);
     let owner = path[index].join(OWNER_FILE);
     validate_target_directory(&path[index])?;
+    Ok((path[index].clone(), shim, owner))
+}
+
+#[cfg(unix)]
+fn validate_owned_shim(shim: &Path, owner: &Path) -> Result<(), String> {
     if !owner.is_file() {
         return Err(format!(
             "the active Git at {} is not owned by GUS",
             shim.display()
         ));
     }
-    let expected = read_owner_digest(&owner)?;
-    #[cfg(unix)]
-    let actual = secure_file_digest(&shim)?;
-    #[cfg(not(unix))]
-    let actual = file_digest(&shim)?;
+    let expected = read_owner_digest(owner)?;
+    let actual = secure_file_digest(shim)?;
     if expected != actual {
         return Err(format!(
             "the active GUS shim at {} was modified",
             shim.display()
         ));
     }
-    Ok((shim, owner))
+    Ok(())
 }
 
 fn doctor() -> Result<(), String> {
-    let (shim, _) = active_owned_shim()?;
-    verify_installed_shim(&shim)?;
-    println!("GUS Git shim is active and verified: {}", shim.display());
-    Ok(())
+    #[cfg(not(unix))]
+    return Err("doctor is not implemented on this platform yet".to_owned());
+
+    #[cfg(unix)]
+    {
+        let (target, shim, owner) = active_shim_paths()?;
+        let directory = open_target_directory(&target)?;
+        let _lock = acquire_install_lock(&target)?;
+        recover_interrupted_update(&target, &shim, &owner, &directory)?;
+        validate_owned_shim(&shim, &owner)?;
+        verify_installed_shim(&shim)?;
+        println!("GUS Git shim is active and verified: {}", shim.display());
+        Ok(())
+    }
 }
 
 fn uninstall() -> Result<(), String> {
@@ -686,12 +714,14 @@ fn uninstall() -> Result<(), String> {
 
     #[cfg(unix)]
     {
-        let (shim, owner) = active_owned_shim()?;
-        let directory = open_target_directory(
-            shim.parent()
-                .ok_or_else(|| "active Git shim has no parent directory".to_owned())?,
-        )?;
+        let (target, shim, owner) = active_shim_paths()?;
+        let directory = open_target_directory(&target)?;
+        let _lock = acquire_install_lock(&target)?;
+        recover_interrupted_update(&target, &shim, &owner, &directory)?;
+        validate_owned_shim(&shim, &owner)?;
+        verify_installed_shim(&shim)?;
         fs::remove_file(&shim)
+            .and_then(|()| directory.sync_all())
             .map_err(|error| format!("cannot remove {}: {error}", shim.display()))?;
         fs::remove_file(&owner)
             .and_then(|()| directory.sync_all())
