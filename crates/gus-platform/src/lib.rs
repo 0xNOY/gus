@@ -284,6 +284,23 @@ impl TerminalSessionIdentity {
         self.anchor_process
     }
 
+    /// Derives an opaque, stable key suitable for namespacing state that must
+    /// live only for this terminal session.
+    #[must_use]
+    pub fn selection_key(self) -> TerminalSelectionKey {
+        let mut native = [0_u8; 108];
+        native[0..32].copy_from_slice(&self.terminal.digest);
+        native[32..64].copy_from_slice(&self.anchor_process.time_domain.0);
+        native[64..68].copy_from_slice(&self.anchor_process.pid.get().to_le_bytes());
+        native[68..76].copy_from_slice(&self.anchor_process.start_time.get().to_le_bytes());
+        native[76..108].copy_from_slice(&self.anchor_process.user.digest);
+        TerminalSelectionKey(identity_digest(
+            b"gus.platform.terminal-selection.v1",
+            self.terminal.family,
+            &native,
+        ))
+    }
+
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
@@ -296,6 +313,30 @@ impl TerminalSessionIdentity {
             terminal,
             anchor_process,
         }
+    }
+}
+
+/// Opaque namespace key for state scoped to one terminal session.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TerminalSelectionKey([u8; IDENTITY_DIGEST_BYTES]);
+
+impl TerminalSelectionKey {
+    /// Encodes the opaque key for use as a portable file or object name.
+    #[must_use]
+    pub fn encode_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(IDENTITY_DIGEST_BYTES * 2);
+        for byte in self.0 {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+}
+
+impl fmt::Debug for TerminalSelectionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TerminalSelectionKey([REDACTED])")
     }
 }
 
@@ -548,6 +589,22 @@ fn identity_digest(
 mod process_observer_tests {
     use super::*;
 
+    fn terminal_session(terminal: &[u8], pid: u32) -> TerminalSessionIdentity {
+        let family = PlatformFamily::Linux;
+        let user = OsUserIdentity::from_native_bytes(family, b"user");
+        let time_domain = ProcessTimeDomainIdentity::from_native_bytes(family, b"boot");
+        let process = ProcessIdentity::from_observation(
+            time_domain,
+            NonZeroU32::new(pid).expect("test PID is nonzero"),
+            NonZeroU64::new(42).expect("test start time is nonzero"),
+            user,
+        );
+        TerminalSessionIdentity::from_observation(
+            TerminalIdentity::from_native_bytes(family, terminal),
+            process,
+        )
+    }
+
     #[test]
     fn native_process_identity_is_stable_and_redacts_its_user() {
         let pid = NonZeroU32::new(std::process::id()).expect("current process PID is nonzero");
@@ -563,5 +620,29 @@ mod process_observer_tests {
         let debug = format!("{first:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("digest"));
+    }
+
+    #[test]
+    fn terminal_selection_key_is_stable_and_portable() {
+        let first = terminal_session(b"tty-1", 100).selection_key();
+        let second = terminal_session(b"tty-1", 100).selection_key();
+
+        assert_eq!(first, second);
+        assert_eq!(first.encode_hex().len(), 64);
+        assert!(
+            first
+                .encode_hex()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert_eq!(format!("{first:?}"), "TerminalSelectionKey([REDACTED])");
+    }
+
+    #[test]
+    fn terminal_selection_key_binds_terminal_and_anchor() {
+        let baseline = terminal_session(b"tty-1", 100).selection_key();
+
+        assert_ne!(baseline, terminal_session(b"tty-2", 100).selection_key());
+        assert_ne!(baseline, terminal_session(b"tty-1", 101).selection_key());
     }
 }
