@@ -4338,7 +4338,7 @@ mod tests {
     #[test]
     fn system_git_authority_rejects_unverified_version_rulesets() {
         let unsupported =
-            VerifiedGitSemantics::from_version_output([7; 32], "git version 2.54.3.unverified")
+            VerifiedGitSemantics::from_version_output([7; 32], "git version 2.53.3.unverified")
                 .expect("well-formed unsupported Git version");
         assert_eq!(
             require_supported_git(unsupported).expect_err("unverified minor must reject"),

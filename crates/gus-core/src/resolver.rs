@@ -462,7 +462,7 @@ impl VerifiedGitSemantics {
         let _ = patch;
         let ruleset = match (major, minor) {
             (2, 39 | 43) => GitSemanticRuleset::Git2_39,
-            (2, 55) => GitSemanticRuleset::Git2_55,
+            (2, 54 | 55) => GitSemanticRuleset::Git2_55,
             _ => GitSemanticRuleset::Unsupported,
         };
         let credential_ruleset = GitCredentialProtocolRuleset::Unsupported;
@@ -1263,6 +1263,7 @@ mod tests {
         for version in [
             "git version 2.39.5",
             "git version 2.43.0.ubuntu7.3",
+            "git version 2.54.0",
             "git version 2.55.0.windows.1",
         ] {
             let semantics = semantics(version);
@@ -1298,7 +1299,7 @@ mod tests {
         let unsupported = ResolverSnapshot::new(
             intent,
             [1; 32],
-            semantics("git version 2.54.3"),
+            semantics("git version 2.53.3"),
             Some([3; 32]),
             generations(),
             Some("main".to_owned()),
@@ -1354,6 +1355,17 @@ mod tests {
             ),
             ProfileRequirement::Required(RequirementReason::AuthorIdentity),
             "verified Ubuntu Git 2.43 uses the legacy autostash ruleset"
+        );
+        assert_eq!(
+            resolve_pull_invocation(
+                "git version 2.54.0",
+                &["pull", "--ff-only"],
+                Some("main"),
+                Some([3; 32]),
+                entries(),
+            ),
+            ProfileRequirement::NotRequired,
+            "Git 2.54 pull.autoStash overrides merge.autoStash"
         );
         assert_eq!(
             resolve_pull_invocation(
