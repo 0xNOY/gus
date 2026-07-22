@@ -120,8 +120,8 @@ fn run_commit_in_new_terminal(
             &raw mut master,
             &raw mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(

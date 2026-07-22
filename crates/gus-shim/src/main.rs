@@ -279,16 +279,38 @@ fn read_session_selection(path: &Path) -> Result<Option<ProfileId>, String> {
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn write_session_selection(path: &Path, id: &ProfileId) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{} has no portable file name", path.display()))?;
+    let temporary = parent.join(format!(".{file_name}-{}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    validate_private_file(&file, path)?;
-    writeln!(file, "{id}").map_err(|error| format!("cannot write {}: {error}", path.display()))
+        .open(&temporary)
+        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
+    validate_private_file(&file, &temporary)?;
+    let result = (|| {
+        writeln!(file, "{id}")
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+        fs::rename(&temporary, path).map_err(|error| {
+            format!(
+                "cannot publish {} as {}: {error}",
+                temporary.display(),
+                path.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -336,6 +358,16 @@ fn prompt_for_profile(profiles: &ProfileSet) -> Result<ProfileId, String> {
         .map_err(|error| format!("cannot write the profile prompt: {error}"))?;
 
     let response = read_terminal_line(&mut terminal)?;
+    resolve_prompt_response(profiles, &response)
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn resolve_prompt_response(profiles: &ProfileSet, response: &str) -> Result<ProfileId, String> {
+    if let Ok(id) = ProfileId::try_from(response.to_owned()) {
+        if profiles.profiles.contains_key(&id) {
+            return Ok(id);
+        }
+    }
     if let Ok(index) = response.parse::<usize>() {
         if let Some(id) = index
             .checked_sub(1)
@@ -344,12 +376,7 @@ fn prompt_for_profile(profiles: &ProfileSet) -> Result<ProfileId, String> {
             return Ok(id.clone());
         }
     }
-    let id = ProfileId::try_from(response).map_err(|_| "invalid profile selection".to_owned())?;
-    profiles
-        .profiles
-        .contains_key(&id)
-        .then_some(id)
-        .ok_or_else(|| "the selected profile does not exist".to_owned())
+    Err("the selected profile does not exist".to_owned())
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -553,4 +580,70 @@ fn launch_error(action: &str, error: &dyn std::error::Error) -> ExitCode {
 fn launch_message(message: &str) -> ExitCode {
     eprintln!("GUS_E_REAL_GIT: {message}");
     ExitCode::from(126)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn profiles() -> ProfileSet {
+        toml::from_str(
+            r#"
+version = 2
+generation = 1
+
+[profiles.2]
+id = "2"
+generation = 1
+[profiles.2.author]
+name = "Numeric"
+email = "numeric@example.test"
+[profiles.2.committer]
+name = "Numeric"
+email = "numeric@example.test"
+
+[profiles.alpha]
+id = "alpha"
+generation = 1
+[profiles.alpha.author]
+name = "Alpha"
+email = "alpha@example.test"
+[profiles.alpha.committer]
+name = "Alpha"
+email = "alpha@example.test"
+"#,
+        )
+        .expect("valid profile set")
+    }
+
+    #[test]
+    fn exact_numeric_profile_id_takes_precedence_over_menu_position() {
+        let selected = resolve_prompt_response(&profiles(), "2").expect("selection");
+        assert_eq!(selected.as_str(), "2");
+    }
+
+    #[test]
+    fn session_selection_is_atomically_replaced() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+        let path = directory.path().join("selection");
+        let work = ProfileId::try_from("work".to_owned()).expect("work ID");
+        let personal = ProfileId::try_from("personal".to_owned()).expect("personal ID");
+
+        write_session_selection(&path, &work).expect("initial selection");
+        write_session_selection(&path, &personal).expect("replacement selection");
+
+        assert_eq!(
+            read_session_selection(&path).expect("read selection"),
+            Some(personal)
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("read directory")
+                .count(),
+            1
+        );
+    }
 }
