@@ -5,6 +5,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use std::{collections::HashSet, convert::Infallible};
+
 #[cfg(unix)]
 mod resolver_unix;
 #[cfg(windows)]
@@ -269,6 +272,38 @@ pub struct DiscoveryInspection {
     chain: resolver_unix::UnixResolutionLeaseSet,
     #[cfg(windows)]
     chain: resolver_windows::WindowsResolutionLeaseSet,
+}
+
+/// One internally content-bound executable ready for descriptor execution.
+///
+/// This is a low-level platform primitive, not real-Git provenance, probe
+/// evidence, or public launch authority. A higher layer must consume it only
+/// while producing those stronger guarantees.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "retained by the next verified Git probe/execution layer"
+    )
+)]
+pub(crate) struct RetainedExecutable {
+    inspection: DiscoveryInspection,
+    exclusions: ExecutableExclusionSet,
+    expected_content_digest: [u8; 32],
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl fmt::Debug for RetainedExecutable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RetainedExecutable([REDACTED])")
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+thread_local! {
+    static BEFORE_DESCRIPTOR_EXEC_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 /// GUS-owned filesystem objects that may never be selected as real Git.
@@ -665,6 +700,166 @@ impl DiscoveryInspection {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl DiscoveryInspection {
+    /// Binds this inspection to content already verified by a trusted caller.
+    ///
+    /// This crate-internal primitive deliberately does not establish real-Git
+    /// provenance or version semantics by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns fail-closed if the attested digest differs or any retained
+    /// discovery, artifact, ACL, or exclusion evidence is stale.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained by the next verified Git probe/execution layer"
+        )
+    )]
+    pub(crate) fn bind_expected_content(
+        self,
+        exclusions: ExecutableExclusionSet,
+        expected_content_digest: [u8; 32],
+    ) -> Result<RetainedExecutable, RetainedExecError> {
+        if !self
+            .candidate
+            .matches_content_digest(expected_content_digest)
+        {
+            return Err(RetainedExecError::ContentMismatch);
+        }
+        self.revalidate(&exclusions)?;
+        Ok(RetainedExecutable {
+            inspection: self,
+            exclusions,
+            expected_content_digest,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "retained by the next verified Git probe/execution layer"
+    )
+)]
+impl RetainedExecutable {
+    /// Revalidates all retained evidence and replaces the current process with
+    /// the exact inspected executable descriptor.
+    ///
+    /// `arguments` includes `argv[0]`. Environment names must be non-empty and
+    /// must not contain `=`. No shell or path lookup is performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns if arguments/environment are invalid, retained evidence became
+    /// stale, or the kernel refused descriptor execution. Success never
+    /// returns.
+    pub fn exec(
+        self,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+    ) -> Result<Infallible, RetainedExecError> {
+        if arguments.is_empty() {
+            return Err(RetainedExecError::EmptyArguments);
+        }
+        let arguments = arguments
+            .iter()
+            .map(|argument| cstring_from_os(argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut environment_names = HashSet::with_capacity(environment.len());
+        let mut encoded_environment = Vec::with_capacity(environment.len());
+        for (name, value) in environment {
+            if !environment_names.insert(name.as_bytes().to_vec()) {
+                return Err(RetainedExecError::InvalidEnvironment);
+            }
+            encoded_environment.push(environment_entry(name, value)?);
+        }
+
+        self.inspection.revalidate(&self.exclusions)?;
+        if !self
+            .inspection
+            .candidate
+            .matches_content_digest(self.expected_content_digest)
+        {
+            return Err(RetainedExecError::ContentMismatch);
+        }
+
+        let mut argument_pointers = arguments
+            .iter()
+            .map(|argument| argument.as_ptr())
+            .collect::<Vec<_>>();
+        argument_pointers.push(std::ptr::null());
+        let mut environment_pointers = encoded_environment
+            .iter()
+            .map(|entry| entry.as_ptr())
+            .collect::<Vec<_>>();
+        environment_pointers.push(std::ptr::null());
+
+        #[cfg(test)]
+        BEFORE_DESCRIPTOR_EXEC_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+
+        // SAFETY: the descriptor is retained by `inspection`; both pointer
+        // arrays are NUL-terminated and refer to live `CString` storage. A
+        // successful call replaces this process and never returns.
+        unsafe {
+            libc::fexecve(
+                self.inspection.candidate.lease.as_raw_fd(),
+                argument_pointers.as_ptr(),
+                environment_pointers.as_ptr(),
+            )
+        };
+        let error = io::Error::last_os_error();
+        Err(RetainedExecError::Io {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "retained by the next verified Git probe/execution layer"
+    )
+)]
+fn cstring_from_os(value: &std::ffi::OsStr) -> Result<CString, RetainedExecError> {
+    CString::new(value.as_bytes()).map_err(|_| RetainedExecError::InvalidArgument)
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "retained by the next verified Git probe/execution layer"
+    )
+)]
+fn environment_entry(
+    name: &std::ffi::OsStr,
+    value: &std::ffi::OsStr,
+) -> Result<CString, RetainedExecError> {
+    let name = name.as_bytes();
+    if name.is_empty() || name.contains(&b'=') || name.contains(&0) || value.as_bytes().contains(&0)
+    {
+        return Err(RetainedExecError::InvalidEnvironment);
+    }
+    let mut entry = Vec::with_capacity(name.len().saturating_add(value.as_bytes().len() + 1));
+    entry.extend_from_slice(name);
+    entry.push(b'=');
+    entry.extend_from_slice(value.as_bytes());
+    CString::new(entry).map_err(|_| RetainedExecError::InvalidEnvironment)
+}
+
 impl ExecutableCandidate {
     /// Opens and inspects an already-resolved absolute native executable
     /// without invoking it.
@@ -875,6 +1070,46 @@ pub enum RealGitArtifactError {
     ExclusionSnapshotStale,
     #[error("the real Git candidate changed during verification")]
     ArtifactChanged,
+}
+
+/// Failure in the crate-internal retained-descriptor execution primitive.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "retained by the next verified Git probe/execution layer"
+    )
+)]
+pub(crate) enum RetainedExecError {
+    #[error("the expected content does not match the inspected executable")]
+    ContentMismatch,
+    #[error("descriptor execution requires argv[0]")]
+    EmptyArguments,
+    #[error("a descriptor-exec argument contains an invalid NUL byte")]
+    InvalidArgument,
+    #[error("a descriptor-exec environment entry is invalid or duplicated")]
+    InvalidEnvironment,
+    #[error("executable evidence became invalid before descriptor execution: {0}")]
+    Artifact(#[from] RealGitArtifactError),
+    #[error("failed to execute the retained descriptor: {kind:?} (OS code: {raw_os_error:?})")]
+    Io {
+        kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+fn install_before_descriptor_exec_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_DESCRIPTOR_EXEC_HOOK.with(|installed| {
+        assert!(
+            installed.borrow().is_none(),
+            "only one descriptor-exec test hook may be installed per thread"
+        );
+        *installed.borrow_mut() = Some(Box::new(hook));
+    });
 }
 
 fn io_error(error: io::Error) -> RealGitArtifactError {
@@ -2844,6 +3079,9 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    use std::ffi::OsStr;
+
     #[test]
     fn rejects_relative_candidates() {
         let (_owned_root, exclusions) = exclusion_fixture();
@@ -3232,6 +3470,124 @@ mod tests {
             !candidate
                 .matches_exclusion_snapshot(&exclusions)
                 .expect("extended exclusions remain fresh")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn expected_content_must_match_before_descriptor_execution() {
+        let (_owned_root, exclusions) = exclusion_fixture();
+        let inspection = DiscoveryInspection::inspect(&native_fixture_path(), &exclusions)
+            .expect("inspect native fixture");
+        let mut wrong = inspection.candidate().content_digest();
+        wrong[0] ^= 1;
+        assert_eq!(
+            inspection
+                .bind_expected_content(exclusions, wrong)
+                .expect_err("wrong expected digest must reject"),
+            RetainedExecError::ContentMismatch
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn descriptor_execution_does_not_reopen_a_replaced_path() {
+        const DRIVER: &str = "GUS_PLATFORM_LAUNCH_TEST_DRIVER";
+        const TARGET: &str = "GUS_PLATFORM_LAUNCH_TEST_TARGET";
+        const TEST_NAME: &str =
+            "real_git::tests::descriptor_execution_does_not_reopen_a_replaced_path";
+        const MARKER: &str = "gus-retained-descriptor-exec-ok";
+
+        if std::env::var_os(TARGET).as_deref() == Some(OsStr::new("1")) {
+            println!("{MARKER}");
+            return;
+        }
+        if std::env::var_os(DRIVER).as_deref() == Some(OsStr::new("1")) {
+            let owned_root = temporary_directory();
+            let exclusions =
+                ExecutableExclusionSet::new(owned_root.path(), 7).expect("build launch exclusions");
+            let candidate_root = temporary_directory();
+            let candidate = candidate_root.path().join("retained-test-image");
+            fs::copy(
+                std::env::current_exe().expect("current test image"),
+                &candidate,
+            )
+            .expect("copy retained test image");
+            make_executable(&candidate);
+            let inspection = DiscoveryInspection::inspect(&candidate, &exclusions)
+                .expect("inspect retained test image");
+            let expected = inspection.candidate().content_digest();
+            let launch = inspection
+                .bind_expected_content(exclusions, expected)
+                .expect("bind retained test image content");
+            let replaced_candidate = candidate.clone();
+            let retained_original = candidate_root.path().join("retained-original");
+            install_before_descriptor_exec_hook(move || {
+                fs::rename(&replaced_candidate, retained_original)
+                    .expect("move retained image after final revalidation");
+                fs::copy(native_fixture_path(), &replaced_candidate)
+                    .expect("replace candidate path with a different executable");
+                make_executable(&replaced_candidate);
+            });
+            let arguments = [
+                OsString::from("gus-platform-launch-target"),
+                OsString::from("--exact"),
+                OsString::from(TEST_NAME),
+                OsString::from("--nocapture"),
+                OsString::from("--test-threads=1"),
+            ];
+            let mut environment = std::env::vars_os()
+                .filter(|(name, _)| name != DRIVER && name != TARGET)
+                .collect::<Vec<_>>();
+            environment.push((OsString::from(TARGET), OsString::from("1")));
+            let error = launch
+                .exec(&arguments, &environment)
+                .expect_err("successful descriptor exec must not return");
+            panic!("descriptor exec failed: {error}");
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test executable for launch driver"),
+        )
+        .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+        .env(DRIVER, "1")
+        .env_remove(TARGET)
+        .output()
+        .expect("run descriptor launch driver");
+        assert!(
+            output.status.success(),
+            "launch driver failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(MARKER),
+            "descriptor target marker missing: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn descriptor_execution_rejects_duplicate_environment_names() {
+        let (_owned_root, exclusions) = exclusion_fixture();
+        let inspection = DiscoveryInspection::inspect(&native_fixture_path(), &exclusions)
+            .expect("inspect native fixture");
+        let expected = inspection.candidate().content_digest();
+        let executable = inspection
+            .bind_expected_content(exclusions, expected)
+            .expect("bind fixture content");
+        let arguments = [OsString::from("git")];
+        let environment = [
+            (OsString::from("GUS_DUPLICATE"), OsString::from("one")),
+            (OsString::from("GUS_DUPLICATE"), OsString::from("two")),
+        ];
+
+        assert_eq!(
+            executable
+                .exec(&arguments, &environment)
+                .expect_err("duplicate names must reject before execution"),
+            RetainedExecError::InvalidEnvironment
         );
     }
 
