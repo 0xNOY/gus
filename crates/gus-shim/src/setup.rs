@@ -2,16 +2,25 @@ use sha2::{Digest as _, Sha256};
 use std::{
     env,
     ffi::OsString,
-    fs::{self, File, OpenOptions},
-    io::{Read as _, Write as _},
+    fs::{self, File},
+    io::Read as _,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::{
+    fd::AsRawFd as _,
+    unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+};
+#[cfg(unix)]
+use std::{fs::OpenOptions, io::Write as _};
 
 const OWNER_FILE: &str = ".gus-git-shim-owner-v1";
+#[cfg(unix)]
+const INSTALL_LOCK_FILE: &str = ".gus-git-shim-install.lock";
+#[cfg(unix)]
+const UPDATE_JOURNAL_FILE: &str = ".gus-git-shim-update-v1";
 
 fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
@@ -40,7 +49,10 @@ fn run(arguments: &[OsString]) -> Result<(), String> {
 
 fn setup(arguments: &[OsString]) -> Result<(), String> {
     #[cfg(not(unix))]
-    return Err("setup is not implemented on this platform yet".to_owned());
+    {
+        let _ = arguments;
+        Err("setup is not implemented on this platform yet".to_owned())
+    }
 
     #[cfg(unix)]
     {
@@ -52,6 +64,7 @@ fn setup(arguments: &[OsString]) -> Result<(), String> {
         let target = select_target(&path, real_git_index, requested_target.as_deref())?;
         let destination = target.join("git");
         let owner = target.join(OWNER_FILE);
+        validate_target_directory(&target)?;
 
         println!("GUS shim source: {}", source.display());
         println!("Install target: {}", destination.display());
@@ -60,11 +73,14 @@ fn setup(arguments: &[OsString]) -> Result<(), String> {
             return Ok(());
         }
 
-        let installed = install_new_shim(&source, &destination, &owner)?;
+        let installed = install_shim(&source, &destination, &owner)?;
         if let Err(error) = verify_installed_shim(&destination) {
             if installed && is_owned_shim(&destination, &owner) {
                 let _ = fs::remove_file(&destination);
                 let _ = fs::remove_file(&owner);
+                if let Ok(directory) = open_target_directory(&target) {
+                    let _ = directory.sync_all();
+                }
             }
             return Err(error);
         }
@@ -74,6 +90,7 @@ fn setup(arguments: &[OsString]) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn parse_setup_arguments(arguments: &[OsString]) -> Result<(bool, Option<PathBuf>), String> {
     let mut dry_run = false;
     let mut target = None;
@@ -95,6 +112,7 @@ fn parse_setup_arguments(arguments: &[OsString]) -> Result<(bool, Option<PathBuf
     Ok((dry_run, target))
 }
 
+#[cfg(unix)]
 fn shim_source() -> Result<PathBuf, String> {
     let current = env::current_exe().map_err(|error| format!("cannot locate gus: {error}"))?;
     let directory = current
@@ -121,8 +139,16 @@ fn executable_path_entries() -> Result<Vec<PathBuf>, String> {
                 entry.display()
             ));
         }
-        let canonical = fs::canonicalize(&entry)
-            .map_err(|error| format!("cannot resolve PATH entry {}: {error}", entry.display()))?;
+        let canonical = match fs::canonicalize(&entry) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot resolve PATH entry {}: {error}",
+                    entry.display()
+                ));
+            }
+        };
         if !entries.contains(&canonical) {
             entries.push(canonical);
         }
@@ -135,13 +161,17 @@ fn first_git_index(path: &[PathBuf]) -> Option<usize> {
         .position(|directory| git_path(directory).is_file())
 }
 
+#[cfg(unix)]
 fn first_unowned_git_index(path: &[PathBuf]) -> Option<usize> {
     path.iter().position(|directory| {
         let git = git_path(directory);
-        git.is_file() && !is_owned_shim(&git, &directory.join(OWNER_FILE))
+        git.is_file()
+            && !is_owned_shim(&git, &directory.join(OWNER_FILE))
+            && read_update_journal(&directory.join(UPDATE_JOURNAL_FILE)).is_err()
     })
 }
 
+#[cfg(unix)]
 fn is_owned_shim(shim: &Path, owner: &Path) -> bool {
     owner.is_file()
         && read_owner_digest(owner)
@@ -157,6 +187,7 @@ fn git_path(directory: &Path) -> PathBuf {
     directory.join(name)
 }
 
+#[cfg(unix)]
 fn select_target(
     path: &[PathBuf],
     real_git_index: usize,
@@ -187,62 +218,112 @@ fn select_target(
 }
 
 #[cfg(unix)]
-fn install_new_shim(source: &Path, destination: &Path, owner: &Path) -> Result<bool, String> {
-    let digest = file_digest(source)?;
-    if !destination.exists() && owner.is_file() && read_owner_digest(owner)? == digest {
-        fs::remove_file(owner)
-            .map_err(|error| format!("cannot recover {}: {error}", owner.display()))?;
-    }
-    if destination.exists() || owner.exists() {
-        if destination.is_file()
-            && owner.is_file()
-            && read_owner_digest(owner)? == digest
-            && file_digest(destination)? == digest
-        {
-            return Ok(false);
+fn install_shim(source: &Path, destination: &Path, owner: &Path) -> Result<bool, String> {
+    let target = destination
+        .parent()
+        .ok_or_else(|| "install target has no parent".to_owned())?;
+    let directory = open_target_directory(target)?;
+    let _lock = acquire_install_lock(target)?;
+    recover_interrupted_update(target, destination, owner, &directory)?;
+
+    let suffix = format!("{}-{}", std::process::id(), monotonic_suffix()?);
+    let staged_shim = target.join(format!(".gus-git-shim-{suffix}.tmp"));
+    let staged_owner = target.join(format!(".gus-owner-{suffix}.tmp"));
+    let digest = stage_executable(source, &staged_shim)?;
+    write_new_file(
+        &staged_owner,
+        format!("sha256={digest}\n").as_bytes(),
+        0o600,
+    )?;
+
+    let result = if !destination.exists() && !owner.exists() {
+        publish_no_replace(&staged_owner, owner)?;
+        directory
+            .sync_all()
+            .map_err(|error| sync_directory_error(&error))?;
+        if let Err(error) = publish_no_replace(&staged_shim, destination) {
+            let _ = fs::remove_file(owner);
+            let _ = directory.sync_all();
+            Err(error)
+        } else {
+            directory
+                .sync_all()
+                .map_err(|error| sync_directory_error(&error))?;
+            Ok(true)
         }
-        return Err(format!(
+    } else if destination.is_file() && owner.is_file() {
+        let current = secure_file_digest(destination)?;
+        let recorded = read_owner_digest(owner)?;
+        if current != recorded {
+            Err(format!(
+                "the existing Git at {} is not owned by GUS",
+                destination.display()
+            ))
+        } else if current == digest {
+            Ok(false)
+        } else {
+            update_owned_shim(
+                target,
+                destination,
+                owner,
+                &staged_shim,
+                &staged_owner,
+                &current,
+                &digest,
+                &directory,
+            )?;
+            Ok(false)
+        }
+    } else if !destination.exists() && owner.is_file() {
+        let _ = read_owner_digest(owner)?;
+        fs::remove_file(owner)
+            .and_then(|()| directory.sync_all())
+            .map_err(|error| format!("cannot recover {}: {error}", owner.display()))?;
+        publish_no_replace(&staged_owner, owner)?;
+        directory
+            .sync_all()
+            .map_err(|error| sync_directory_error(&error))?;
+        publish_no_replace(&staged_shim, destination)?;
+        directory
+            .sync_all()
+            .map_err(|error| sync_directory_error(&error))?;
+        Ok(true)
+    } else {
+        Err(format!(
             "refusing to overwrite existing {} or ownership metadata",
             destination.display()
-        ));
-    }
-
-    let process = std::process::id();
-    let staged_shim = destination.with_file_name(format!(".gus-git-shim-{process}.tmp"));
-    let staged_owner = owner.with_file_name(format!(".gus-owner-{process}.tmp"));
-    let result = (|| {
-        copy_executable(source, &staged_shim)?;
-        write_new_file(
-            &staged_owner,
-            format!("sha256={digest}\n").as_bytes(),
-            0o600,
-        )?;
-        fs::rename(&staged_owner, owner)
-            .map_err(|error| format!("cannot publish {}: {error}", owner.display()))?;
-        if let Err(error) = fs::rename(&staged_shim, destination) {
-            let _ = fs::remove_file(owner);
-            return Err(format!("cannot publish {}: {error}", destination.display()));
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&staged_shim);
-        let _ = fs::remove_file(&staged_owner);
-    }
-    result.map(|()| true)
+        ))
+    };
+    let _ = fs::remove_file(&staged_shim);
+    let _ = fs::remove_file(&staged_owner);
+    result
 }
 
 #[cfg(unix)]
-fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
-    let mut input =
-        File::open(source).map_err(|error| format!("cannot open {}: {error}", source.display()))?;
+fn stage_executable(source: &Path, destination: &Path) -> Result<String, String> {
+    let mut input = open_checked_file(source, false)?;
     let mut output = new_file(destination, 0o700)?;
-    std::io::copy(&mut input, &mut output)
-        .and_then(|_| output.sync_all())
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        output
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("cannot stage {}: {error}", destination.display()))?;
+    }
+    output
+        .sync_all()
         .map_err(|error| format!("cannot stage {}: {error}", destination.display()))?;
     fs::set_permissions(destination, fs::Permissions::from_mode(0o755))
         .and_then(|()| output.sync_all())
-        .map_err(|error| format!("cannot make {} executable: {error}", destination.display()))
+        .map_err(|error| format!("cannot make {} executable: {error}", destination.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(unix)]
@@ -263,9 +344,243 @@ fn new_file(path: &Path, mode: u32) -> Result<File, String> {
         .map_err(|error| format!("cannot create {}: {error}", path.display()))
 }
 
+#[cfg(unix)]
+fn validate_target_directory(path: &Path) -> Result<(), String> {
+    open_target_directory(path).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn validate_target_directory(_path: &Path) -> Result<(), String> {
+    Err("setup is not implemented on this platform yet".to_owned())
+}
+
+#[cfg(unix)]
+fn open_target_directory(path: &Path) -> Result<File, String> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("cannot securely open {}: {error}", path.display()))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and only reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != effective_user || metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} must be a non-group/world-writable directory owned by the current user",
+            path.display()
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_checked_file(path: &Path, require_single_link: bool) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("cannot securely open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and only reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != effective_user
+        || metadata.mode() & 0o022 != 0
+        || (require_single_link && metadata.nlink() != 1)
+    {
+        return Err(format!(
+            "{} must be an unmodified regular file owned by the current user",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn acquire_install_lock(target: &Path) -> Result<File, String> {
+    let path = target.join(INSTALL_LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|error| format!("cannot open install lock {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect install lock {}: {error}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and only reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != effective_user
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(format!("install lock {} is not private", path.display()));
+    }
+    // SAFETY: the descriptor is live for this function and `flock` has no pointer arguments.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "another GUS setup is active for {}: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn publish_no_replace(staged: &Path, destination: &Path) -> Result<(), String> {
+    fs::hard_link(staged, destination).map_err(|error| {
+        format!(
+            "cannot publish {} without replacing an existing file: {error}",
+            destination.display()
+        )
+    })?;
+    fs::remove_file(staged)
+        .map_err(|error| format!("cannot remove staged {}: {error}", staged.display()))
+}
+
+#[cfg(unix)]
+fn monotonic_suffix() -> Result<u128, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))
+}
+
+#[cfg(unix)]
+fn sync_directory_error(error: &std::io::Error) -> String {
+    format!("cannot durably update the install directory: {error}")
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn update_owned_shim(
+    target: &Path,
+    destination: &Path,
+    owner: &Path,
+    staged_shim: &Path,
+    staged_owner: &Path,
+    old_digest: &str,
+    new_digest: &str,
+    directory: &File,
+) -> Result<(), String> {
+    let journal = target.join(UPDATE_JOURNAL_FILE);
+    let backup = target.join(".gus-git-shim-previous-v1");
+    if journal.exists() || backup.exists() {
+        return Err("an unrecognized GUS update recovery file already exists".to_owned());
+    }
+    write_new_file(
+        &journal,
+        format!("old={old_digest}\nnew={new_digest}\n").as_bytes(),
+        0o600,
+    )?;
+    fs::hard_link(destination, &backup)
+        .and_then(|()| directory.sync_all())
+        .map_err(|error| format!("cannot retain the previous Git shim: {error}"))?;
+    fs::rename(staged_shim, destination)
+        .and_then(|()| directory.sync_all())
+        .map_err(|error| format!("cannot activate the updated Git shim: {error}"))?;
+    if let Err(error) = verify_installed_shim(destination) {
+        fs::rename(&backup, destination)
+            .and_then(|()| directory.sync_all())
+            .map_err(|rollback| format!("{error}; rollback failed: {rollback}"))?;
+        let _ = fs::remove_file(&journal);
+        let _ = directory.sync_all();
+        return Err(error);
+    }
+    fs::rename(staged_owner, owner)
+        .and_then(|()| directory.sync_all())
+        .map_err(|error| format!("cannot publish updated ownership metadata: {error}"))?;
+    fs::remove_file(&backup)
+        .and_then(|()| fs::remove_file(&journal))
+        .and_then(|()| directory.sync_all())
+        .map_err(|error| format!("cannot finish the Git shim update: {error}"))
+}
+
+#[cfg(unix)]
+fn recover_interrupted_update(
+    target: &Path,
+    destination: &Path,
+    owner: &Path,
+    directory: &File,
+) -> Result<(), String> {
+    let journal = target.join(UPDATE_JOURNAL_FILE);
+    if !journal.exists() {
+        return Ok(());
+    }
+    let backup = target.join(".gus-git-shim-previous-v1");
+    let (old, new) = read_update_journal(&journal)?;
+    let active = secure_file_digest(destination)?;
+    let recorded = read_owner_digest(owner)?;
+    match (active.as_str(), recorded.as_str()) {
+        (active, recorded) if active == old && recorded == old => {}
+        (active, recorded) if active == new && recorded == old => {
+            if verify_installed_shim(destination).is_ok() {
+                let staged =
+                    target.join(format!(".gus-recovered-owner-{}.tmp", monotonic_suffix()?));
+                write_new_file(&staged, format!("sha256={new}\n").as_bytes(), 0o600)?;
+                fs::rename(&staged, owner)
+                    .and_then(|()| directory.sync_all())
+                    .map_err(|error| format!("cannot recover ownership metadata: {error}"))?;
+            } else {
+                if secure_file_digest(&backup)? != old {
+                    return Err("the retained pre-update Git shim was modified".to_owned());
+                }
+                fs::rename(&backup, destination)
+                    .and_then(|()| directory.sync_all())
+                    .map_err(|error| format!("cannot roll back interrupted update: {error}"))?;
+            }
+        }
+        (active, recorded) if active == new && recorded == new => {}
+        _ => return Err("interrupted update state does not match its journal".to_owned()),
+    }
+    if backup.exists() {
+        fs::remove_file(&backup)
+            .map_err(|error| format!("cannot remove recovered backup: {error}"))?;
+    }
+    fs::remove_file(&journal)
+        .and_then(|()| directory.sync_all())
+        .map_err(|error| format!("cannot finish interrupted update recovery: {error}"))
+}
+
+#[cfg(unix)]
+fn read_update_journal(path: &Path) -> Result<(String, String), String> {
+    let text = read_checked_text(path, 256)?;
+    let mut lines = text.lines();
+    let old = lines.next().and_then(|line| line.strip_prefix("old="));
+    let new = lines.next().and_then(|line| line.strip_prefix("new="));
+    if lines.next().is_some() || !old.is_some_and(valid_digest) || !new.is_some_and(valid_digest) {
+        return Err(format!("{} is not a valid update journal", path.display()));
+    }
+    Ok((
+        old.unwrap_or_default().to_owned(),
+        new.unwrap_or_default().to_owned(),
+    ))
+}
+
 fn file_digest(path: &Path) -> Result<String, String> {
+    #[cfg(unix)]
+    let mut file = open_checked_file(path, false)?;
+    #[cfg(not(unix))]
     let mut file =
         File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    digest_reader(&mut file, path)
+}
+
+#[cfg(unix)]
+fn secure_file_digest(path: &Path) -> Result<String, String> {
+    let mut file = open_checked_file(path, false)?;
+    digest_reader(&mut file, path)
+}
+
+fn digest_reader(file: &mut File, path: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -281,16 +596,43 @@ fn file_digest(path: &Path) -> Result<String, String> {
 }
 
 fn read_owner_digest(path: &Path) -> Result<String, String> {
+    #[cfg(unix)]
+    let text = read_checked_text(path, 128)?;
+    #[cfg(not(unix))]
     let text = fs::read_to_string(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     text.strip_prefix("sha256=")
         .and_then(|value| value.strip_suffix('\n'))
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .filter(|value| valid_digest(value))
         .map(str::to_owned)
         .ok_or_else(|| format!("{} is not valid GUS ownership metadata", path.display()))
 }
 
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(unix)]
+fn read_checked_text(path: &Path, limit: u64) -> Result<String, String> {
+    let file = open_checked_file(path, true)?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(format!("{} exceeds its size limit", path.display()));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8", path.display()))
+}
+
 fn verify_installed_shim(path: &Path) -> Result<(), String> {
+    let probe = Command::new(path)
+        .arg("--gus-shim-probe")
+        .output()
+        .map_err(|error| format!("cannot probe {}: {error}", path.display()))?;
+    if !probe.status.success() || probe.stdout != b"gus-git-shim-v1\n" || !probe.stderr.is_empty() {
+        return Err(format!("{} is not a GUS Git shim", path.display()));
+    }
     let output = Command::new(path)
         .arg("--version")
         .output()
@@ -310,6 +652,7 @@ fn active_owned_shim() -> Result<(PathBuf, PathBuf), String> {
     let index = first_git_index(&path).ok_or_else(|| "Git is not present on PATH".to_owned())?;
     let shim = git_path(&path[index]);
     let owner = path[index].join(OWNER_FILE);
+    validate_target_directory(&path[index])?;
     if !owner.is_file() {
         return Err(format!(
             "the active Git at {} is not owned by GUS",
@@ -317,6 +660,9 @@ fn active_owned_shim() -> Result<(PathBuf, PathBuf), String> {
         ));
     }
     let expected = read_owner_digest(&owner)?;
+    #[cfg(unix)]
+    let actual = secure_file_digest(&shim)?;
+    #[cfg(not(unix))]
     let actual = file_digest(&shim)?;
     if expected != actual {
         return Err(format!(
@@ -335,11 +681,44 @@ fn doctor() -> Result<(), String> {
 }
 
 fn uninstall() -> Result<(), String> {
-    let (shim, owner) = active_owned_shim()?;
-    fs::remove_file(&shim).map_err(|error| format!("cannot remove {}: {error}", shim.display()))?;
-    fs::remove_file(&owner)
-        .map_err(|error| format!("cannot remove {}: {error}", owner.display()))?;
-    println!("Removed GUS Git shim: {}", shim.display());
-    println!("Open a new shell or restart the IDE if it cached the removed Git path");
-    Ok(())
+    #[cfg(not(unix))]
+    return Err("uninstall is not implemented on this platform yet".to_owned());
+
+    #[cfg(unix)]
+    {
+        let (shim, owner) = active_owned_shim()?;
+        let directory = open_target_directory(
+            shim.parent()
+                .ok_or_else(|| "active Git shim has no parent directory".to_owned())?,
+        )?;
+        fs::remove_file(&shim)
+            .map_err(|error| format!("cannot remove {}: {error}", shim.display()))?;
+        fs::remove_file(&owner)
+            .and_then(|()| directory.sync_all())
+            .map_err(|error| format!("cannot remove {}: {error}", owner.display()))?;
+        println!("Removed GUS Git shim: {}", shim.display());
+        println!("Open a new shell or restart the IDE if it cached the removed Git path");
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_replace_publish_preserves_a_colliding_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let staged = directory.path().join("staged");
+        let destination = directory.path().join("destination");
+        fs::write(&staged, b"gus").expect("write staged file");
+        fs::write(&destination, b"third party").expect("write collision");
+
+        assert!(publish_no_replace(&staged, &destination).is_err());
+        assert_eq!(
+            fs::read(&destination).expect("read collision"),
+            b"third party"
+        );
+        assert_eq!(fs::read(&staged).expect("read staged"), b"gus");
+    }
 }

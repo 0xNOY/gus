@@ -242,6 +242,17 @@ fn version_is_forwarded_by_the_real_git_image() {
 }
 
 #[test]
+fn private_probe_identifies_the_gus_shim() {
+    let output = shim()
+        .arg("--gus-shim-probe")
+        .output()
+        .expect("probe GUS Git shim");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"gus-git-shim-v1\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn status_preserves_porcelain_output_without_profile_selection() {
     let repository = tempfile::tempdir().expect("temporary repository");
     initialize_repository(repository.path());

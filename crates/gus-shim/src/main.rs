@@ -38,6 +38,10 @@ fn main() -> ExitCode {
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn run_unix() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.as_slice() == ["--gus-shim-probe"] {
+        println!("gus-git-shim-v1");
+        return ExitCode::SUCCESS;
+    }
     match ShimInvocation::parse(&arguments).route() {
         InitialRoute::Forward(admission) => execute_git(admission),
         InitialRoute::Resolve(required) => match selected_profile() {
