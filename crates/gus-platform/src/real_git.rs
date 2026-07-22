@@ -6,7 +6,12 @@ use std::{
 };
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use std::{collections::HashSet, convert::Infallible};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    os::fd::OwnedFd,
+    time::{Duration, Instant},
+};
 
 #[cfg(unix)]
 mod resolver_unix;
@@ -15,13 +20,16 @@ mod resolver_windows;
 
 #[cfg(unix)]
 use std::ffi::{CString, OsString};
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
 use std::fs::OpenOptions;
 #[cfg(windows)]
 use std::{ffi::c_void, mem::size_of, ptr};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use gus_core::VerifiedGitSemantics;
 
 #[cfg(windows)]
 use std::fs;
@@ -282,7 +290,7 @@ pub struct DiscoveryInspection {
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "retained by the next verified Git probe/execution layer"
     )
@@ -293,6 +301,23 @@ pub(crate) struct RetainedExecutable {
     expected_content_digest: [u8; 32],
 }
 
+/// A retained executable whose package/vendor/operator provenance was
+/// verified before the restricted Git probe.
+///
+/// No constructor exists until the provenance verifier is implemented. Tests
+/// construct this crate-private state only to exercise process supervision.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "constructed by the upcoming real-Git provenance verifier"
+    )
+)]
+pub(crate) struct ProvenanceVerifiedExecutable {
+    retained: RetainedExecutable,
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 impl fmt::Debug for RetainedExecutable {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -301,9 +326,84 @@ impl fmt::Debug for RetainedExecutable {
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+type ProbeOutputHook = Box<dyn FnOnce(&[u8])>;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
 thread_local! {
     static BEFORE_DESCRIPTOR_EXEC_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static AFTER_RETAINED_PROBE_HOOK: std::cell::RefCell<Option<ProbeOutputHook>> =
+        std::cell::RefCell::new(None);
+    static BEFORE_PROBE_COLLECTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+const MAX_GIT_PROBE_OUTPUT: usize = 4096;
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+struct ProbeProcess {
+    process_id: libc::pid_t,
+    output: OwnedFd,
+    exec_error: OwnedFd,
+    status: Option<libc::c_int>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl Drop for ProbeProcess {
+    fn drop(&mut self) {
+        // The child creates a dedicated process group before it can execute
+        // the candidate. Kill ordinary descendants on every completion path.
+        // SAFETY: a negated positive child PID addresses that process group.
+        unsafe {
+            libc::kill(-self.process_id, libc::SIGKILL);
+        }
+        if self.status.is_none() {
+            // SAFETY: a positive PID returned by `fork` identifies this child.
+            unsafe {
+                libc::kill(self.process_id, libc::SIGKILL);
+            }
+            let mut status = 0;
+            loop {
+                // SAFETY: `status` is valid storage and this object owns the
+                // unreaped child PID.
+                let result = unsafe { libc::waitpid(self.process_id, &raw mut status, 0) };
+                if result == self.process_id
+                    || result == -1
+                        && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+struct EncodedCStringList {
+    _storage: Vec<CString>,
+    pointers: Vec<*const libc::c_char>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl EncodedCStringList {
+    fn new(storage: Vec<CString>) -> Self {
+        let mut pointers = storage
+            .iter()
+            .map(|value| value.as_ptr())
+            .collect::<Vec<_>>();
+        pointers.push(std::ptr::null());
+        Self {
+            _storage: storage,
+            pointers,
+        }
+    }
+
+    fn as_ptr(&self) -> *const *const libc::c_char {
+        self.pointers.as_ptr()
+    }
 }
 
 /// GUS-owned filesystem objects that may never be selected as real Git.
@@ -713,7 +813,7 @@ impl DiscoveryInspection {
     /// discovery, artifact, ACL, or exclusion evidence is stale.
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "retained by the next verified Git probe/execution layer"
         )
@@ -741,12 +841,175 @@ impl DiscoveryInspection {
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
+        dead_code,
+        reason = "retained by the next verified Git probe/execution layer"
+    )
+)]
+impl ProvenanceVerifiedExecutable {
+    /// Probes `git --version` through the exact retained descriptor.
+    ///
+    /// The child has closed stdin, discarded stderr, bounded stdout, a closed
+    /// descriptor world, and a finite deadline. The retained evidence is
+    /// revalidated before and after the child runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns fail-closed if the retained artifact changes, the child cannot
+    /// be supervised, or the output is not a supported Git version record.
+    pub(crate) fn probe_git(&self) -> Result<VerifiedGitSemantics, RetainedExecError> {
+        let arguments = [OsString::from("git"), OsString::from("--version")];
+        let environment = [
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                OsString::from("/dev/null"),
+            ),
+            (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+            (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
+            (OsString::from("HOME"), OsString::from("/")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+        ];
+        let output = self.run_probe(
+            &arguments,
+            &environment,
+            GIT_PROBE_TIMEOUT,
+            MAX_GIT_PROBE_OUTPUT,
+        )?;
+        let output =
+            std::str::from_utf8(&output).map_err(|_| RetainedExecError::InvalidGitProbe)?;
+        VerifiedGitSemantics::from_version_output(
+            self.retained.inspection.candidate.identity().digest(),
+            output,
+        )
+        .map_err(|_| RetainedExecError::InvalidGitProbe)
+    }
+
+    fn run_probe(
+        &self,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        timeout: Duration,
+        output_limit: usize,
+    ) -> Result<Vec<u8>, RetainedExecError> {
+        if arguments.is_empty() || timeout.is_zero() || output_limit == 0 {
+            return Err(RetainedExecError::InvalidGitProbe);
+        }
+        let arguments = encode_arguments(arguments)?;
+        let environment = encode_environment(environment)?;
+
+        self.retained.revalidate_for_execution()?;
+        let (output_reader, output_writer) = cloexec_pipe()?;
+        let (exec_error_reader, exec_error_writer) = cloexec_pipe()?;
+        set_nonblocking(&output_reader)?;
+        set_nonblocking(&exec_error_reader)?;
+        let null = ensure_fd_at_least(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .map_err(|error| retained_io_error(&error))?
+                .into(),
+            10,
+        )?;
+        let reader_fd = output_reader.as_raw_fd();
+        let writer_fd = output_writer.as_raw_fd();
+        let error_reader_fd = exec_error_reader.as_raw_fd();
+        let error_writer_fd = exec_error_writer.as_raw_fd();
+        let null_fd = null.as_raw_fd();
+        let probe_executable =
+            duplicate_fd(self.retained.inspection.candidate.lease.as_raw_fd(), 10)?;
+        let executable_fd = probe_executable.as_raw_fd();
+
+        #[cfg(test)]
+        BEFORE_DESCRIPTOR_EXEC_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+
+        // SAFETY: all fallible allocation and encoding is complete. The child
+        // performs only async-signal-safe descriptor operations, `fexecve`,
+        // and `_exit` before replacing its address space.
+        let process_id = unsafe { libc::fork() };
+        if process_id == -1 {
+            return Err(last_retained_io_error());
+        }
+        if process_id == 0 {
+            // SAFETY: these are raw syscalls over descriptors inherited from
+            // this fork. Every failure terminates through `_exit` without
+            // invoking Rust destructors in the post-fork child.
+            unsafe {
+                if libc::setpgid(0, 0) == -1 {
+                    write_probe_exec_error(error_writer_fd);
+                    libc::_exit(124);
+                }
+                libc::close(reader_fd);
+                libc::close(error_reader_fd);
+                if libc::dup2(null_fd, libc::STDIN_FILENO) == -1
+                    || libc::dup2(writer_fd, libc::STDOUT_FILENO) == -1
+                    || libc::dup2(null_fd, libc::STDERR_FILENO) == -1
+                    || libc::dup2(executable_fd, 3) == -1
+                    || libc::dup2(error_writer_fd, 4) == -1
+                {
+                    write_probe_exec_error(error_writer_fd);
+                    libc::_exit(125);
+                }
+                if libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) == -1
+                    || libc::fcntl(4, libc::F_SETFD, libc::FD_CLOEXEC) == -1
+                    || close_probe_fds_from_five() == -1
+                {
+                    write_probe_exec_error(4);
+                    libc::_exit(125);
+                }
+                libc::fexecve(3, arguments.as_ptr(), environment.as_ptr());
+                write_probe_exec_error(4);
+                libc::_exit(126);
+            }
+        }
+
+        drop(output_writer);
+        drop(exec_error_writer);
+        drop(null);
+        drop(probe_executable);
+        let mut child = ProbeProcess {
+            process_id,
+            output: output_reader,
+            exec_error: exec_error_reader,
+            status: None,
+        };
+        let output = collect_probe_output(&mut child, timeout, output_limit)?;
+        #[cfg(test)]
+        AFTER_RETAINED_PROBE_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(&output);
+            }
+        });
+        self.retained.revalidate_for_execution()?;
+        Ok(output)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg_attr(
+    not(test),
+    allow(
         dead_code,
         reason = "retained by the next verified Git probe/execution layer"
     )
 )]
 impl RetainedExecutable {
+    fn revalidate_for_execution(&self) -> Result<(), RetainedExecError> {
+        self.inspection.revalidate(&self.exclusions)?;
+        if !self
+            .inspection
+            .candidate
+            .matches_content_digest(self.expected_content_digest)
+        {
+            return Err(RetainedExecError::ContentMismatch);
+        }
+        Ok(())
+    }
+
     /// Revalidates all retained evidence and replaces the current process with
     /// the exact inspected executable descriptor.
     ///
@@ -766,38 +1029,10 @@ impl RetainedExecutable {
         if arguments.is_empty() {
             return Err(RetainedExecError::EmptyArguments);
         }
-        let arguments = arguments
-            .iter()
-            .map(|argument| cstring_from_os(argument))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut environment_names = HashSet::with_capacity(environment.len());
-        let mut encoded_environment = Vec::with_capacity(environment.len());
-        for (name, value) in environment {
-            if !environment_names.insert(name.as_bytes().to_vec()) {
-                return Err(RetainedExecError::InvalidEnvironment);
-            }
-            encoded_environment.push(environment_entry(name, value)?);
-        }
+        let arguments = encode_arguments(arguments)?;
+        let encoded_environment = encode_environment(environment)?;
 
-        self.inspection.revalidate(&self.exclusions)?;
-        if !self
-            .inspection
-            .candidate
-            .matches_content_digest(self.expected_content_digest)
-        {
-            return Err(RetainedExecError::ContentMismatch);
-        }
-
-        let mut argument_pointers = arguments
-            .iter()
-            .map(|argument| argument.as_ptr())
-            .collect::<Vec<_>>();
-        argument_pointers.push(std::ptr::null());
-        let mut environment_pointers = encoded_environment
-            .iter()
-            .map(|entry| entry.as_ptr())
-            .collect::<Vec<_>>();
-        environment_pointers.push(std::ptr::null());
+        self.revalidate_for_execution()?;
 
         #[cfg(test)]
         BEFORE_DESCRIPTOR_EXEC_HOOK.with(|hook| {
@@ -812,8 +1047,8 @@ impl RetainedExecutable {
         unsafe {
             libc::fexecve(
                 self.inspection.candidate.lease.as_raw_fd(),
-                argument_pointers.as_ptr(),
-                environment_pointers.as_ptr(),
+                arguments.as_ptr(),
+                encoded_environment.as_ptr(),
             )
         };
         let error = io::Error::last_os_error();
@@ -825,9 +1060,284 @@ impl RetainedExecutable {
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn encode_arguments(arguments: &[OsString]) -> Result<EncodedCStringList, RetainedExecError> {
+    let encoded = arguments
+        .iter()
+        .map(|argument| cstring_from_os(argument))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EncodedCStringList::new(encoded))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn encode_environment(
+    environment: &[(OsString, OsString)],
+) -> Result<EncodedCStringList, RetainedExecError> {
+    let mut names = HashSet::with_capacity(environment.len());
+    let mut encoded = Vec::with_capacity(environment.len());
+    for (name, value) in environment {
+        if !names.insert(name.as_bytes().to_vec()) {
+            return Err(RetainedExecError::InvalidEnvironment);
+        }
+        encoded.push(environment_entry(name, value)?);
+    }
+    Ok(EncodedCStringList::new(encoded))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd), RetainedExecError> {
+    let mut descriptors = [-1; 2];
+    // SAFETY: `descriptors` is exact writable storage for two returned FDs.
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(last_retained_io_error());
+    }
+    // SAFETY: successful `pipe2` returns two new owned descriptors.
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: as above, the write descriptor is independently owned.
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    Ok((
+        ensure_fd_at_least(reader, 10)?,
+        ensure_fd_at_least(writer, 10)?,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn ensure_fd_at_least(
+    descriptor: OwnedFd,
+    minimum: libc::c_int,
+) -> Result<OwnedFd, RetainedExecError> {
+    if descriptor.as_raw_fd() >= minimum {
+        return Ok(descriptor);
+    }
+    // SAFETY: the source descriptor is live and F_DUPFD_CLOEXEC duplicates it
+    // at or above the requested lower bound.
+    let duplicated = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
+    if duplicated == -1 {
+        return Err(last_retained_io_error());
+    }
+    // SAFETY: successful fcntl returned one new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn duplicate_fd(
+    descriptor: libc::c_int,
+    minimum: libc::c_int,
+) -> Result<OwnedFd, RetainedExecError> {
+    // SAFETY: the source descriptor is retained by the inspection and
+    // F_DUPFD_CLOEXEC returns an independently owned descriptor.
+    let duplicated = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, minimum) };
+    if duplicated == -1 {
+        return Err(last_retained_io_error());
+    }
+    // SAFETY: successful fcntl returned one new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn set_nonblocking(descriptor: &OwnedFd) -> Result<(), RetainedExecError> {
+    // SAFETY: F_GETFL only queries status flags on the live descriptor.
+    let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(last_retained_io_error());
+    }
+    // SAFETY: F_SETFL updates status flags on the live descriptor.
+    if unsafe {
+        libc::fcntl(
+            descriptor.as_raw_fd(),
+            libc::F_SETFL,
+            flags | libc::O_NONBLOCK,
+        )
+    } == -1
+    {
+        return Err(last_retained_io_error());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn collect_probe_output(
+    child: &mut ProbeProcess,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<Vec<u8>, RetainedExecError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(RetainedExecError::ProbeTimedOut)?;
+    let mut output = Vec::new();
+    let mut exec_error = Vec::new();
+
+    #[cfg(test)]
+    BEFORE_PROBE_COLLECTION_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(RetainedExecError::ProbeTimedOut);
+        }
+        update_probe_status(child)?;
+        drain_probe_fd(&child.output, &mut output, output_limit)?;
+        drain_probe_fd(
+            &child.exec_error,
+            &mut exec_error,
+            std::mem::size_of::<libc::c_int>(),
+        )?;
+        if child.status.is_some() {
+            if Instant::now() >= deadline {
+                return Err(RetainedExecError::ProbeTimedOut);
+            }
+            break;
+        }
+
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(RetainedExecError::ProbeTimedOut)?;
+        let timeout_ms = i32::try_from(remaining.as_millis().clamp(1, 50)).unwrap_or(50);
+        let mut descriptors = [
+            libc::pollfd {
+                fd: child.output.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: child.exec_error.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `descriptors` is valid mutable storage for two poll records.
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout_ms) };
+        if result == -1 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(last_retained_io_error());
+        }
+    }
+
+    if !exec_error.is_empty() {
+        return Err(RetainedExecError::ProbeFailed);
+    }
+    let status = child.status.expect("probe loop stops only after waitpid");
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(RetainedExecError::ProbeFailed);
+    }
+    Ok(output)
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn update_probe_status(child: &mut ProbeProcess) -> Result<(), RetainedExecError> {
+    if child.status.is_some() {
+        return Ok(());
+    }
+    let mut status = 0;
+    // SAFETY: `status` is exact writable storage and this object owns the PID.
+    let result = unsafe { libc::waitpid(child.process_id, &raw mut status, libc::WNOHANG) };
+    if result == child.process_id {
+        child.status = Some(status);
+        return Ok(());
+    }
+    if result == -1 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+        return Err(last_retained_io_error());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn drain_probe_fd(
+    descriptor: &OwnedFd,
+    destination: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), RetainedExecError> {
+    let mut buffer = [0_u8; 1024];
+    loop {
+        // SAFETY: the descriptor is live and `buffer` is writable for its
+        // exact declared length.
+        let count = unsafe {
+            libc::read(
+                descriptor.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if count > 0 {
+            let count = usize::try_from(count).map_err(|_| RetainedExecError::ProbeFailed)?;
+            if destination.len().saturating_add(count) > limit {
+                return Err(RetainedExecError::ProbeOutputTooLarge);
+            }
+            destination.extend_from_slice(&buffer[..count]);
+            continue;
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(retained_io_error(&error));
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn retained_io_error(error: &io::Error) -> RetainedExecError {
+    RetainedExecError::Io {
+        kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn last_retained_io_error() -> RetainedExecError {
+    retained_io_error(&io::Error::last_os_error())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn probe_errno() -> libc::c_int {
+    // SAFETY: called in the post-fork child to copy thread-local errno.
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(target_os = "freebsd")]
+unsafe fn probe_errno() -> libc::c_int {
+    // SAFETY: called in the post-fork child to copy thread-local errno.
+    unsafe { *libc::__error() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+unsafe fn write_probe_exec_error(descriptor: libc::c_int) {
+    // SAFETY: the caller is the post-fork child and supplies the dedicated
+    // pipe descriptor. A single `c_int` write is below PIPE_BUF.
+    let error = unsafe { probe_errno() };
+    let bytes = error.to_ne_bytes();
+    unsafe {
+        libc::write(descriptor, bytes.as_ptr().cast(), bytes.len());
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn close_probe_fds_from_five() -> libc::c_int {
+    // Linux support already requires kernels newer than close_range(2).
+    // SAFETY: the raw syscall closes the inclusive descriptor range only in
+    // the post-fork child; descriptors 0 through 4 are the explicit allowlist.
+    let result = unsafe { libc::syscall(libc::SYS_close_range, 5_u32, u32::MAX, 0_u32) };
+    if result == -1 { -1 } else { 0 }
+}
+
+#[cfg(target_os = "freebsd")]
+unsafe fn close_probe_fds_from_five() -> libc::c_int {
+    // SAFETY: FreeBSD closefrom closes every descriptor at or above five.
+    unsafe {
+        libc::closefrom(5);
+    }
+    0
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "retained by the next verified Git probe/execution layer"
     )
@@ -839,7 +1349,7 @@ fn cstring_from_os(value: &std::ffi::OsStr) -> Result<CString, RetainedExecError
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "retained by the next verified Git probe/execution layer"
     )
@@ -1078,7 +1588,7 @@ pub enum RealGitArtifactError {
 #[non_exhaustive]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "retained by the next verified Git probe/execution layer"
     )
@@ -1092,6 +1602,14 @@ pub(crate) enum RetainedExecError {
     InvalidArgument,
     #[error("a descriptor-exec environment entry is invalid or duplicated")]
     InvalidEnvironment,
+    #[error("the retained executable did not produce a valid supported Git version")]
+    InvalidGitProbe,
+    #[error("the retained executable probe exceeded its output bound")]
+    ProbeOutputTooLarge,
+    #[error("the retained executable probe exceeded its deadline")]
+    ProbeTimedOut,
+    #[error("the retained executable probe exited unsuccessfully")]
+    ProbeFailed,
     #[error("executable evidence became invalid before descriptor execution: {0}")]
     Artifact(#[from] RealGitArtifactError),
     #[error("failed to execute the retained descriptor: {kind:?} (OS code: {raw_os_error:?})")]
@@ -1107,6 +1625,28 @@ fn install_before_descriptor_exec_hook(hook: impl FnOnce() + 'static) {
         assert!(
             installed.borrow().is_none(),
             "only one descriptor-exec test hook may be installed per thread"
+        );
+        *installed.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+fn install_after_retained_probe_hook(hook: impl FnOnce(&[u8]) + 'static) {
+    AFTER_RETAINED_PROBE_HOOK.with(|installed| {
+        assert!(
+            installed.borrow().is_none(),
+            "only one post-probe test hook may be installed per thread"
+        );
+        *installed.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+fn install_before_probe_collection_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_PROBE_COLLECTION_HOOK.with(|installed| {
+        assert!(
+            installed.borrow().is_none(),
+            "only one pre-collection test hook may be installed per thread"
         );
         *installed.borrow_mut() = Some(Box::new(hook));
     });
@@ -3588,6 +4128,366 @@ mod tests {
                 .exec(&arguments, &environment)
                 .expect_err("duplicate names must reject before execution"),
             RetainedExecError::InvalidEnvironment
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn retained_fixture(path: &Path) -> (tempfile::TempDir, ProvenanceVerifiedExecutable) {
+        let owned_root = temporary_directory();
+        let exclusions =
+            ExecutableExclusionSet::new(owned_root.path(), 9).expect("build probe exclusions");
+        let inspection = DiscoveryInspection::inspect(path, &exclusions).expect("inspect fixture");
+        let expected = inspection.candidate().content_digest();
+        let executable = inspection
+            .bind_expected_content(exclusions, expected)
+            .expect("bind fixture content");
+        (
+            owned_root,
+            ProvenanceVerifiedExecutable {
+                retained: executable,
+            },
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_captures_bounded_stdout_and_preserves_authority() {
+        let (_owned_root, executable) = retained_fixture(&native_fixture_path());
+        let output = executable
+            .run_probe(
+                &[OsString::from("echo"), OsString::from("gus-probe-marker")],
+                &[],
+                Duration::from_secs(1),
+                64,
+            )
+            .expect("probe retained echo");
+        assert_eq!(output, b"gus-probe-marker\n");
+        executable
+            .retained
+            .revalidate_for_execution()
+            .expect("probe must preserve retained launch evidence");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_does_not_reopen_a_replaced_path() {
+        let candidate_root = temporary_directory();
+        let candidate = candidate_root.path().join("probe-candidate");
+        fs::copy(native_fixture_path(), &candidate).expect("copy echo probe fixture");
+        make_executable(&candidate);
+        let (_owned_root, executable) = retained_fixture(&candidate);
+        let replacement = candidate.clone();
+        let original = candidate_root.path().join("probe-original");
+        install_before_descriptor_exec_hook(move || {
+            fs::rename(&replacement, original).expect("move probe fixture after revalidation");
+            fs::copy("/usr/bin/false", &replacement).expect("replace probe path with false");
+            make_executable(&replacement);
+        });
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&captured);
+        install_after_retained_probe_hook(move |output| {
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = output.to_vec();
+        });
+
+        assert_eq!(
+            executable
+                .run_probe(
+                    &[OsString::from("echo"), OsString::from("retained-probe")],
+                    &[],
+                    Duration::from_secs(1),
+                    64,
+                )
+                .expect_err("changed namespace must reject after retained probe"),
+            RetainedExecError::Artifact(RealGitArtifactError::DiscoveryChainStale)
+        );
+        assert_eq!(
+            *captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            b"retained-probe\n"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_rejects_non_git_output() {
+        let (_owned_root, executable) = retained_fixture(&native_fixture_path());
+        assert_eq!(
+            executable
+                .probe_git()
+                .expect_err("echo is not a Git version probe"),
+            RetainedExecError::InvalidGitProbe
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_validates_the_native_git_version() {
+        #[cfg(target_os = "linux")]
+        let git = Path::new("/usr/bin/git");
+        #[cfg(target_os = "freebsd")]
+        let git = Path::new("/usr/local/bin/git");
+        let (_owned_root, executable) = retained_fixture(git);
+        let semantics = executable.probe_git().expect("probe installed native Git");
+        assert!(semantics.version_output().starts_with("git version 2."));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_isolates_stdin_and_inherited_descriptors() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        const DRIVER: &str = "GUS_PLATFORM_PROBE_ISOLATION_DRIVER";
+        const TARGET: &str = "GUS_PLATFORM_PROBE_ISOLATION_TARGET";
+        const TEST_NAME: &str =
+            "real_git::tests::retained_probe_isolates_stdin_and_inherited_descriptors";
+        const LEAKED_FD: libc::c_int = 200;
+
+        if std::env::var_os(TARGET).as_deref() == Some(OsStr::new("1")) {
+            let mut byte = 0_u8;
+            // SAFETY: one-byte storage is valid and stdin must be `/dev/null`.
+            assert_eq!(
+                unsafe { libc::read(libc::STDIN_FILENO, (&raw mut byte).cast(), 1) },
+                0,
+                "probe target inherited readable parent stdin"
+            );
+            // SAFETY: F_GETFD only queries whether this descriptor survived.
+            assert_eq!(
+                unsafe { libc::fcntl(LEAKED_FD, libc::F_GETFD) },
+                -1,
+                "probe target inherited a non-allowlisted descriptor"
+            );
+            let warning = b"discarded-warning";
+            // SAFETY: stderr must be a writable `/dev/null` descriptor and
+            // `warning` is readable for its exact length.
+            assert_eq!(
+                unsafe {
+                    libc::write(libc::STDERR_FILENO, warning.as_ptr().cast(), warning.len())
+                },
+                isize::try_from(warning.len()).expect("warning length fits isize"),
+                "probe stderr was not writable"
+            );
+            println!("gus-probe-isolation-ok");
+            return;
+        }
+
+        if std::env::var_os(DRIVER).as_deref() == Some(OsStr::new("1")) {
+            let candidate_root = temporary_directory();
+            let candidate = candidate_root.path().join("probe-isolation-image");
+            fs::copy(
+                std::env::current_exe().expect("current test image"),
+                &candidate,
+            )
+            .expect("copy probe isolation image");
+            make_executable(&candidate);
+            let (_owned_root, executable) = retained_fixture(&candidate);
+            let source = File::open("/dev/null").expect("open leak source");
+            // Deliberately omit CLOEXEC to model an inherited broker/IDE FD.
+            // SAFETY: F_DUPFD duplicates the live source at or above 200.
+            let leaked = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, LEAKED_FD) };
+            assert_eq!(leaked, LEAKED_FD);
+            // SAFETY: successful F_DUPFD returned one owned descriptor.
+            let _leaked = unsafe { OwnedFd::from_raw_fd(leaked) };
+            let output = executable
+                .run_probe(
+                    &[
+                        OsString::from("probe-isolation-image"),
+                        OsString::from("--exact"),
+                        OsString::from(TEST_NAME),
+                        OsString::from("--nocapture"),
+                        OsString::from("--test-threads=1"),
+                    ],
+                    &[(OsString::from(TARGET), OsString::from("1"))],
+                    Duration::from_secs(1),
+                    4096,
+                )
+                .expect("run isolated probe target");
+            assert!(String::from_utf8_lossy(&output).contains("gus-probe-isolation-ok"));
+            assert!(!String::from_utf8_lossy(&output).contains("discarded-warning"));
+            return;
+        }
+
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("current test executable for isolation driver"),
+        )
+        .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+        .env(DRIVER, "1")
+        .env_remove(TARGET)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn isolation driver");
+        child
+            .stdin
+            .take()
+            .expect("driver stdin pipe")
+            .write_all(b"parent-secret")
+            .expect("write parent stdin marker");
+        let output = child.wait_with_output().expect("wait for isolation driver");
+        assert!(
+            output.status.success(),
+            "isolation driver failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_times_out_and_reaps_the_child() {
+        #[cfg(target_os = "linux")]
+        let sleep = Path::new("/usr/bin/sleep");
+        #[cfg(target_os = "freebsd")]
+        let sleep = Path::new("/bin/sleep");
+        let (_owned_root, executable) = retained_fixture(sleep);
+        let started = Instant::now();
+        assert_eq!(
+            executable
+                .run_probe(
+                    &[OsString::from("sleep"), OsString::from("5")],
+                    &[],
+                    Duration::from_millis(20),
+                    64,
+                )
+                .expect_err("sleep must exceed the probe deadline"),
+            RetainedExecError::ProbeTimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_rejects_success_observed_after_the_deadline() {
+        let (_owned_root, executable) = retained_fixture(&native_fixture_path());
+        install_before_probe_collection_hook(|| {
+            std::thread::sleep(Duration::from_millis(40));
+        });
+        assert_eq!(
+            executable
+                .run_probe(
+                    &[OsString::from("echo"), OsString::from("too-late")],
+                    &[],
+                    Duration::from_millis(10),
+                    64,
+                )
+                .expect_err("late success must fail closed"),
+            RetainedExecError::ProbeTimedOut
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_terminates_ordinary_descendants() {
+        const TARGET: &str = "GUS_PLATFORM_PROBE_DESCENDANT_TARGET";
+        const SENTINEL: &str = "GUS_PLATFORM_PROBE_DESCENDANT_SENTINEL";
+        const TEST_NAME: &str = "real_git::tests::retained_probe_terminates_ordinary_descendants";
+
+        if std::env::var_os(TARGET).as_deref() == Some(OsStr::new("1")) {
+            let path = CString::new(
+                std::env::var_os(SENTINEL)
+                    .expect("descendant sentinel path")
+                    .as_bytes(),
+            )
+            .expect("sentinel path has no NUL");
+            // SAFETY: the test child uses only async-signal-safe libc calls
+            // after fork and exits without running Rust destructors.
+            let descendant = unsafe { libc::fork() };
+            #[allow(
+                clippy::manual_assert,
+                reason = "the post-fork child must not evaluate panic formatting"
+            )]
+            if descendant == -1 {
+                panic!("fork descendant fixture: {}", io::Error::last_os_error());
+            }
+            if descendant == 0 {
+                unsafe {
+                    libc::close(libc::STDOUT_FILENO);
+                    libc::close(libc::STDERR_FILENO);
+                    libc::usleep(1_500_000);
+                    let file = libc::open(
+                        path.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                        0o600,
+                    );
+                    if file >= 0 {
+                        libc::close(file);
+                    }
+                    libc::_exit(0);
+                }
+            }
+            // SAFETY: these queries have no preconditions.
+            let group = unsafe { libc::getpgrp() };
+            println!("gus-probe-descendant={descendant} group={group}");
+            return;
+        }
+
+        let sentinel_root = temporary_directory();
+        let sentinel = sentinel_root.path().join("escaped-descendant");
+        let candidate_root = temporary_directory();
+        let candidate = candidate_root.path().join("probe-descendant-image");
+        fs::copy(
+            std::env::current_exe().expect("current test image"),
+            &candidate,
+        )
+        .expect("copy probe descendant image");
+        make_executable(&candidate);
+        let (_owned_root, executable) = retained_fixture(&candidate);
+        let output = executable
+            .run_probe(
+                &[
+                    OsString::from("probe-descendant-image"),
+                    OsString::from("--exact"),
+                    OsString::from(TEST_NAME),
+                    OsString::from("--nocapture"),
+                    OsString::from("--test-threads=1"),
+                ],
+                &[
+                    (OsString::from(TARGET), OsString::from("1")),
+                    (OsString::from(SENTINEL), sentinel.as_os_str().to_owned()),
+                ],
+                Duration::from_secs(2),
+                4096,
+            )
+            .expect("probe descendant fixture");
+        assert!(String::from_utf8_lossy(&output).contains("gus-probe-descendant="));
+        std::thread::sleep(Duration::from_millis(1_700));
+        assert!(
+            !sentinel.exists(),
+            "probe descendant escaped its dedicated process group: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_kills_output_overflow() {
+        let (_owned_root, executable) = retained_fixture(Path::new("/usr/bin/yes"));
+        assert_eq!(
+            executable
+                .run_probe(
+                    &[OsString::from("yes"), OsString::from("overflow")],
+                    &[],
+                    Duration::from_secs(1),
+                    16,
+                )
+                .expect_err("unbounded output must reject"),
+            RetainedExecError::ProbeOutputTooLarge
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn retained_probe_rejects_unsuccessful_exit() {
+        let (_owned_root, executable) = retained_fixture(Path::new("/usr/bin/false"));
+        assert_eq!(
+            executable
+                .run_probe(&[OsString::from("false")], &[], Duration::from_secs(1), 64,)
+                .expect_err("non-zero probe must reject"),
+            RetainedExecError::ProbeFailed
         );
     }
 
