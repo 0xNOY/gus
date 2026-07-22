@@ -79,6 +79,7 @@ fn setup(arguments: &[OsString]) -> Result<(), String> {
         if let Err(error) = verify_installed_shim(&destination) {
             if installed && is_owned_shim(&destination, &owner) {
                 let _ = fs::remove_file(&destination);
+                let _ = directory.sync_all();
                 let _ = fs::remove_file(&owner);
                 let _ = directory.sync_all();
             }
@@ -248,6 +249,7 @@ fn install_shim(
             .sync_all()
             .map_err(|error| sync_directory_error(&error))?;
         if let Err(error) = publish_no_replace(&staged_shim, destination) {
+            let _ = directory.sync_all();
             let _ = fs::remove_file(owner);
             let _ = directory.sync_all();
             Err(error)
@@ -436,15 +438,25 @@ fn acquire_install_lock(target: &Path) -> Result<File, String> {
 }
 
 #[cfg(unix)]
-fn publish_no_replace(staged: &Path, destination: &Path) -> Result<(), String> {
+fn publish_no_replace(staged: &Path, destination: &Path) -> Result<bool, String> {
     fs::hard_link(staged, destination).map_err(|error| {
         format!(
             "cannot publish {} without replacing an existing file: {error}",
             destination.display()
         )
     })?;
-    fs::remove_file(staged)
-        .map_err(|error| format!("cannot remove staged {}: {error}", staged.display()))
+    if let Err(error) = fs::remove_file(staged) {
+        let rollback = fs::remove_file(destination);
+        return match rollback {
+            Ok(()) => Err(format!(
+                "published {} but could not remove staged {}: {error}; publication was rolled back",
+                destination.display(),
+                staged.display()
+            )),
+            Err(_) => Ok(false),
+        };
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
