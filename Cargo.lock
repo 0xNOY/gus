@@ -102,8 +102,11 @@ version = "0.2.0"
 dependencies = [
  "getrandom",
  "gus-core",
+ "gus-ipc",
+ "gus-platform",
  "gus-profile",
  "hmac",
+ "serde_json",
  "sha2",
  "thiserror",
  "zeroize",

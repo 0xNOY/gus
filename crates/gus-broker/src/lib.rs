@@ -5,6 +5,13 @@
 //! process handles. The state machines then prevent adapters from accidentally
 //! treating a multi-process HTTP credential flow as a single-use capability.
 
+mod provider;
+
+pub use provider::{
+    IssuedProviderPrompt, ProviderAdmission, ProviderAdmissionError, ProviderCommandFailure,
+    ProviderCommandOutcome, ProviderMembershipAdmission, ProviderSession, ProviderSessionError,
+};
+
 use std::{
     collections::HashMap,
     fmt,
