@@ -160,7 +160,11 @@ dependencies = [
  "gus-core",
  "gus-ipc",
  "gus-platform",
+ "gus-profile",
+ "libc",
  "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

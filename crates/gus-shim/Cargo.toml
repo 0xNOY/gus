@@ -12,6 +12,10 @@ publish = false
 gus-core = { path = "../gus-core" }
 gus-ipc = { path = "../gus-ipc" }
 gus-platform = { path = "../gus-platform" }
+gus-profile = { path = "../gus-profile" }
+libc.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 
 [[bin]]
 name = "git"

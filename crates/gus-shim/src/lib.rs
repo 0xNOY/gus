@@ -13,6 +13,7 @@ use gus_core::{
     ResolutionError, ResolutionIntent, ResolutionTarget, ResolvedInvocation, ResolverSnapshot,
 };
 pub use gus_ipc::OperationPresentation;
+use gus_profile::{PersonIdentity, Profile};
 
 /// A losslessly parsed invocation entering the Git shim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +124,115 @@ impl ResolutionRequired {
         let (target, intent) = (*self.invocation).begin_resolution_capture()?;
         Ok((ResolutionCapture { target }, intent))
     }
+
+    /// Selects an externally requested profile for an operation whose initial
+    /// policy already proves that only author/committer identity is required.
+    ///
+    /// Operations that still need repository, transport, or signing evidence
+    /// must continue through [`Self::begin_capture`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid profiles and every unresolved requirement other than a
+    /// direct author identity requirement.
+    pub fn select_explicit_profile(
+        self,
+        profile: &Profile,
+    ) -> Result<ExplicitProfileAdmission, ExplicitProfileError> {
+        profile.validate()?;
+        if self.invocation.operation() != Operation::Commit
+            || self.invocation.profile_requirement()
+                != ProfileRequirement::Required(RequirementReason::AuthorIdentity)
+        {
+            return Err(ExplicitProfileError::ResolutionRequired);
+        }
+        if profile.signing.is_some() {
+            return Err(ExplicitProfileError::SigningUnsupported);
+        }
+        let global = &self.invocation.normalized().global;
+        if !global.directory_changes.is_empty()
+            || global.git_dir.is_some()
+            || global.work_tree.is_some()
+            || global.namespace.is_some()
+            || global.exec_path.is_some()
+            || !global.config_overrides.is_empty()
+            || !global.config_env_overrides.is_empty()
+        {
+            return Err(ExplicitProfileError::UnsupportedInvocation);
+        }
+        if !plain_commit_arguments(&self.invocation.normalized().command_args) {
+            return Err(ExplicitProfileError::UnsupportedInvocation);
+        }
+        Ok(ExplicitProfileAdmission {
+            arguments: self.invocation.into_raw_args(),
+            author: profile.author.clone(),
+            committer: profile.committer.clone(),
+        })
+    }
+}
+
+/// Execution inputs admitted for one external profile override.
+#[derive(Debug)]
+pub struct ExplicitProfileAdmission {
+    arguments: Vec<std::ffi::OsString>,
+    author: PersonIdentity,
+    committer: PersonIdentity,
+}
+
+impl ExplicitProfileAdmission {
+    /// Consumes the admission into the exact argv and immutable identities
+    /// validated by [`ResolutionRequired::select_explicit_profile`].
+    #[must_use]
+    pub fn into_execution(self) -> (Vec<std::ffi::OsString>, PersonIdentity, PersonIdentity) {
+        (self.arguments, self.author, self.committer)
+    }
+}
+
+/// Failure to turn an external profile override into execution authority.
+#[derive(Debug, thiserror::Error)]
+pub enum ExplicitProfileError {
+    #[error("the selected profile is invalid: {0}")]
+    InvalidProfile(#[from] gus_profile::ValidationError),
+    #[error("the invocation still requires trusted repository or transport resolution")]
+    ResolutionRequired,
+    #[error("this build supports explicit profiles only for a plain unsigned commit")]
+    UnsupportedInvocation,
+    #[error("commit signing for an explicit profile is not implemented in this build")]
+    SigningUnsupported,
+}
+
+fn plain_commit_arguments(arguments: &[std::ffi::OsString]) -> bool {
+    let mut index = 0;
+    while index < arguments.len() {
+        let Some(argument) = arguments[index].to_str() else {
+            return false;
+        };
+        if argument == "--" {
+            return true;
+        }
+        if matches!(argument, "-m" | "--message") {
+            index += 1;
+            if index == arguments.len() {
+                return false;
+            }
+        } else if !(matches!(
+            argument,
+            "-q" | "--quiet"
+                | "-a"
+                | "--all"
+                | "--allow-empty"
+                | "--allow-empty-message"
+                | "--no-verify"
+                | "--dry-run"
+        ) || argument.starts_with("-m") && argument.len() > 2
+            || argument.starts_with("--message="))
+            && argument.starts_with('-')
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 /// A single in-progress capture retaining the exact invocation request nonce.
