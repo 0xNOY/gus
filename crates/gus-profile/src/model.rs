@@ -63,26 +63,38 @@ impl PersonIdentity {
     /// [`ValidationError::InvalidEmail`] when an identity cannot be represented
     /// safely and unambiguously.
     pub fn new(name: String, email: String) -> Result<Self, ValidationError> {
-        if name.is_empty()
-            || name.chars().count() > 256
-            || has_forbidden_control(&name)
-            || name.contains(['<', '>'])
+        let identity = Self { name, email };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Revalidates an identity loaded from a serialized profile store.
+    ///
+    /// # Errors
+    ///
+    /// Rejects names and email addresses that cannot be safely exported to
+    /// Git's identity environment.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.name.is_empty()
+            || self.name.chars().count() > 256
+            || has_forbidden_control(&self.name)
+            || self.name.contains(['<', '>'])
         {
             return Err(ValidationError::InvalidName);
         }
-        let mut parts = email.split('@');
+        let mut parts = self.email.split('@');
         let local = parts.next().unwrap_or_default();
         let domain = parts.next().unwrap_or_default();
         if local.is_empty()
             || domain.is_empty()
             || parts.next().is_some()
-            || email.len() > 320
-            || has_forbidden_control(&email)
-            || email.contains(['<', '>', ' '])
+            || self.email.len() > 320
+            || has_forbidden_control(&self.email)
+            || self.email.contains(['<', '>', ' '])
         {
             return Err(ValidationError::InvalidEmail);
         }
-        Ok(Self { name, email })
+        Ok(())
     }
 
     #[must_use]
@@ -761,6 +773,8 @@ impl Profile {
         if self.generation == 0 {
             return Err(ValidationError::InvalidProfileGeneration);
         }
+        self.author.validate()?;
+        self.committer.validate()?;
         if let Some(signing) = &self.signing {
             signing.validate()?;
         }
@@ -985,6 +999,30 @@ mod tests {
                 Err(ValidationError::InvalidEmail)
             );
         }
+    }
+
+    #[test]
+    fn profile_validation_rechecks_deserialized_people() {
+        let profiles: ProfileSet = toml::from_str(
+            r#"
+version = 2
+generation = 1
+
+[profiles.bad]
+id = "bad"
+generation = 1
+
+[profiles.bad.author]
+name = ""
+email = "bad@example.test"
+
+[profiles.bad.committer]
+name = "Valid Committer"
+email = "committer@example.test"
+"#,
+        )
+        .expect("serde shape is valid before semantic validation");
+        assert_eq!(profiles.validate(), Err(ValidationError::InvalidName));
     }
 
     #[test]
