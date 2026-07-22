@@ -159,6 +159,8 @@ version = "0.2.0"
 dependencies = [
  "gus-core",
  "gus-ipc",
+ "gus-platform",
+ "tempfile",
 ]
 
 [[package]]

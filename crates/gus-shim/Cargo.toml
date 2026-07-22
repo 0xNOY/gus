@@ -11,6 +11,14 @@ publish = false
 [dependencies]
 gus-core = { path = "../gus-core" }
 gus-ipc = { path = "../gus-ipc" }
+gus-platform = { path = "../gus-platform" }
+
+[[bin]]
+name = "git"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

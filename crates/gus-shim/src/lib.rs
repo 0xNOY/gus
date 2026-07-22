@@ -89,6 +89,15 @@ impl LocalPolicyAdmission {
     pub fn presentation(&self) -> OperationPresentation {
         operation_presentation(self.invocation.operation())
     }
+
+    /// Consumes this admission and returns the exact argv it admitted.
+    ///
+    /// Execution layers should use this method instead of retaining a second
+    /// caller-owned argv copy beside the policy decision.
+    #[must_use]
+    pub fn into_arguments(self) -> Vec<std::ffi::OsString> {
+        (*self.invocation).into_raw_args()
+    }
 }
 
 /// An invocation that needs trusted repository/config/endpoint evidence.

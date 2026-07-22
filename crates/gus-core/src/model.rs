@@ -514,6 +514,13 @@ impl InvocationContext {
         &self.invocation
     }
 
+    /// Consumes the parsed invocation and returns the exact argv following
+    /// the executable name.
+    #[must_use]
+    pub fn into_raw_args(self) -> Vec<OsString> {
+        self.invocation.raw_args
+    }
+
     #[must_use]
     pub fn operation(&self) -> Operation {
         self.invocation.operation
