@@ -3,16 +3,16 @@ use std::process::ExitCode;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::{
     ffi::OsString,
-    fs::OpenOptions,
-    io::Read as _,
-    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::{Read as _, Write as _},
+    os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _},
+    path::{Path, PathBuf},
 };
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use gus_core::{NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME, ProfileRequirement, RequirementReason};
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use gus_platform::{ExecutableExclusionSet, VerifiedRealGit};
+use gus_platform::{CurrentSessionObserver, ExecutableExclusionSet, VerifiedRealGit};
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use gus_profile::{Profile, ProfileId, ProfileSet};
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -20,6 +20,8 @@ use gus_shim::{ExplicitProfileAdmission, InitialRoute, LocalPolicyAdmission, Shi
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 const MAX_PROFILE_STORE_BYTES: u64 = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+const MAX_SELECTION_BYTES: usize = 128;
 
 fn main() -> ExitCode {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -38,7 +40,7 @@ fn run_unix() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     match ShimInvocation::parse(&arguments).route() {
         InitialRoute::Forward(admission) => execute_git(admission),
-        InitialRoute::Resolve(required) => match explicit_profile() {
+        InitialRoute::Resolve(required) => match selected_profile() {
             Ok(Some(profile)) => match required.select_explicit_profile(&profile) {
                 Ok(admission) => execute_profiled_git(admission),
                 Err(error) => explicit_admission_error(&error),
@@ -48,7 +50,7 @@ fn run_unix() -> ExitCode {
                 "no explicit profile was selected",
             ),
             Err(error) => {
-                eprintln!("GUS_E_PROFILE_INVALID: {error}; Git was not started");
+                eprintln!("GUS_E_SELECTION_FAILED: {error}; Git was not started");
                 ExitCode::from(125)
             }
         },
@@ -104,14 +106,36 @@ fn execute_git_arguments(
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn explicit_profile() -> Result<Option<Profile>, String> {
-    let Some(raw_id) = std::env::var_os("GUS_PROFILE_ID") else {
+fn selected_profile() -> Result<Option<Profile>, String> {
+    if let Some(raw_id) = std::env::var_os("GUS_PROFILE_ID") {
+        let id = raw_id
+            .into_string()
+            .map_err(|_| "GUS_PROFILE_ID is not valid UTF-8".to_owned())
+            .and_then(|id| ProfileId::try_from(id).map_err(|error| error.to_string()))?;
+        return profile_by_id(&load_profile_set()?, &id).map(Some);
+    }
+
+    let observation = CurrentSessionObserver::new()
+        .observe()
+        .map_err(|error| format!("cannot establish the terminal session: {error}"))?;
+    let Some(terminal) = observation.terminal_session() else {
         return Ok(None);
     };
-    let id = raw_id
-        .into_string()
-        .map_err(|_| "GUS_PROFILE_ID is not valid UTF-8".to_owned())
-        .and_then(|id| ProfileId::try_from(id).map_err(|error| error.to_string()))?;
+    let profiles = load_profile_set()?;
+    let selection_path = selection_path(&terminal.selection_key().encode_hex())?;
+    if let Some(id) = read_session_selection(&selection_path)? {
+        if let Some(profile) = profiles.profiles.get(&id) {
+            return Ok(Some(profile.clone()));
+        }
+    }
+    let id = prompt_for_profile(&profiles)?;
+    let profile = profile_by_id(&profiles, &id)?;
+    write_session_selection(&selection_path, &id)?;
+    Ok(Some(profile))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn load_profile_set() -> Result<ProfileSet, String> {
     let path = profile_store_path()?;
     let mut bytes = Vec::new();
     let file = OpenOptions::new()
@@ -143,12 +167,16 @@ fn explicit_profile() -> Result<Option<Profile>, String> {
     profiles
         .validate()
         .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
+    Ok(profiles)
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn profile_by_id(profiles: &ProfileSet, id: &ProfileId) -> Result<Profile, String> {
     profiles
         .profiles
-        .get(&id)
+        .get(id)
         .cloned()
-        .ok_or_else(|| format!("profile '{id}' does not exist in {}", path.display()))
-        .map(Some)
+        .ok_or_else(|| format!("profile '{id}' does not exist in the profile store"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -175,9 +203,180 @@ fn profile_store_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn selection_path(key: &str) -> Result<PathBuf, String> {
+    let root = if let Some(root) = std::env::var_os("GUS_RUNTIME_DIR") {
+        absolute_path("GUS_RUNTIME_DIR", root)?
+    } else if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR") {
+        absolute_path("XDG_RUNTIME_DIR", root)?
+    } else {
+        // SAFETY: `geteuid` has no preconditions and only reads process credentials.
+        PathBuf::from(format!("/tmp/gus-{}", unsafe { libc::geteuid() }))
+    };
+    ensure_private_directory(&root)?;
+    let selections = root.join("gus-selections");
+    ensure_private_directory(&selections)?;
+    Ok(selections.join(key))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn absolute_path(name: &str, value: OsString) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    path.is_absolute()
+        .then_some(path)
+        .ok_or_else(|| format!("{name} must be an absolute path"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and only reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != effective_user || metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} must be a private directory owned by the current user",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn read_session_selection(path: &Path) -> Result<Option<ProfileId>, String> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
+    };
+    validate_private_file(&file, path)?;
+    let mut bytes = Vec::new();
+    file.take(129)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() > MAX_SELECTION_BYTES {
+        return Err(format!(
+            "{} exceeds the selection size limit",
+            path.display()
+        ));
+    }
+    let id = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("{} is not valid UTF-8", path.display()))?
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    ProfileId::try_from(id)
+        .map(Some)
+        .map_err(|error| format!("{} contains an invalid profile ID: {error}", path.display()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn write_session_selection(path: &Path, id: &ProfileId) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    validate_private_file(&file, path)?;
+    writeln!(file, "{id}").map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn validate_private_file(file: &File, path: &Path) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and only reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.uid() != effective_user || metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} must be a private regular file owned by the current user",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn prompt_for_profile(profiles: &ProfileSet) -> Result<ProfileId, String> {
+    if profiles.profiles.is_empty() {
+        return Err("the profile store contains no profiles".to_owned());
+    }
+    let mut terminal = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open("/dev/tty")
+        .map_err(|error| format!("cannot open the controlling terminal: {error}"))?;
+    writeln!(terminal, "GUS: select a profile for this terminal session:")
+        .map_err(|error| format!("cannot write the profile prompt: {error}"))?;
+    for (index, (id, profile)) in profiles.profiles.iter().enumerate() {
+        writeln!(
+            terminal,
+            "  {}. {} — {} <{}>",
+            index + 1,
+            id,
+            profile.author.name(),
+            profile.author.email()
+        )
+        .map_err(|error| format!("cannot write the profile prompt: {error}"))?;
+    }
+    write!(terminal, "Profile number or ID: ")
+        .and_then(|()| terminal.flush())
+        .map_err(|error| format!("cannot write the profile prompt: {error}"))?;
+
+    let response = read_terminal_line(&mut terminal)?;
+    if let Ok(index) = response.parse::<usize>() {
+        if let Some(id) = index
+            .checked_sub(1)
+            .and_then(|index| profiles.profiles.keys().nth(index))
+        {
+            return Ok(id.clone());
+        }
+    }
+    let id = ProfileId::try_from(response).map_err(|_| "invalid profile selection".to_owned())?;
+    profiles
+        .profiles
+        .contains_key(&id)
+        .then_some(id)
+        .ok_or_else(|| "the selected profile does not exist".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn read_terminal_line(terminal: &mut File) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let count = terminal
+            .read(&mut byte)
+            .map_err(|error| format!("cannot read the profile selection: {error}"))?;
+        if count == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if byte[0] != b'\r' {
+            bytes.push(byte[0]);
+        }
+        if bytes.len() > MAX_SELECTION_BYTES {
+            return Err("the profile selection is too long".to_owned());
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| "the profile selection is not valid UTF-8".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn selection_required(reason: &str, context: &str) -> ExitCode {
     eprintln!(
-        "GUS_E_SELECTION_REQUIRED: {reason}; {context}, so Git was not started\nhint: set GUS_PROFILE_ID to a configured profile"
+        "GUS_E_SELECTION_REQUIRED: {reason}; {context}, so Git was not started\nhint: run the command from an interactive terminal to select a profile"
     );
     ExitCode::from(125)
 }
@@ -259,6 +458,7 @@ fn neutral_environment() -> Vec<(OsString, OsString)> {
         "GIT_SSH_COMMAND",
         "GUS_PROFILE_ID",
         "GUS_PROFILE_STORE",
+        "GUS_RUNTIME_DIR",
         "SSH_AGENT_PID",
         "SSH_ASKPASS",
         "SSH_ASKPASS_REQUIRE",

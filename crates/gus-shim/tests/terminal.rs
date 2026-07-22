@@ -1,6 +1,16 @@
 #![cfg(any(target_os = "linux", target_os = "freebsd"))]
 
-use std::{fs, os::unix::fs::PermissionsExt as _, path::Path, process::Command};
+use std::{
+    ffi::CStr,
+    fs,
+    io::Write as _,
+    os::{
+        fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        unix::{fs::PermissionsExt as _, process::CommandExt as _},
+    },
+    path::Path,
+    process::{Command, Stdio},
+};
 
 fn shim() -> Command {
     Command::new(env!("CARGO_BIN_EXE_git"))
@@ -48,6 +58,174 @@ email = "selected-committer@example.test"
 "#,
     )
     .expect("write profile store");
+}
+
+fn write_two_profile_store(path: &Path) {
+    fs::write(
+        path,
+        r#"
+version = 2
+generation = 1
+
+[profiles.personal]
+id = "personal"
+generation = 1
+
+[profiles.personal.author]
+name = "Personal Author"
+email = "personal@example.test"
+
+[profiles.personal.committer]
+name = "Personal Committer"
+email = "personal@example.test"
+
+[profiles.work]
+id = "work"
+generation = 1
+
+[profiles.work.author]
+name = "Work Author"
+email = "work@example.test"
+
+[profiles.work.committer]
+name = "Work Committer"
+email = "work@example.test"
+"#,
+    )
+    .expect("write two-profile store");
+}
+
+fn stage(path: &Path, name: &str, contents: &[u8]) {
+    fs::write(path.join(name), contents).expect("write commit fixture");
+    let add = system_git()
+        .args(["add", name])
+        .current_dir(path)
+        .output()
+        .expect("stage commit fixture");
+    assert!(add.status.success());
+}
+
+fn run_commit_in_new_terminal(
+    repository: &Path,
+    store: &Path,
+    runtime: &Path,
+    selection: &str,
+    message: &str,
+) {
+    let mut master = 0;
+    let mut slave = 0;
+    // SAFETY: both output pointers are valid and no optional termios/winsize is supplied.
+    let result = unsafe {
+        libc::openpty(
+            &raw mut master,
+            &raw mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `openpty` initialized both descriptors on success, transferring ownership here.
+    let mut master = unsafe { fs::File::from_raw_fd(master) };
+    // SAFETY: see above.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    let mut name = [0_i8; 256];
+    // SAFETY: the slave descriptor is live and `name` is a writable bounded buffer.
+    let tty_result = unsafe { libc::ttyname_r(slave.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    assert_eq!(tty_result, 0, "ttyname_r failed with {tty_result}");
+    // SAFETY: successful `ttyname_r` wrote a NUL-terminated string into `name`.
+    let slave_path = unsafe { CStr::from_ptr(name.as_ptr()) }
+        .to_str()
+        .expect("PTY path is UTF-8")
+        .to_owned();
+
+    let mut child = Command::new(std::env::current_exe().expect("resolve test executable"))
+        .args(["--ignored", "--exact", "pty_commit_child"])
+        .env("GUS_TEST_PTY", slave_path)
+        .env("GUS_TEST_MESSAGE", message)
+        .env("GUS_PROFILE_STORE", store)
+        .env("GUS_RUNTIME_DIR", runtime)
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn PTY child");
+    writeln!(master, "{selection}").expect("send profile selection");
+    let status = child.wait().expect("wait for PTY child");
+    assert!(status.success(), "PTY commit failed with {status}");
+}
+
+#[test]
+#[ignore = "internal child process for PTY session tests"]
+fn pty_commit_child() {
+    let slave_path = std::env::var("GUS_TEST_PTY").expect("PTY path");
+    let message = std::env::var("GUS_TEST_MESSAGE").expect("commit message");
+    // SAFETY: `setsid` has no pointer arguments; this helper is a fresh child process.
+    assert_ne!(unsafe { libc::setsid() }, -1, "setsid failed");
+    let slave = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(slave_path)
+        .expect("open PTY slave as controlling terminal");
+    for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: the source descriptor is live and each target is a standard descriptor.
+        assert_ne!(unsafe { libc::dup2(slave.as_raw_fd(), descriptor) }, -1);
+    }
+    let error = shim().args(["commit", "--quiet", "-m", &message]).exec();
+    panic!("exec shim failed: {error}");
+}
+
+#[test]
+fn separate_terminal_sessions_select_independent_profiles_for_one_repository() {
+    let repository = tempfile::tempdir().expect("temporary repository");
+    let runtime = tempfile::tempdir().expect("temporary runtime directory");
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700))
+        .expect("make runtime directory private");
+    initialize_repository(repository.path());
+    let store = repository.path().join("profiles.toml");
+    write_two_profile_store(&store);
+
+    stage(repository.path(), "work.txt", b"work\n");
+    run_commit_in_new_terminal(
+        repository.path(),
+        &store,
+        runtime.path(),
+        "2",
+        "work session",
+    );
+
+    stage(repository.path(), "personal.txt", b"personal\n");
+    run_commit_in_new_terminal(
+        repository.path(),
+        &store,
+        runtime.path(),
+        "1",
+        "personal session",
+    );
+
+    let identities = system_git()
+        .args(["log", "-2", "--format=%an <%ae>"])
+        .current_dir(repository.path())
+        .output()
+        .expect("inspect identities from both sessions");
+    assert!(identities.status.success());
+    assert_eq!(
+        identities.stdout,
+        b"Personal Author <personal@example.test>\nWork Author <work@example.test>\n"
+    );
+    let selection_count = fs::read_dir(runtime.path().join("gus-selections"))
+        .expect("read session selections")
+        .count();
+    assert_eq!(
+        selection_count, 2,
+        "each terminal must have its own selection"
+    );
 }
 
 #[test]
