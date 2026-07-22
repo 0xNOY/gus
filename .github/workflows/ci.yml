@@ -223,7 +223,7 @@ jobs:
           targets: x86_64-unknown-freebsd
 
       - name: Lint FreeBSD target
-        run: cargo +stable clippy --target x86_64-unknown-freebsd -p gus-platform --all-targets --all-features -- -D warnings
+        run: cargo +stable clippy --target x86_64-unknown-freebsd -p gus-platform -p gus-shim --all-targets --all-features -- -D warnings
 
       - name: Check FreeBSD target MSRV
-        run: cargo +1.85.0 check --target x86_64-unknown-freebsd -p gus-platform --all-targets --all-features
+        run: cargo +1.85.0 check --target x86_64-unknown-freebsd -p gus-platform -p gus-shim --all-targets --all-features
