@@ -23,15 +23,18 @@ GUSは、複数のGitアカウント（例：個人用、仕事用）を簡単�
 
 ### インストール手順
 
-1. Cargoを使用してインストール:
+1. Cargoを使用してGUS本体とGitシムをインストール:
    ```sh
-   cargo install --git https://github.com/0xNOY/gus.git
+   cargo install --git https://github.com/0xNOY/gus.git gus-shim --locked --force
    ```
 
-2. シェル設定の追加（`.bashrc`、`.zshrc`など）:
+2. Gitシムを既存のPATH上へ配置し、動作確認:
    ```sh
-   eval "$(gus setup)"
+   gus setup
+   gus doctor
    ```
+
+`gus setup`はShellコードを出力せず、`.bashrc`や`.zshrc`も変更しません。GUSのインストール先が実Gitより前のPATHにない場合は、安全に配置できないため失敗します。インストール直後に既存ShellやIDEが以前のGitを保持している場合だけ、新しいShellを開くかIDEを再起動してください。
 
 ## 基本的な使い方
 

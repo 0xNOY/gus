@@ -162,6 +162,7 @@ dependencies = [
  "gus-platform",
  "gus-profile",
  "libc",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",

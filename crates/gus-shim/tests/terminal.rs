@@ -13,7 +13,7 @@ use std::{
 };
 
 fn shim() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_git"))
+    Command::new(env!("CARGO_BIN_EXE_gus-git-shim"))
 }
 
 fn system_git() -> Command {
