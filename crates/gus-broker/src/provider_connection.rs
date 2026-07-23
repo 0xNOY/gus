@@ -89,21 +89,18 @@ impl PendingUnixProvider {
     /// registration response, or failure to enter nonblocking command mode.
     pub fn admit(
         mut self,
-        authenticated_host_instance: Digest32,
         authorized_repositories: &[Digest32],
+        membership_generation: Generation,
         provider_generation: Generation,
         heartbeat_interval_millis: u32,
     ) -> Result<UnixProviderConnection, ProviderConnectionError> {
-        let admission = ProviderAdmission::verify(
-            self.peer,
-            &self.registration,
-            authenticated_host_instance,
-            authorized_repositories,
-        )
-        .map_err(ProviderConnectionError::admission)?;
+        let admission = ProviderAdmission::verify(self.peer, &self.registration)
+            .map_err(ProviderConnectionError::admission)?;
         let (mut session, response) = ProviderSession::register(
             &self.registration,
             admission,
+            authorized_repositories,
+            membership_generation,
             provider_generation,
             heartbeat_interval_millis,
             Instant::now(),
@@ -270,6 +267,23 @@ impl UnixProviderConnection {
             ));
         }
         Ok(())
+    }
+
+    /// Replaces repository membership from broker-authorized native evidence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects closed/expired providers and invalid or stale membership.
+    pub fn replace_authorized_repositories(
+        &mut self,
+        repositories: &[Digest32],
+        membership_generation: Generation,
+        now: Instant,
+    ) -> Result<Vec<RequestId>, ProviderConnectionError> {
+        self.state
+            .session
+            .replace_authorized_repositories(repositories, membership_generation, now)
+            .map_err(ProviderConnectionError::session)
     }
 
     /// Expires prompts and returns their waiter IDs.
@@ -724,8 +738,6 @@ mod tests {
             ProviderRegistrationRequest::new(
                 ProviderKind::Vscode,
                 "window-1".into(),
-                digest(1),
-                vec![digest(2)],
                 vec![
                     ProviderCapability::ProfileQuickPick,
                     ProviderCapability::Status,
@@ -794,7 +806,7 @@ mod tests {
         let pending = PendingUnixProvider::read(server, read_timeout, write_timeout)
             .expect("read registration");
         let connection = pending
-            .admit(digest(1), &[digest(2)], generation(7), 15_000)
+            .admit(&[digest(2)], generation(1), generation(7), 15_000)
             .expect("admit registration");
         let registered = read_provider_response(&mut client).expect("registration response");
         assert_eq!(registered.request_id(), registration.request_id());

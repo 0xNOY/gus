@@ -78,20 +78,15 @@ export class ProviderClient {
   #heartbeat: unknown;
   #closed = false;
   #writeTail: Promise<void> = Promise.resolve();
-  #repositories: Set<string>;
   readonly #seenPrompts = new Set<string>();
   readonly #prompts = new Map<string, { abort: AbortController; timeout: unknown }>();
-  readonly #pendingControls = new Map<string, {
-    membership?: { generation: string; repositories: Set<string> };
-  }>();
-  #membershipGeneration: bigint | undefined;
+  readonly #pendingControls = new Set<string>();
 
   constructor(options: ProviderClientOptions) {
     this.#options = options;
     this.#registrationFrame = createProviderRegistrationFrame(options.registration);
     const message = this.#registrationFrame.message;
     if (message.type !== "register") throw new Error("invalid GUS registration factory result");
-    this.#repositories = new Set(message.body.repositories);
     this.#statusCapability = message.body.capabilities.includes("status");
   }
 
@@ -129,40 +124,6 @@ export class ProviderClient {
     this.#shutdown();
   }
 
-  updateRepositories(repositories: string[], membershipGeneration: string): void {
-    const control = this.#control();
-    if (control === undefined || this.#closed) {
-      throw new Error("GUS provider is not registered");
-    }
-    if ([...this.#pendingControls.values()].some((pending) => pending.membership !== undefined)) {
-      throw new Error("GUS repository membership update is already pending");
-    }
-    const parsedGeneration = BigInt(membershipGeneration);
-    if (this.#membershipGeneration !== undefined && parsedGeneration <= this.#membershipGeneration) {
-      throw new Error("GUS repository membership generation is stale");
-    }
-    const frame = createProviderControlFrame({
-      type: "update_repositories",
-      body: {
-        ...control,
-        membership_generation: membershipGeneration,
-        repositories,
-      },
-    });
-    const message = frame.message;
-    if (message.type !== "update_repositories") {
-      throw new Error("invalid GUS membership factory result");
-    }
-    this.#cancelPrompts();
-    this.#pendingControls.set(frame.request_id, {
-      membership: {
-        generation: message.body.membership_generation,
-        repositories: new Set(message.body.repositories),
-      },
-    });
-    this.#send(frame);
-  }
-
   #accept(frame: DecodedProviderResponseFrame): void {
     switch (frame.message.type) {
       case "registered": {
@@ -187,9 +148,6 @@ export class ProviderClient {
       }
       case "selection_prompt":
         this.#requireControl(frame.message.body);
-        if (!this.#repositories.has(frame.message.body.repository.identity)) {
-          throw new Error("GUS prompt is outside provider repository membership");
-        }
         if (this.#seenPrompts.has(frame.request_id)) {
           throw new Error("duplicate GUS selection prompt");
         }
@@ -204,28 +162,11 @@ export class ProviderClient {
         return;
       case "status_snapshot":
         this.#requireControl(frame.message.body);
-        if (frame.message.body.entries.some(
-          (entry) => !this.#repositories.has(entry.repository.identity),
-        )) {
-          throw new Error("GUS status is outside provider repository membership");
-        }
         this.#options.onStatus(frame.message.body);
         return;
       case "acknowledged":
-        {
-          const pending = this.#pendingControls.get(frame.request_id);
-          if (pending === undefined) {
-            throw new Error("GUS provider acknowledged an unknown command");
-          }
-          this.#pendingControls.delete(frame.request_id);
-          if (pending.membership !== undefined) {
-            // A prompt for the old membership can cross this update on the
-            // full-duplex transport after the request was queued. The broker
-            // revokes it at the same transition represented by this ACK.
-            this.#cancelPrompts();
-            this.#repositories = pending.membership.repositories;
-            this.#membershipGeneration = BigInt(pending.membership.generation);
-          }
+        if (!this.#pendingControls.delete(frame.request_id)) {
+          throw new Error("GUS provider acknowledged an unknown command");
         }
         return;
       case "error":
@@ -303,7 +244,7 @@ export class ProviderClient {
       return;
     }
     if (frame.message.type !== "register" && !this.#pendingControls.has(frame.request_id)) {
-      this.#pendingControls.set(frame.request_id, {});
+      this.#pendingControls.add(frame.request_id);
     }
     this.#writeTail = this.#writeTail
       .then(() => {

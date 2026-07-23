@@ -138,10 +138,6 @@ function providerRegistration(): ProviderRegistrationRequest {
   return {
     kind: "vscode",
     editor_session_id: "window-1",
-    host_instance: "1111111111111111111111111111111111111111111111111111111111111111",
-    repositories: [
-      "2222222222222222222222222222222222222222222222222222222222222222",
-    ],
     capabilities: ["profile_quick_pick", "status"],
   };
 }

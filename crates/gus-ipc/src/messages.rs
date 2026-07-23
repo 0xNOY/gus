@@ -591,8 +591,6 @@ impl Validate for ProviderRepositoryMembership {
 pub struct ProviderRegistrationRequest {
     kind: ProviderKind,
     editor_session_id: String,
-    host_instance: Digest32,
-    repositories: Vec<Digest32>,
     capabilities: Vec<ProviderCapability>,
 }
 
@@ -602,20 +600,17 @@ impl ProviderRegistrationRequest {
     ///
     /// # Errors
     ///
-    /// Rejects control characters, excessive collections, and duplicate
-    /// capability/repository entries.
+    /// Rejects control characters and duplicate or excessive capabilities.
+    /// Native host and repository identities are deliberately absent: the
+    /// broker derives them from the authenticated connection and Git callers.
     pub fn new(
         kind: ProviderKind,
         editor_session_id: String,
-        host_instance: Digest32,
-        repositories: Vec<Digest32>,
         capabilities: Vec<ProviderCapability>,
     ) -> Result<Self, ProtocolError> {
         let request = Self {
             kind,
             editor_session_id,
-            host_instance,
-            repositories,
             capabilities,
         };
         request.validate()?;
@@ -633,16 +628,6 @@ impl ProviderRegistrationRequest {
     }
 
     #[must_use]
-    pub const fn host_instance(&self) -> Digest32 {
-        self.host_instance
-    }
-
-    #[must_use]
-    pub fn repositories(&self) -> &[Digest32] {
-        &self.repositories
-    }
-
-    #[must_use]
     pub fn capabilities(&self) -> &[ProviderCapability] {
         &self.capabilities
     }
@@ -651,11 +636,6 @@ impl ProviderRegistrationRequest {
 impl Validate for ProviderRegistrationRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         validate_text("editor_session_id", &self.editor_session_id, 1)?;
-        validate_unique_bounded(
-            "repositories",
-            &self.repositories,
-            MAX_PROVIDER_REPOSITORIES,
-        )?;
         validate_unique_bounded(
             "capabilities",
             &self.capabilities,
@@ -679,8 +659,6 @@ impl fmt::Debug for ProviderRegistrationRequest {
             .debug_struct("ProviderRegistrationRequest")
             .field("kind", &self.kind)
             .field("editor_session_id", &"<redacted>")
-            .field("host_instance", &self.host_instance)
-            .field("repository_count", &self.repositories.len())
             .field("capabilities", &self.capabilities)
             .finish()
     }
@@ -1847,8 +1825,6 @@ impl ProtocolErrorDetail {
 struct RawProviderRegistrationRequest {
     kind: ProviderKind,
     editor_session_id: String,
-    host_instance: Digest32,
-    repositories: Vec<Digest32>,
     capabilities: Vec<ProviderCapability>,
 }
 
@@ -1858,14 +1834,7 @@ impl<'de> Deserialize<'de> for ProviderRegistrationRequest {
         D: Deserializer<'de>,
     {
         let raw = RawProviderRegistrationRequest::deserialize(deserializer)?;
-        Self::new(
-            raw.kind,
-            raw.editor_session_id,
-            raw.host_instance,
-            raw.repositories,
-            raw.capabilities,
-        )
-        .map_err(de::Error::custom)
+        Self::new(raw.kind, raw.editor_session_id, raw.capabilities).map_err(de::Error::custom)
     }
 }
 

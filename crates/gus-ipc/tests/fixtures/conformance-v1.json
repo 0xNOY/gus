@@ -30,7 +30,7 @@
     },
     {
       "direction": "provider_request",
-      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"20000000-0000-4000-8000-000000000001","message":{"type":"register","body":{"kind":"vscode","editor_session_id":"window-1","host_instance":"3333333333333333333333333333333333333333333333333333333333333333","repositories":["2222222222222222222222222222222222222222222222222222222222222222"],"capabilities":["profile_quick_pick","status","diagnostics"]}}}
+      "payload": {"protocol_version":1,"message_family":"provider_request","request_id":"20000000-0000-4000-8000-000000000001","message":{"type":"register","body":{"kind":"vscode","editor_session_id":"window-1","capabilities":["profile_quick_pick","status","diagnostics"]}}}
     },
     {
       "direction": "provider_request",

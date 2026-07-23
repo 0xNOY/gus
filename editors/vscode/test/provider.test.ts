@@ -55,8 +55,6 @@ function registration(): ProviderRegistrationRequest {
   return {
     kind: "vscode",
     editor_session_id: "window-1",
-    host_instance: "11".repeat(32),
-    repositories: [REPOSITORY],
     capabilities: ["profile_quick_pick", "status"],
   };
 }
@@ -72,22 +70,6 @@ function brokerRecord(requestId: string, message: unknown): Uint8Array {
   new DataView(result.buffer).setUint32(0, payload.length, false);
   result.set(payload, 4);
   return result;
-}
-
-function selectionPrompt(registrationId: string, repository = REPOSITORY) {
-  return {
-    type: "selection_prompt",
-    body: {
-      registration_id: registrationId,
-      provider_generation: "1",
-      selection_generation: "2",
-      scope: { kind: "ide_window", opaque_id: "33".repeat(32), label: "VS Code" },
-      repository: { identity: repository, label: "gus" },
-      operation: "commit",
-      profiles: [{ profile_id: "alice", display_name: "Alice", email: null }],
-      timeout_millis: 1000,
-    },
-  };
 }
 
 async function settle(): Promise<void> {
@@ -250,7 +232,7 @@ test("provider aborts an expired prompt without sending a stale decision", async
   assert.equal(transport.records.length, 2, "only register and status subscription are sent");
 });
 
-test("provider rejects prompts outside current repository membership", async () => {
+test("provider presents repositories authorized by the authenticated broker", async () => {
   const transport = new MemoryTransport();
   const scheduler = new MemoryScheduler();
   const failures: Error[] = [];
@@ -287,143 +269,11 @@ test("provider rejects prompts outside current repository membership", async () 
       timeout_millis: 1000,
     },
   }));
-  assert(transport.closed);
-  assert.match(failures[0]?.message ?? "", /outside provider repository/u);
-});
-
-test("membership update aborts prompts invalidated by the broker transition", async () => {
-  const transport = new MemoryTransport();
-  const scheduler = new MemoryScheduler();
-  let pickerSignal: AbortSignal | undefined;
-  let resolvePicker: ((value: undefined) => void) | undefined;
-  const client = new ProviderClient({
-    registration: registration(),
-    transport,
-    scheduler,
-    picker: {
-      pick: async (_prompt, signal) => {
-        pickerSignal = signal;
-        return new Promise<undefined>((resolve) => { resolvePicker = resolve; });
-      },
-    },
-    onStatus: () => {},
-    onFatal: (error) => assert.fail(error.message),
-  });
-  client.start();
-  await settle();
-  const register = decodeProviderRequest(transport.records[0]!);
-  client.receive(brokerRecord(register.request_id, {
-    type: "registered",
-    body: {
-      registration_id: register.request_id,
-      provider_generation: "1",
-      heartbeat_interval_millis: 1000,
-    },
-  }));
-  await settle();
-  client.receive(brokerRecord(PROMPT_ID, selectionPrompt(register.request_id)));
-  await settle();
-  client.updateRepositories([REPOSITORY], "2");
-  assert(pickerSignal?.aborted);
-  resolvePicker?.(undefined);
   await settle();
   assert.equal(transport.records.length, 3);
   assert.equal(
     decodeProviderRequest(transport.records[2]!).message.type,
-    "update_repositories",
+    "selection_decision",
   );
-});
-
-test("membership changes only when the broker acknowledges the update", async () => {
-  const transport = new MemoryTransport();
-  const scheduler = new MemoryScheduler();
-  const statuses: unknown[] = [];
-  const failures: Error[] = [];
-  const client = new ProviderClient({
-    registration: registration(),
-    transport,
-    scheduler,
-    picker: { pick: async () => undefined },
-    onStatus: (status) => statuses.push(status),
-    onFatal: (error) => failures.push(error),
-  });
-  client.start();
-  await settle();
-  const register = decodeProviderRequest(transport.records[0]!);
-  client.receive(brokerRecord(register.request_id, {
-    type: "registered",
-    body: {
-      registration_id: register.request_id,
-      provider_generation: "1",
-      heartbeat_interval_millis: 1000,
-    },
-  }));
-  await settle();
-  client.updateRepositories([], "1");
-  await settle();
-  const update = decodeProviderRequest(transport.records[2]!);
-  const statusBody = {
-    registration_id: register.request_id,
-    provider_generation: "1",
-    entries: [{
-      scope: { kind: "ide_window", opaque_id: "33".repeat(32), label: "VS Code" },
-      repository: { identity: REPOSITORY, label: "gus" },
-      selected_profile: null,
-      protection: "verified",
-    }],
-  };
-  client.receive(brokerRecord("30000000-0000-4000-8000-000000000003", {
-    type: "status_snapshot",
-    body: statusBody,
-  }));
-  assert.equal(statuses.length, 1, "old membership remains current before acknowledgement");
-  client.receive(brokerRecord(update.request_id, { type: "acknowledged" }));
-  client.receive(brokerRecord("40000000-0000-4000-8000-000000000004", {
-    type: "status_snapshot",
-    body: statusBody,
-  }));
-  assert(transport.closed);
-  assert.match(failures[0]?.message ?? "", /outside provider repository/u);
-});
-
-test("membership acknowledgement aborts an old prompt that crossed the update", async () => {
-  const transport = new MemoryTransport();
-  const scheduler = new MemoryScheduler();
-  let signal: AbortSignal | undefined;
-  let resolvePicker: ((value: undefined) => void) | undefined;
-  const client = new ProviderClient({
-    registration: registration(),
-    transport,
-    scheduler,
-    picker: {
-      pick: async (_prompt, pickerSignal) => {
-        signal = pickerSignal;
-        return new Promise<undefined>((resolve) => { resolvePicker = resolve; });
-      },
-    },
-    onStatus: () => {},
-    onFatal: (error) => assert.fail(error.message),
-  });
-  client.start();
-  await settle();
-  const register = decodeProviderRequest(transport.records[0]!);
-  client.receive(brokerRecord(register.request_id, {
-    type: "registered",
-    body: {
-      registration_id: register.request_id,
-      provider_generation: "1",
-      heartbeat_interval_millis: 1000,
-    },
-  }));
-  await settle();
-  client.updateRepositories([], "1");
-  await settle();
-  const update = decodeProviderRequest(transport.records[2]!);
-  client.receive(brokerRecord(PROMPT_ID, selectionPrompt(register.request_id)));
-  await settle();
-  client.receive(brokerRecord(update.request_id, { type: "acknowledged" }));
-  assert(signal?.aborted);
-  resolvePicker?.(undefined);
-  await settle();
-  assert.equal(transport.records.length, 3, "no stale selection decision is sent");
+  assert.deepEqual(failures, []);
 });

@@ -48,8 +48,6 @@ fn native_bridge_relays_provider_records_over_authenticated_stdio() {
         ProviderRegistrationRequest::new(
             ProviderKind::Vscode,
             "window-1".into(),
-            digest(1),
-            vec![digest(2)],
             vec![
                 ProviderCapability::ProfileQuickPick,
                 ProviderCapability::Status,
@@ -65,8 +63,8 @@ fn native_bridge_relays_provider_records_over_authenticated_stdio() {
         .accept_registration()
         .expect("accept bridged registration")
         .admit(
-            digest(1),
             &[digest(2)],
+            Generation::new(1).expect("generation"),
             Generation::new(7).expect("generation"),
             15_000,
         )

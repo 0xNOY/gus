@@ -393,8 +393,6 @@ mod tests {
                 ProviderRegistrationRequest::new(
                     ProviderKind::Vscode,
                     "window-1".into(),
-                    digest(1),
-                    vec![digest(2)],
                     vec![ProviderCapability::ProfileQuickPick],
                 )
                 .expect("registration"),
@@ -411,7 +409,7 @@ mod tests {
         let connection = listener
             .accept_registration()
             .expect("read provider registration")
-            .admit(digest(1), &[digest(2)], generation(7), 15_000)
+            .admit(&[digest(2)], generation(1), generation(7), 15_000)
             .expect("admit registered provider");
         assert_eq!(connection.provider_generation(), generation(7));
         connector.join().expect("connector thread");

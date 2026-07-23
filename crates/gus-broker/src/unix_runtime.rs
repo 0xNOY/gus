@@ -425,8 +425,6 @@ mod tests {
                 ProviderRegistrationRequest::new(
                     ProviderKind::Vscode,
                     "window-1".into(),
-                    digest(1),
-                    vec![digest(2)],
                     vec![ProviderCapability::ProfileQuickPick],
                 )
                 .expect("registration"),
@@ -445,8 +443,8 @@ mod tests {
             .accept_registration()
             .expect("accept provider")
             .admit(
-                digest(1),
                 &[digest(2)],
+                Generation::new(1).expect("generation"),
                 Generation::new(7).expect("generation"),
                 15_000,
             )

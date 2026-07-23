@@ -8,8 +8,6 @@ import { startProviderBridge } from "../src/bridge.js";
 import { decodeProviderRequest, type ProviderRegistrationRequest } from "../src/ipc.js";
 import type { ProviderScheduler } from "../src/provider.js";
 
-const REPOSITORY = "22".repeat(32);
-
 class FakeProcess extends EventEmitter {
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
@@ -39,8 +37,6 @@ function registration(): ProviderRegistrationRequest {
   return {
     kind: "vscode",
     editor_session_id: "window-1",
-    host_instance: "11".repeat(32),
-    repositories: [REPOSITORY],
     capabilities: ["profile_quick_pick", "status"],
   };
 }

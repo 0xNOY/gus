@@ -63,8 +63,6 @@ export type ProviderCapability =
 export interface ProviderRegistrationRequest {
   kind: ProviderKind;
   editor_session_id: string;
-  host_instance: Digest32;
-  repositories: Digest32[];
   capabilities: ProviderCapability[];
 }
 
@@ -798,15 +796,11 @@ function isProviderRegistration(value: unknown): value is ProviderRegistrationRe
     !hasExactKeys(value, [
       "kind",
       "editor_session_id",
-      "host_instance",
-      "repositories",
       "capabilities",
     ]) ||
     typeof value.kind !== "string" ||
     !providerKinds.has(value.kind as ProviderKind) ||
     !isPresentationText(value.editor_session_id) ||
-    !isDigest(value.host_instance) ||
-    !isUniqueArray(value.repositories, 128, isDigest, String) ||
     !isUniqueArray(
       value.capabilities,
       16,

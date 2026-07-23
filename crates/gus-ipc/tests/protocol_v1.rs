@@ -67,14 +67,12 @@ fn profile(id: &str, display_name: &str) -> ProfilePresentation {
 fn provider_correlation(
     registration_id: gus_ipc::RequestId,
     provider_generation: Generation,
-    repositories: Vec<Digest32>,
+    repositories: &[Digest32],
     capabilities: Vec<ProviderCapability>,
 ) -> ProviderCorrelation {
     let registration = ProviderRegistrationRequest::new(
         ProviderKind::Vscode,
         "test-editor-session".into(),
-        digest(0xfe),
-        repositories,
         capabilities,
     )
     .expect("registration");
@@ -85,8 +83,13 @@ fn provider_correlation(
     let response_frame =
         ProviderResponseFrame::registration_response(registration_frame.request_id(), accepted)
             .expect("registration response frame");
-    ProviderCorrelation::from_registration(&registration_frame, &response_frame)
-        .expect("correlated registration")
+    ProviderCorrelation::from_registration(
+        &registration_frame,
+        &response_frame,
+        repositories,
+        generation(1),
+    )
+    .expect("correlated registration")
 }
 
 fn prompt(
@@ -273,8 +276,6 @@ fn provider_control_factory_rejects_registration_and_selection_roles() {
     let registration = ProviderRegistrationRequest::new(
         ProviderKind::Vscode,
         "test-editor-session".into(),
-        digest(1),
-        Vec::new(),
         vec![ProviderCapability::ProfileQuickPick],
     )
     .expect("registration");
@@ -480,7 +481,7 @@ fn provider_correlation_consumes_one_exact_prompt_and_rejects_replay() {
     let mut correlation = provider_correlation(
         registration_id,
         provider_generation,
-        vec![digest(0x33)],
+        &[digest(0x33)],
         vec![ProviderCapability::ProfileQuickPick],
     );
     assert!(
@@ -533,7 +534,7 @@ fn provider_correlation_consumes_one_exact_prompt_and_rejects_replay() {
     let mut replacement = provider_correlation(
         request_id("cfac2219-d065-4602-a26a-26b5bfa33c51"),
         generation(4),
-        vec![digest(0x33)],
+        &[digest(0x33)],
         vec![ProviderCapability::ProfileQuickPick],
     );
     assert_eq!(
@@ -547,8 +548,6 @@ fn provider_registration_state_requires_the_exact_response_id() {
     let registration = ProviderRegistrationRequest::new(
         ProviderKind::Vscode,
         "test-editor-session".into(),
-        digest(1),
-        vec![digest(2)],
         vec![ProviderCapability::ProfileQuickPick],
     )
     .expect("registration");
@@ -566,7 +565,12 @@ fn provider_registration_state_requires_the_exact_response_id() {
     )
     .expect("mismatched response");
     assert!(matches!(
-        ProviderCorrelation::from_registration(&request_frame, &mismatched_response),
+        ProviderCorrelation::from_registration(
+            &request_frame,
+            &mismatched_response,
+            &[digest(2)],
+            generation(1),
+        ),
         Err(ProviderCorrelationError::RegistrationResponseMismatch)
     ));
 }
@@ -579,7 +583,7 @@ fn provider_membership_change_revokes_prompts_and_unoffered_profiles() {
     let mut correlation = provider_correlation(
         registration_id,
         provider_generation,
-        vec![digest(0x33)],
+        &[digest(0x33)],
         vec![ProviderCapability::ProfileQuickPick],
     );
     let second_prompt = ProviderResponseFrame::selection_prompt(prompt(
@@ -610,7 +614,7 @@ fn provider_membership_change_revokes_prompts_and_unoffered_profiles() {
     let membership = ProviderRepositoryMembership::new(
         registration_id,
         provider_generation,
-        generation(1),
+        generation(2),
         vec![digest(2)],
     )
     .expect("membership");
@@ -636,7 +640,7 @@ fn provider_prompt_lifecycle_releases_timeout_failure_and_disconnect_waiters() {
     let mut correlation = provider_correlation(
         registration_id,
         provider_generation,
-        vec![digest(0x33)],
+        &[digest(0x33)],
         vec![ProviderCapability::ProfileQuickPick],
     );
 
@@ -712,7 +716,7 @@ fn provider_unregister_consumes_state_and_returns_every_waiter() {
     let mut correlation = provider_correlation(
         registration_id,
         provider_generation,
-        vec![digest(0x33)],
+        &[digest(0x33)],
         vec![ProviderCapability::ProfileQuickPick],
     );
     let prompt_frame = ProviderResponseFrame::selection_prompt(prompt(
@@ -776,7 +780,7 @@ fn invalid_provider_unregister_retains_every_waiter() {
         let mut correlation = provider_correlation(
             registration_id,
             provider_generation,
-            vec![digest(0x33)],
+            &[digest(0x33)],
             vec![ProviderCapability::ProfileQuickPick],
         );
         let prompt_frame = ProviderResponseFrame::selection_prompt(prompt(
@@ -805,7 +809,7 @@ fn provider_cancel_and_unavailable_each_consume_one_live_prompt() {
     let mut correlation = provider_correlation(
         registration_id,
         provider_generation,
-        vec![digest(0x33)],
+        &[digest(0x33)],
         vec![ProviderCapability::ProfileQuickPick],
     );
     for (index, decision) in [ProviderDecision::Cancelled, ProviderDecision::Unavailable]
@@ -853,7 +857,7 @@ fn provider_prompt_capacity_recovers_all_expired_waiters() {
     let mut correlation = provider_correlation(
         registration_id,
         provider_generation,
-        vec![digest(0x33)],
+        &[digest(0x33)],
         vec![ProviderCapability::ProfileQuickPick],
     );
     let mut prompt_ids = Vec::new();
@@ -900,7 +904,7 @@ fn provider_capabilities_and_repository_membership_are_enforced() {
     let correlation = provider_correlation(
         registration_id,
         provider_generation,
-        vec![digest(0x22)],
+        &[digest(0x22)],
         vec![ProviderCapability::ProfileQuickPick],
     );
     let status = ProviderStatusSnapshot::new(registration_id, provider_generation, Vec::new())
@@ -957,7 +961,7 @@ fn scoped_status_keeps_scm_terminals_and_tasks_independent() {
     let correlation = provider_correlation(
         registration_id,
         provider_generation,
-        vec![digest(9)],
+        &[digest(9)],
         vec![
             ProviderCapability::ProfileQuickPick,
             ProviderCapability::Status,
@@ -979,8 +983,6 @@ fn decoded_values_are_readable_without_reserializing_and_debug_is_redacted() {
     let registration = ProviderRegistrationRequest::new(
         ProviderKind::Vscode,
         "sensitive-window-id".into(),
-        digest(1),
-        vec![digest(2)],
         vec![
             ProviderCapability::ProfileQuickPick,
             ProviderCapability::Status,
@@ -989,8 +991,6 @@ fn decoded_values_are_readable_without_reserializing_and_debug_is_redacted() {
     .expect("registration");
     assert_eq!(registration.kind(), ProviderKind::Vscode);
     assert_eq!(registration.editor_session_id(), "sensitive-window-id");
-    assert_eq!(registration.host_instance(), digest(1));
-    assert_eq!(registration.repositories(), &[digest(2)]);
     assert!(
         registration
             .capabilities()

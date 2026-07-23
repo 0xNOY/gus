@@ -13,6 +13,7 @@ use crate::{
 };
 
 const MAX_OUTSTANDING_PROMPTS: usize = 32;
+const MAX_PROVIDER_REPOSITORIES: usize = 128;
 
 /// Connection-local correlation state for one authenticated provider.
 ///
@@ -47,6 +48,8 @@ impl ProviderCorrelation {
     pub fn from_registration(
         request_frame: &ProviderRequestFrame,
         response_frame: &ProviderResponseFrame,
+        authorized_repositories: &[Digest32],
+        membership_generation: Generation,
     ) -> Result<Self, ProviderCorrelationError> {
         let ProviderRequest::Register(registration) = request_frame.message() else {
             return Err(ProviderCorrelationError::UnexpectedMessageRole);
@@ -57,13 +60,14 @@ impl ProviderCorrelation {
         if request_frame.request_id() != response_frame.request_id() {
             return Err(ProviderCorrelationError::RegistrationResponseMismatch);
         }
+        let repositories = repository_set(authorized_repositories)?;
         Ok(Self {
             registration_id: accepted.registration_id(),
             provider_generation: accepted.provider_generation(),
             capabilities: registration.capabilities().to_vec(),
-            repositories: registration.repositories().iter().copied().collect(),
+            repositories,
             outstanding_prompts: BTreeMap::new(),
-            membership_generation: None,
+            membership_generation: Some(membership_generation),
         })
     }
 
@@ -168,14 +172,35 @@ impl ProviderCorrelation {
             return Err(ProviderCorrelationError::UnexpectedMessageRole);
         };
         self.validate_binding(request.registration_id(), request.provider_generation())?;
+        self.replace_authorized_repositories(
+            request.repositories(),
+            request.membership_generation(),
+        )
+    }
+
+    /// Replaces membership using repositories independently authorized by the
+    /// broker from native Git-caller evidence.
+    ///
+    /// The IDE provider never needs to derive or self-assert native repository
+    /// identities. Every outstanding prompt is revoked at the transition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate, excessive, stale, or replayed snapshots.
+    pub fn replace_authorized_repositories(
+        &mut self,
+        repositories: &[Digest32],
+        membership_generation: Generation,
+    ) -> Result<Vec<RequestId>, ProviderCorrelationError> {
         if self
             .membership_generation
-            .is_some_and(|generation| generation >= request.membership_generation())
+            .is_some_and(|generation| generation >= membership_generation)
         {
             return Err(ProviderCorrelationError::StaleMembership);
         }
-        self.membership_generation = Some(request.membership_generation());
-        self.repositories = request.repositories().iter().copied().collect();
+        let repositories = repository_set(repositories)?;
+        self.membership_generation = Some(membership_generation);
+        self.repositories = repositories;
         Ok(self.drain_prompts())
     }
 
@@ -398,6 +423,18 @@ pub enum ProviderCorrelationError {
     ProfileNotOffered,
     #[error("repository membership generation is stale or replayed")]
     StaleMembership,
+    #[error("broker-authorized repository membership is duplicate or exceeds capacity")]
+    InvalidMembership,
+}
+
+fn repository_set(
+    repositories: &[Digest32],
+) -> Result<BTreeSet<Digest32>, ProviderCorrelationError> {
+    let unique = repositories.iter().copied().collect::<BTreeSet<_>>();
+    if repositories.len() > MAX_PROVIDER_REPOSITORIES || unique.len() != repositories.len() {
+        return Err(ProviderCorrelationError::InvalidMembership);
+    }
+    Ok(unique)
 }
 
 /// Fail-closed provider termination with every waiter retained for completion.

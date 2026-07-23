@@ -18,41 +18,28 @@ use thiserror::Error;
 // registration rather than weakening replay protection.
 const MAX_PROCESSED_COMMANDS: usize = 262_144;
 
-/// Broker admission which binds untrusted registration claims to an
-/// authenticated extension-host peer and broker-resolved repositories.
+/// Broker admission which binds an untrusted registration to an authenticated
+/// native provider connection.
 /// `editor_session_id` remains provider-chosen presentation/correlation data;
-/// routing authority comes only from the retained peer, authenticated host
-/// instance, and resolved repository set. The complete frame is retained so
-/// the admission cannot be substituted onto another same-ID request.
+/// routing authority and repository membership come only from broker-owned OS
+/// observations. The complete frame is retained so the admission cannot be
+/// substituted onto another same-ID request.
 pub struct ProviderAdmission {
     peer: ProcessIdentity,
     request: ProviderRequestFrame,
 }
 
 impl ProviderAdmission {
-    /// Verifies a registration against transport and repository evidence.
-    ///
-    /// `authorized_repositories` must come from the broker's repository
-    /// resolver, never by copying the provider's digest claims.
-    ///
     /// # Errors
     ///
-    /// Rejects non-registration frames and any host or repository mismatch.
+    /// Rejects non-registration frames.
     pub fn verify(
         peer: ProcessIdentity,
         request: &ProviderRequestFrame,
-        authenticated_host_instance: Digest32,
-        authorized_repositories: &[Digest32],
     ) -> Result<Self, ProviderAdmissionError> {
-        let ProviderRequest::Register(registration) = request.message() else {
+        let ProviderRequest::Register(_) = request.message() else {
             return Err(ProviderAdmissionError::UnexpectedMessageRole);
         };
-        if registration.host_instance() != authenticated_host_instance
-            || as_set(registration.repositories()) != as_set(authorized_repositories)
-            || registration.repositories().len() != authorized_repositories.len()
-        {
-            return Err(ProviderAdmissionError::ClaimMismatch);
-        }
         Ok(Self {
             peer,
             request: request.clone(),
@@ -134,6 +121,8 @@ impl ProviderSession {
     pub fn register(
         request: &ProviderRequestFrame,
         admission: ProviderAdmission,
+        authorized_repositories: &[Digest32],
+        membership_generation: Generation,
         provider_generation: Generation,
         heartbeat_interval_millis: u32,
         now: Instant,
@@ -155,7 +144,12 @@ impl ProviderSession {
             heartbeat_interval_millis,
         )?;
         let response = ProviderResponseFrame::registration_response(registration_id, accepted)?;
-        let correlation = ProviderCorrelation::from_registration(request, &response)?;
+        let correlation = ProviderCorrelation::from_registration(
+            request,
+            &response,
+            authorized_repositories,
+            membership_generation,
+        )?;
         let heartbeat_timeout = Duration::from_millis(u64::from(heartbeat_interval_millis) * 2);
         let heartbeat_deadline = now
             .checked_add(heartbeat_timeout)
@@ -223,6 +217,27 @@ impl ProviderSession {
         }
         self.correlation()?.validate_status(&frame)?;
         Ok(frame)
+    }
+
+    /// Replaces repository membership from broker-owned caller observations.
+    ///
+    /// The provider does not supply these identities. Outstanding prompts are
+    /// returned so the broker can complete them as unavailable before routing
+    /// against the new snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Rejects closed/expired providers and invalid or stale membership.
+    pub fn replace_authorized_repositories(
+        &mut self,
+        repositories: &[Digest32],
+        membership_generation: Generation,
+        now: Instant,
+    ) -> Result<Vec<RequestId>, ProviderSessionError> {
+        self.require_heartbeat_live(now)?;
+        Ok(self
+            .correlation_mut()?
+            .replace_authorized_repositories(repositories, membership_generation)?)
     }
 
     /// Handles one decoded post-registration provider command.
@@ -525,8 +540,6 @@ mod tests {
             ProviderRegistrationRequest::new(
                 ProviderKind::Vscode,
                 "window-1".into(),
-                digest(1),
-                vec![digest(2)],
                 vec![
                     ProviderCapability::ProfileQuickPick,
                     ProviderCapability::Status,
@@ -553,9 +566,17 @@ mod tests {
         request: &ProviderRequestFrame,
         now: Instant,
     ) -> (ProviderSession, ProviderResponseFrame) {
-        let admission =
-            ProviderAdmission::verify(peer(), request, digest(1), &[digest(2)]).expect("admission");
-        ProviderSession::register(request, admission, generation(7), 15_000, now).expect("register")
+        let admission = ProviderAdmission::verify(peer(), request).expect("admission");
+        ProviderSession::register(
+            request,
+            admission,
+            &[digest(2)],
+            generation(1),
+            generation(7),
+            15_000,
+            now,
+        )
+        .expect("register")
     }
 
     fn prompt(session: &ProviderSession, timeout_millis: u32) -> SelectionPrompt {
@@ -629,7 +650,7 @@ mod tests {
         let membership = ProviderRepositoryMembership::new(
             session.registration_id(),
             session.provider_generation(),
-            generation(1),
+            generation(2),
             vec![digest(2)],
         )
         .expect("membership");
@@ -657,6 +678,35 @@ mod tests {
         assert!(matches!(
             session.expire_prompts(now),
             Err(ProviderSessionError::Closed)
+        ));
+    }
+
+    #[test]
+    fn broker_can_replace_membership_without_provider_claims() {
+        let request = registration();
+        let (mut session, _) = register(&request);
+        let now = Instant::now();
+        let issued = session
+            .issue_prompt(prompt(&session, 30_000), now)
+            .expect("initial authorized prompt");
+
+        assert_eq!(
+            session
+                .replace_authorized_repositories(&[digest(9)], generation(2), now)
+                .expect("broker-owned replacement"),
+            vec![issued.frame.request_id()]
+        );
+        assert!(matches!(
+            session.issue_prompt(prompt(&session, 30_000), now),
+            Err(ProviderSessionError::Correlation(
+                ProviderCorrelationError::RepositoryNotRegistered
+            ))
+        ));
+        assert!(matches!(
+            session.replace_authorized_repositories(&[digest(9)], generation(2), now),
+            Err(ProviderSessionError::Correlation(
+                ProviderCorrelationError::StaleMembership
+            ))
         ));
     }
 
@@ -749,13 +799,12 @@ mod tests {
     }
 
     #[test]
-    fn admission_cannot_move_to_a_same_id_frame_with_different_claims() {
+    fn admission_cannot_move_to_a_same_id_frame_with_different_metadata() {
         let request = registration();
-        let admission = ProviderAdmission::verify(peer(), &request, digest(1), &[digest(2)])
-            .expect("admission");
+        let admission = ProviderAdmission::verify(peer(), &request).expect("admission");
         let mut substituted = serde_json::to_value(&request).expect("serialize frame");
-        substituted["message"]["body"]["repositories"][0] =
-            serde_json::to_value(digest(9)).expect("serialize digest");
+        substituted["message"]["body"]["editor_session_id"] =
+            serde_json::Value::String("window-2".into());
         let payload = serde_json::to_vec(&substituted).expect("serialize substituted frame");
         let mut record = Vec::with_capacity(4 + payload.len());
         record.extend_from_slice(
@@ -771,6 +820,8 @@ mod tests {
             ProviderSession::register(
                 &substituted,
                 admission,
+                &[digest(2)],
+                generation(1),
                 generation(7),
                 15_000,
                 Instant::now()

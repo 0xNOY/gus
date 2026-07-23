@@ -13,8 +13,6 @@ import type { StatusPresentation } from "../src/ui.js";
 const REGISTRATION: ProviderRegistrationRequest = {
   kind: "vscode",
   editor_session_id: "window-1",
-  host_instance: "11".repeat(32),
-  repositories: ["22".repeat(32)],
   capabilities: ["profile_quick_pick", "status"],
 };
 
