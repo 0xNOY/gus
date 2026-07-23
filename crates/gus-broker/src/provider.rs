@@ -492,7 +492,10 @@ impl std::fmt::Debug for ProviderSession {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        num::NonZeroU32,
+        time::{Duration, Instant},
+    };
 
     use gus_ipc::{
         BrokerProviderMessage, Digest32, OperationPresentation, ProfilePresentation,
@@ -500,7 +503,7 @@ mod tests {
         ProviderRepositoryMembership, ProviderSelectionDecision, RepositoryPresentation,
         ScopePresentation, SelectionScopePresentation,
     };
-    use gus_platform::CurrentSessionObserver;
+    use gus_platform::NativeProcessObserver;
     use gus_profile::ProfileId;
 
     use super::*;
@@ -535,10 +538,11 @@ mod tests {
     }
 
     fn peer() -> ProcessIdentity {
-        CurrentSessionObserver::new()
-            .observe()
-            .expect("current process")
-            .caller()
+        NativeProcessObserver::new(
+            NonZeroU32::new(std::process::id()).expect("current process ID is nonzero"),
+        )
+        .observe()
+        .expect("current process")
     }
 
     fn register(request: &ProviderRequestFrame) -> (ProviderSession, ProviderResponseFrame) {
