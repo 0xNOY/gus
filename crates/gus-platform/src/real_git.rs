@@ -386,6 +386,8 @@ thread_local! {
 thread_local! {
     static BEFORE_MACOS_PROBE_STATUS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static FORCE_MACOS_GROUP_KILL_ERROR: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
@@ -1117,19 +1119,19 @@ fn run_macos_probe(
             terminate_macos_probe(&mut child, process_id)?;
             return Err(RetainedExecError::ProbeTimedOut);
         }
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        match macos_probe_has_exited(process_id) {
+            Ok(true) => {
                 if Instant::now() >= deadline {
-                    kill_macos_probe_group(process_id)?;
+                    terminate_macos_probe(&mut child, process_id)?;
                     return Err(RetainedExecError::ProbeTimedOut);
                 }
-                kill_macos_probe_group(process_id)?;
+                let status = finish_observed_macos_probe(&mut child, process_id)?;
                 break status;
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(error) => {
                 terminate_macos_probe(&mut child, process_id)?;
-                return Err(retained_io_error(&error));
+                return Err(error);
             }
         }
         thread::sleep(Duration::from_millis(5));
@@ -1157,6 +1159,51 @@ fn run_macos_probe(
 }
 
 #[cfg(target_os = "macos")]
+fn macos_probe_has_exited(process_id: libc::pid_t) -> Result<bool, RetainedExecError> {
+    let expected_process_id = process_id;
+    let process_id =
+        libc::id_t::try_from(process_id).map_err(|_| RetainedExecError::ProbeFailed)?;
+    loop {
+        let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `status` is zeroed writable storage for one siginfo record.
+        // WNOWAIT observes the exact child without releasing its PID/PGID,
+        // so the process group remains safe to signal before `Child::wait`.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                process_id,
+                status.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: successful waitid initialized the zeroed record. POSIX
+            // defines a zero si_pid as WNOHANG observing no state change.
+            return match unsafe { status.assume_init() }.si_pid {
+                0 => Ok(false),
+                observed if observed == expected_process_id => Ok(true),
+                _ => Err(RetainedExecError::ProbeFailed),
+            };
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(retained_io_error(&error));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finish_observed_macos_probe(
+    child: &mut Child,
+    process_id: libc::pid_t,
+) -> Result<std::process::ExitStatus, RetainedExecError> {
+    let group_result = kill_macos_probe_group(process_id);
+    let wait_result = child.wait().map_err(|error| retained_io_error(&error));
+    group_result?;
+    wait_result
+}
+
+#[cfg(target_os = "macos")]
 fn terminate_macos_probe(
     child: &mut Child,
     process_id: libc::pid_t,
@@ -1172,6 +1219,13 @@ fn terminate_macos_probe(
 
 #[cfg(target_os = "macos")]
 fn kill_macos_probe_group(process_id: libc::pid_t) -> Result<(), RetainedExecError> {
+    #[cfg(test)]
+    if FORCE_MACOS_GROUP_KILL_ERROR.with(|force| force.replace(false)) {
+        return Err(RetainedExecError::Io {
+            kind: io::ErrorKind::PermissionDenied,
+            raw_os_error: Some(libc::EPERM),
+        });
+    }
     // SAFETY: the child was placed in a process group named by its positive
     // PID, so the negated value targets that group.
     if unsafe { libc::kill(-process_id, libc::SIGKILL) } == -1 {
@@ -2047,6 +2101,16 @@ fn install_before_macos_probe_status_hook(hook: impl FnOnce() + 'static) {
             "only one macOS probe-status test hook may be installed per thread"
         );
         *installed.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn force_next_macos_group_kill_error() {
+    FORCE_MACOS_GROUP_KILL_ERROR.with(|force| {
+        assert!(
+            !force.replace(true),
+            "only one forced macOS group-kill error may be pending per thread"
+        );
     });
 }
 
@@ -4185,6 +4249,48 @@ mod tests {
             run_macos_probe(&mut command, Duration::from_millis(10), 64)
                 .expect_err("late success must time out"),
             RetainedExecError::ProbeTimedOut
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_reaps_an_observed_child_when_group_kill_fails() {
+        let mut child = Command::new("/usr/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn observed child");
+        let process_id = libc::pid_t::try_from(child.id()).expect("child PID fits pid_t");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !macos_probe_has_exited(process_id).expect("observe child without reaping") {
+            assert!(
+                Instant::now() < deadline,
+                "child did not exit before deadline"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        force_next_macos_group_kill_error();
+        assert_eq!(
+            finish_observed_macos_probe(&mut child, process_id)
+                .expect_err("injected group-kill failure must be preserved"),
+            RetainedExecError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+                raw_os_error: Some(libc::EPERM),
+            }
+        );
+
+        let mut status = 0;
+        // SAFETY: the exact child PID has already been reaped by the helper.
+        assert_eq!(
+            unsafe { libc::waitpid(process_id, &raw mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
         );
     }
 
