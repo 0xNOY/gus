@@ -24,6 +24,14 @@
   "categories": [
     "SCM Providers"
   ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "gus.showDiagnostics",
+        "title": "GUS: Show Diagnostics"
+      }
+    ]
+  },
   "files": [
     "dist/src/**",
     "bin/**",

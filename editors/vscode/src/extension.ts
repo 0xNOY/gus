@@ -14,6 +14,15 @@ import type {
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("GUS");
   context.subscriptions.push(output);
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "gus.showDiagnostics",
+    () => output.show(true),
+  ));
+  output.appendLine(
+    `GUS ${String(context.extension.packageJSON.version)}; `
+      + `platform=${process.platform}/${process.arch}; `
+      + `remote=${vscode.env.remoteName ?? "local"}`,
+  );
   const item = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
     50,
@@ -94,6 +103,7 @@ class VscodeStatusBar implements StatusBar {
 
   constructor(item: vscode.StatusBarItem) {
     this.#item = item;
+    this.#item.command = "gus.showDiagnostics";
   }
 
   show(presentation: StatusPresentation): void {
