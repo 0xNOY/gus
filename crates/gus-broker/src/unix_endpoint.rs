@@ -206,7 +206,7 @@ fn validate_ancestor_chain(path: &Path) -> Result<(), UnixEndpointError> {
             return Err(UnixEndpointError::UnsafeAncestor);
         }
         let mode = metadata.mode();
-        if mode & 0o022 != 0 && !(metadata.uid() == 0 && mode & libc::S_ISVTX != 0) {
+        if mode & 0o022 != 0 && !(metadata.uid() == 0 && mode & 0o1000 != 0) {
             return Err(UnixEndpointError::UnsafeAncestor);
         }
     }
