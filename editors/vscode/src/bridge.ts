@@ -80,7 +80,7 @@ export function startProviderBridge(
     transport,
     picker: options.picker,
     scheduler: options.scheduler,
-    ...(options.onReady === undefined ? {} : { onRegistered: options.onReady }),
+    ...(options.onReady === undefined ? {} : { onReady: options.onReady }),
     onStatus: options.onStatus,
     onFatal: fail,
   });

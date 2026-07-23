@@ -12,7 +12,10 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use gus_broker::{connect_published_provider, digest_unix_arguments, observe_linux_repository};
+use gus_broker::{
+    LinuxRepositoryLease, connect_published_provider, digest_unix_arguments,
+    retain_linux_repository,
+};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_core::{NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME, ProfileRequirement, RequirementReason};
 #[cfg(target_os = "linux")]
@@ -37,6 +40,20 @@ const MAX_SELECTION_BYTES: usize = 128;
 #[cfg(target_os = "linux")]
 const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(65);
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+struct SelectedProfile {
+    profile: Profile,
+    binding: Option<BrokerSelectionBinding>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+struct BrokerSelectionBinding {
+    #[cfg(target_os = "linux")]
+    repository: LinuxRepositoryLease,
+    #[cfg(target_os = "linux")]
+    plan: gus_ipc::Digest32,
+}
+
 fn main() -> ExitCode {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     {
@@ -60,8 +77,8 @@ fn run_unix() -> ExitCode {
         InitialRoute::Forward(admission) => execute_git(admission),
         InitialRoute::Resolve(required) => {
             match selected_profile(&arguments, required.presentation()) {
-                Ok(Some(profile)) => match required.select_explicit_profile(&profile) {
-                    Ok(admission) => execute_profiled_git(admission),
+                Ok(Some(selected)) => match required.select_explicit_profile(&selected.profile) {
+                    Ok(admission) => execute_profiled_git(admission, selected.binding.as_ref()),
                     Err(error) => explicit_admission_error(&error),
                 },
                 Ok(None) => selection_required(
@@ -86,19 +103,27 @@ fn run_unix() -> ExitCode {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn execute_git(admission: LocalPolicyAdmission) -> ExitCode {
-    execute_git_arguments(admission.into_arguments(), &neutral_environment())
+    execute_git_arguments(admission.into_arguments(), &neutral_environment(), None)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-fn execute_profiled_git(admission: ExplicitProfileAdmission) -> ExitCode {
+fn execute_profiled_git(
+    admission: ExplicitProfileAdmission,
+    binding: Option<&BrokerSelectionBinding>,
+) -> ExitCode {
     let (arguments, author, committer) = admission.into_execution();
-    execute_git_arguments(arguments, &profile_environment(&author, &committer))
+    execute_git_arguments(
+        arguments,
+        &profile_environment(&author, &committer),
+        binding,
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn execute_git_arguments(
     arguments: Vec<OsString>,
     environment: &[(OsString, OsString)],
+    binding: Option<&BrokerSelectionBinding>,
 ) -> ExitCode {
     let current = match std::env::current_exe() {
         Ok(current) => current,
@@ -115,6 +140,9 @@ fn execute_git_arguments(
         Ok(git) => git,
         Err(error) => return launch_error("verify the fixed system Git", &error),
     };
+    if !revalidate_selection(binding, &arguments) {
+        return launch_message("the repository or invocation changed after profile selection");
+    }
 
     let mut forwarded = Vec::with_capacity(arguments.len() + 1);
     forwarded.push(OsString::from("git"));
@@ -125,17 +153,41 @@ fn execute_git_arguments(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn revalidate_selection(binding: Option<&BrokerSelectionBinding>, arguments: &[OsString]) -> bool {
+    let Some(binding) = binding else {
+        return true;
+    };
+    let Some(pid) = std::num::NonZeroU32::new(std::process::id()) else {
+        return false;
+    };
+    binding.repository.revalidate(pid).is_ok() && digest_unix_arguments(arguments) == binding.plan
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn revalidate_selection(
+    _binding: Option<&BrokerSelectionBinding>,
+    _arguments: &[OsString],
+) -> bool {
+    true
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn selected_profile(
     arguments: &[OsString],
     operation: OperationPresentation,
-) -> Result<Option<Profile>, String> {
+) -> Result<Option<SelectedProfile>, String> {
     if let Some(raw_id) = std::env::var_os("GUS_PROFILE_ID") {
         let id = raw_id
             .into_string()
             .map_err(|_| "GUS_PROFILE_ID is not valid UTF-8".to_owned())
             .and_then(|id| ProfileId::try_from(id).map_err(|error| error.to_string()))?;
-        return profile_by_id(&load_profile_set()?, &id).map(Some);
+        return profile_by_id(&load_profile_set()?, &id).map(|profile| {
+            Some(SelectedProfile {
+                profile,
+                binding: None,
+            })
+        });
     }
 
     let observation = CurrentSessionObserver::new()
@@ -154,20 +206,26 @@ fn selected_profile(
     let selection_path = selection_path(&terminal.selection_key().encode_hex())?;
     if let Some(id) = read_session_selection(&selection_path)? {
         if let Some(profile) = profiles.profiles.get(&id) {
-            return Ok(Some(profile.clone()));
+            return Ok(Some(SelectedProfile {
+                profile: profile.clone(),
+                binding: None,
+            }));
         }
     }
     let id = prompt_for_profile(&profiles)?;
     let profile = profile_by_id(&profiles, &id)?;
     write_session_selection(&selection_path, &id)?;
-    Ok(Some(profile))
+    Ok(Some(SelectedProfile {
+        profile,
+        binding: None,
+    }))
 }
 
 #[cfg(target_os = "linux")]
 fn broker_selected_profile(
     arguments: &[OsString],
     operation: OperationPresentation,
-) -> Result<Option<Profile>, String> {
+) -> Result<Option<SelectedProfile>, String> {
     let runtime = broker_runtime_directory()?;
     let Ok(mut broker) = connect_published_provider(&runtime, BROKER_IO_TIMEOUT, BROKER_IO_TIMEOUT)
     else {
@@ -175,15 +233,16 @@ fn broker_selected_profile(
     };
     let pid = std::num::NonZeroU32::new(std::process::id())
         .ok_or_else(|| "the shim process ID is invalid".to_owned())?;
-    let repository_identity = observe_linux_repository(pid)
-        .map_err(|error| format!("cannot establish repository identity: {error}"))?
-        .identity();
+    let repository = retain_linux_repository(pid)
+        .map_err(|error| format!("cannot establish repository identity: {error}"))?;
+    let repository_identity = repository.evidence().identity();
     let request = ResolveSelectionRequest::new(
         digest_unix_arguments(arguments),
         repository_identity,
         operation,
         None,
     );
+    let plan = request.plan_digest();
     let frame = ShimRequestFrame::request(ShimRequest::ResolveSelection(request))
         .map_err(|error| format!("cannot build the broker request: {error}"))?;
     write_shim_request(&mut broker, &frame)
@@ -210,7 +269,10 @@ fn broker_selected_profile(
                         .to_owned(),
                 );
             }
-            Ok(Some(profile))
+            Ok(Some(SelectedProfile {
+                profile,
+                binding: Some(BrokerSelectionBinding { repository, plan }),
+            }))
         }
         BrokerShimMessage::Error(error) => Err(format!(
             "the broker rejected selection with {:?}",

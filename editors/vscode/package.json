@@ -19,7 +19,7 @@
     "workspace"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "*"
   ],
   "categories": [
     "SCM Providers"

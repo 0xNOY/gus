@@ -25,6 +25,40 @@ pub struct LinuxRepositoryEvidence {
     label: String,
 }
 
+/// Open authority for the common directory observed before a broker prompt.
+pub struct LinuxRepositoryLease {
+    evidence: LinuxRepositoryEvidence,
+    common_dir: File,
+}
+
+impl LinuxRepositoryLease {
+    #[must_use]
+    pub const fn evidence(&self) -> &LinuxRepositoryEvidence {
+        &self.evidence
+    }
+
+    /// Revalidates the retained common-directory inode and its live namespace.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the process, repository namespace, or retained inode changed.
+    pub fn revalidate(&self, pid: NonZeroU32) -> Result<(), RepositoryEvidenceError> {
+        let first = NativeProcessObserver::new(pid).observe()?;
+        let (current, common_dir) = repository_location_for_pid(pid)?;
+        let retained = self.common_dir.metadata().map_err(io_error)?;
+        let current_metadata = fs::metadata(common_dir).map_err(io_error)?;
+        let second = NativeProcessObserver::new(pid).observe()?;
+        if first != second
+            || current != self.evidence
+            || retained.dev() != current_metadata.dev()
+            || retained.ino() != current_metadata.ino()
+        {
+            return Err(RepositoryEvidenceError::ProcessChanged);
+        }
+        Ok(())
+    }
+}
+
 impl LinuxRepositoryEvidence {
     #[must_use]
     pub const fn identity(&self) -> Digest32 {
@@ -121,6 +155,33 @@ pub fn observe_linux_repository(
     Ok(repository)
 }
 
+/// Retains the exact common-directory inode across an interactive selection.
+///
+/// # Errors
+///
+/// Fails when the process changes or the repository cannot be opened without
+/// following a final symbolic link.
+pub fn retain_linux_repository(
+    pid: NonZeroU32,
+) -> Result<LinuxRepositoryLease, RepositoryEvidenceError> {
+    let first = NativeProcessObserver::new(pid).observe()?;
+    let (evidence, common_dir) = repository_location_for_pid(pid)?;
+    let common_dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(common_dir)
+        .map_err(io_error)?;
+    let metadata = common_dir.metadata().map_err(io_error)?;
+    let second = NativeProcessObserver::new(pid).observe()?;
+    if first != second || !metadata.is_dir() {
+        return Err(RepositoryEvidenceError::ProcessChanged);
+    }
+    Ok(LinuxRepositoryLease {
+        evidence,
+        common_dir,
+    })
+}
+
 /// Computes the versioned digest used to bind shim argv to a broker request.
 #[must_use]
 pub fn digest_unix_arguments(arguments: &[OsString]) -> Digest32 {
@@ -135,6 +196,12 @@ pub fn digest_unix_arguments(arguments: &[OsString]) -> Digest32 {
 }
 
 fn repository_for_pid(pid: NonZeroU32) -> Result<LinuxRepositoryEvidence, RepositoryEvidenceError> {
+    repository_location_for_pid(pid).map(|(evidence, _)| evidence)
+}
+
+fn repository_location_for_pid(
+    pid: NonZeroU32,
+) -> Result<(LinuxRepositoryEvidence, PathBuf), RepositoryEvidenceError> {
     let cwd = fs::read_link(format!("/proc/{pid}/cwd")).map_err(io_error)?;
     if !cwd.is_absolute() {
         return Err(RepositoryEvidenceError::UnsafeRepository);
@@ -155,7 +222,8 @@ fn repository_for_pid(pid: NonZeroU32) -> Result<LinuxRepositoryEvidence, Reposi
                     return Err(RepositoryEvidenceError::UnsafeRepository);
                 };
                 let common_dir = resolve_common_dir(&git_dir)?;
-                return repository_evidence(&worktree, &common_dir);
+                let evidence = repository_evidence(&worktree, &common_dir)?;
+                return Ok((evidence, common_dir));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(error)),

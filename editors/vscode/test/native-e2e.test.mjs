@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,13 +49,15 @@ test("VS Code provider selects the identity used by a real shimmed commit", asyn
 
     let prompts = 0;
     let fatal;
+    let repositoryToReplace;
+    const statuses = [];
     runtime = startProviderRuntime({
       bridgePath,
       runtimeDirectory,
       registration: {
         kind: "vscode",
         editor_session_id: "native-e2e-window",
-        capabilities: ["profile_quick_pick"],
+        capabilities: ["profile_quick_pick", "status"],
       },
       quickPickWindow: {
         async showQuickPick(items, _options, signal) {
@@ -64,15 +66,25 @@ test("VS Code provider selects the identity used by a real shimmed commit", asyn
           prompts += 1;
           if (prompts === 1) {
             assert.equal(items[0].profile.display_name, "Alice Example");
-          } else {
+          } else if (prompts === 2) {
             assert.equal(items[0].profile.display_name, "Mallory Example");
             await writeFile(profileStore, racedProfileToml, { mode: 0o600 });
+          } else {
+            assert.equal(items[0].profile.display_name, "Eve Example");
+            assert.notEqual(repositoryToReplace, undefined);
+            await rename(
+              join(repositoryToReplace, ".git"),
+              join(repositoryToReplace, ".git-original"),
+            );
+            await mkdir(join(repositoryToReplace, ".git"), { mode: 0o700 });
           }
           return items[0];
         },
       },
       statusBar: {
-        show() {},
+        show(status) {
+          statuses.push(status);
+        },
         dispose() {},
       },
       onFatal(error) {
@@ -93,6 +105,7 @@ test("VS Code provider selects the identity used by a real shimmed commit", asyn
     assert.equal(commit.stderr.includes("GUS_E_"), false, commit.stderr);
     assert.equal(prompts, 1);
     assert.equal(fatal, undefined);
+    assert.equal(statuses.at(-1)?.text, "$(git-commit) GUS SCM: Alice Example");
 
     const log = await run(
       "git",
@@ -123,6 +136,26 @@ test("VS Code provider selects the identity used by a real shimmed commit", asyn
       env: environment,
     });
     assert.equal(count.stdout.trim(), "1");
+
+    repositoryToReplace = join(root, "replaced-repository");
+    await mkdir(repositoryToReplace, { mode: 0o700 });
+    await run("git", ["init", "--quiet"], {
+      cwd: repositoryToReplace,
+      env: environment,
+    });
+    const repositoryRace = await runUnchecked(
+      shimPath,
+      ["commit", "--allow-empty", "-m", "replaced repository"],
+      {
+        cwd: repositoryToReplace,
+        env: environment,
+        detached: true,
+      },
+    );
+    assert.equal(repositoryRace.signal, null);
+    assert.notEqual(repositoryRace.code, 0);
+    assert.match(repositoryRace.stderr, /GUS_E_REAL_GIT/u);
+    assert.equal(prompts, 3);
   } finally {
     runtime?.dispose();
     broker.kill("SIGTERM");

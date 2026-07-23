@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -23,9 +23,9 @@ use gus_broker::{
 #[cfg(target_os = "linux")]
 use gus_ipc::{
     BrokerError, BrokerShimMessage, Digest32, ErrorCode, ErrorDetail, ErrorPhase, Generation,
-    ProfilePresentation, ProviderDecision, ProviderStatusSnapshot, RepositoryPresentation,
-    RequestId, ResolvedSelection, ScopePresentation, SelectionPrompt, SelectionScopePresentation,
-    ShimRequest, ShimResponseFrame,
+    ProfilePresentation, ProtectionStatus, ProviderDecision, ProviderStatusEntry,
+    ProviderStatusSnapshot, RepositoryPresentation, RequestId, ResolvedSelection,
+    ScopePresentation, SelectionPrompt, SelectionScopePresentation, ShimRequest, ShimResponseFrame,
 };
 #[cfg(target_os = "linux")]
 use gus_platform::{ProcessIdentity, observe_process_parent};
@@ -39,11 +39,21 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const SELECTION_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(target_os = "linux")]
+const PROVIDER_READY_GRACE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const SELECTION_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
 const HEARTBEAT_INTERVAL_MILLIS: u32 = 30_000;
 #[cfg(target_os = "linux")]
 const MAX_PROFILE_STORE_BYTES: u64 = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_PROVIDER_WORK: usize = 64;
+#[cfg(target_os = "linux")]
+const WAITER_PENDING: u8 = 0;
+#[cfg(target_os = "linux")]
+const WAITER_CANCELLED: u8 = 1;
+#[cfg(target_os = "linux")]
+const WAITER_CLAIMED: u8 = 2;
 
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
@@ -126,14 +136,15 @@ struct ProviderHandle {
 
 #[cfg(target_os = "linux")]
 struct ProviderWork {
+    plan_digest: Digest32,
     repository: Digest32,
     repository_label: String,
     operation: gus_ipc::OperationPresentation,
     profiles: Vec<Profile>,
     explicit_profile: Option<ProfileId>,
     deadline: Instant,
-    active: Arc<AtomicBool>,
-    reply: mpsc::SyncSender<Result<SelectedProfile, SelectionFailure>>,
+    state: Arc<AtomicU8>,
+    reply: mpsc::SyncSender<Result<SelectionGrant, SelectionFailure>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -148,6 +159,10 @@ struct SelectedProfile {
 #[cfg(target_os = "linux")]
 struct PendingPrompt {
     request_id: gus_ipc::RequestId,
+    plan_digest: Digest32,
+    repository: Digest32,
+    repository_label: String,
+    operation: gus_ipc::OperationPresentation,
     profiles: Vec<Profile>,
     waiters: Vec<SelectionWaiter>,
 }
@@ -155,8 +170,14 @@ struct PendingPrompt {
 #[cfg(target_os = "linux")]
 struct SelectionWaiter {
     deadline: Instant,
-    active: Arc<AtomicBool>,
-    reply: mpsc::SyncSender<Result<SelectedProfile, SelectionFailure>>,
+    state: Arc<AtomicU8>,
+    reply: mpsc::SyncSender<Result<SelectionGrant, SelectionFailure>>,
+}
+
+#[cfg(target_os = "linux")]
+struct SelectionGrant {
+    selected: SelectedProfile,
+    acknowledgement: mpsc::Sender<()>,
 }
 
 #[cfg(target_os = "linux")]
@@ -205,37 +226,49 @@ fn handle_shim(
         return;
     };
     let profiles = profile_set.profiles.into_values().collect::<Vec<_>>();
-    let providers = registry
-        .lock()
-        .ok()
-        .map(|mut providers| {
-            providers.retain(|provider| provider.alive.load(Ordering::Acquire));
-            providers
-                .iter()
-                .rev()
-                .filter(|provider| provider.anchor == anchor)
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if providers.is_empty() {
-        respond_error(shim, request_id, ErrorCode::GusEProviderUnavailable);
-        return;
-    }
+    let provider_deadline = Instant::now() + PROVIDER_READY_GRACE;
+    let providers = loop {
+        let providers = registry
+            .lock()
+            .ok()
+            .map(|mut providers| {
+                providers.retain(|provider| provider.alive.load(Ordering::Acquire));
+                providers
+                    .iter()
+                    .rev()
+                    .filter(|provider| provider.anchor == anchor)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !providers.is_empty() {
+            break providers;
+        }
+        if !shim.peer_is_live() {
+            return;
+        }
+        if Instant::now() >= provider_deadline {
+            respond_error(shim, request_id, ErrorCode::GusEProviderUnavailable);
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     let (reply, result) = mpsc::sync_channel(1);
-    let active = Arc::new(AtomicBool::new(true));
+    let state = Arc::new(AtomicU8::new(WAITER_PENDING));
     let deadline = Instant::now() + SELECTION_TIMEOUT;
     let mut reply = Some(reply);
     let mut sent = false;
+    let mut saw_capacity = false;
     for provider in providers {
         let work = ProviderWork {
+            plan_digest: request.plan_digest(),
             repository,
             repository_label: repository_label.clone(),
             operation,
             profiles: profiles.clone(),
             explicit_profile: explicit_profile.clone(),
             deadline,
-            active: Arc::clone(&active),
+            state: Arc::clone(&state),
             reply: reply
                 .take()
                 .expect("reply is retained until one send succeeds"),
@@ -246,25 +279,29 @@ fn handle_shim(
                 break;
             }
             Err(mpsc::TrySendError::Disconnected(work)) => reply = Some(work.reply),
-            Err(mpsc::TrySendError::Full(_)) => {
-                active.store(false, Ordering::Release);
-                respond_error(shim, request_id, ErrorCode::GusEBrokerCapacity);
-                return;
+            Err(mpsc::TrySendError::Full(work)) => {
+                saw_capacity = true;
+                reply = Some(work.reply);
             }
         }
     }
     if !sent {
-        respond_error(shim, request_id, ErrorCode::GusEProviderUnavailable);
+        let code = if saw_capacity {
+            ErrorCode::GusEBrokerCapacity
+        } else {
+            ErrorCode::GusEProviderUnavailable
+        };
+        respond_error(shim, request_id, code);
         return;
     }
     let selected = loop {
         if !shim.peer_is_live() {
-            active.store(false, Ordering::Release);
+            cancel_waiter(&state);
             return;
         }
         let now = Instant::now();
         if now >= deadline {
-            active.store(false, Ordering::Release);
+            cancel_waiter(&state);
             respond_error(shim, request_id, ErrorCode::GusESelectionTimeout);
             return;
         }
@@ -272,36 +309,35 @@ fn handle_shim(
             .saturating_duration_since(now)
             .min(Duration::from_millis(50));
         match result.recv_timeout(wait) {
-            Ok(Ok(selected)) => break selected,
+            Ok(Ok(grant)) => break grant,
             Ok(Err(SelectionFailure::Cancelled)) => {
-                active.store(false, Ordering::Release);
+                cancel_waiter(&state);
                 respond_error(shim, request_id, ErrorCode::GusESelectionCancelled);
                 return;
             }
             Ok(Err(SelectionFailure::TimedOut)) => {
-                active.store(false, Ordering::Release);
+                cancel_waiter(&state);
                 respond_error(shim, request_id, ErrorCode::GusESelectionTimeout);
                 return;
             }
             Ok(Err(SelectionFailure::Unavailable)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                active.store(false, Ordering::Release);
+                cancel_waiter(&state);
                 respond_error(shim, request_id, ErrorCode::GusEProviderUnavailable);
                 return;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
-    active.store(false, Ordering::Release);
-    let Ok(profile_generation) = Generation::new(selected.profile_generation) else {
+    let Ok(profile_generation) = Generation::new(selected.selected.profile_generation) else {
         return;
     };
-    let Ok(session_generation) = Generation::new(selected.session_generation) else {
+    let Ok(session_generation) = Generation::new(selected.selected.session_generation) else {
         return;
     };
     let Ok(resolved) = ResolvedSelection::new(
-        selected.id,
+        selected.selected.id,
         profile_generation,
-        selected.profile_digest,
+        selected.selected.profile_digest,
         session_generation,
     ) else {
         return;
@@ -311,7 +347,19 @@ fn handle_shim(
     else {
         return;
     };
-    let _ = shim.respond(&response);
+    if shim.respond(&response).is_ok() {
+        let _ = selected.acknowledgement.send(());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cancel_waiter(state: &AtomicU8) {
+    let _ = state.compare_exchange(
+        WAITER_PENDING,
+        WAITER_CANCELLED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -366,7 +414,7 @@ fn provider_loop(
                     break;
                 };
                 if response.request_id() != prompt.request_id {
-                    complete_waiters(&mut prompt.waiters, &Err(SelectionFailure::Unavailable));
+                    complete_waiters(&mut prompt.waiters, SelectionFailure::Unavailable);
                     break;
                 }
                 prune_waiters(&mut prompt.waiters, Instant::now());
@@ -393,10 +441,19 @@ fn provider_loop(
                     ProviderDecision::Cancelled => Err(SelectionFailure::Cancelled),
                     ProviderDecision::Unavailable => Err(SelectionFailure::Unavailable),
                 };
-                if let Ok(value) = &result {
-                    selected = Some(value.clone());
+                match result {
+                    Ok(value) => {
+                        if deliver_selection(&mut prompt.waiters, &value) {
+                            selected = Some(value.clone());
+                            if send_selection_status(&mut connection, &prompt, &value).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        complete_waiters(&mut prompt.waiters, error);
+                    }
                 }
-                complete_waiters(&mut prompt.waiters, &result);
             }
             Ok(Some(_) | None) => {}
             Err(_) => break,
@@ -407,22 +464,30 @@ fn provider_loop(
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if let Some(prompt) = pending.as_mut() {
-                        complete_waiters(&mut prompt.waiters, &Err(SelectionFailure::Unavailable));
+                        complete_waiters(&mut prompt.waiters, SelectionFailure::Unavailable);
                     }
                     let _ = connection.shutdown();
                     return;
                 }
             };
-            if !work.active.load(Ordering::Acquire) || Instant::now() >= work.deadline {
+            if work.state.load(Ordering::Acquire) != WAITER_PENDING
+                || Instant::now() >= work.deadline
+            {
+                cancel_waiter(&work.state);
                 let _ = work.reply.send(Err(SelectionFailure::TimedOut));
                 continue;
             }
             if let Some(selection) = resolve_existing_selection(&work, selected.as_ref()) {
-                let _ = work.reply.send(Ok(selection));
+                let mut waiters = vec![waiter_from(work)];
+                let _ = deliver_selection(&mut waiters, &selection);
                 continue;
             }
             if let Some(prompt) = pending.as_mut() {
-                if prompt.profiles == work.profiles {
+                if prompt.plan_digest == work.plan_digest
+                    && prompt.repository == work.repository
+                    && prompt.operation == work.operation
+                    && prompt.profiles == work.profiles
+                {
                     prompt.waiters.push(waiter_from(work));
                 } else {
                     let _ = work.reply.send(Err(SelectionFailure::Unavailable));
@@ -439,23 +504,18 @@ fn provider_loop(
         }
         if let Some(prompt) = pending.as_mut() {
             prune_waiters(&mut prompt.waiters, Instant::now());
-            if prompt.waiters.is_empty() {
-                let _ = connection.abandon_prompt(prompt.request_id);
-                pending = None;
-                continue;
-            }
             let expired = connection
                 .expire_prompts(Instant::now())
                 .is_ok_and(|expired| expired.contains(&prompt.request_id));
             if expired {
                 let mut prompt = pending.take().expect("pending prompt exists");
-                complete_waiters(&mut prompt.waiters, &Err(SelectionFailure::TimedOut));
+                complete_waiters(&mut prompt.waiters, SelectionFailure::TimedOut);
             }
         }
         thread::sleep(Duration::from_millis(10));
     }
     if let Some(mut prompt) = pending.take() {
-        complete_waiters(&mut prompt.waiters, &Err(SelectionFailure::Unavailable));
+        complete_waiters(&mut prompt.waiters, SelectionFailure::Unavailable);
     }
     let _ = connection.shutdown();
 }
@@ -487,16 +547,63 @@ fn start_prompt(
     let profiles = work.profiles.clone();
     Ok(PendingPrompt {
         request_id: sent.request_id,
+        plan_digest: work.plan_digest,
+        repository: work.repository,
+        repository_label: work.repository_label.clone(),
+        operation: work.operation,
         profiles,
         waiters: vec![waiter_from(work)],
     })
 }
 
 #[cfg(target_os = "linux")]
+fn send_selection_status(
+    connection: &mut UnixProviderConnection,
+    prompt: &PendingPrompt,
+    selected: &SelectedProfile,
+) -> Result<(), ()> {
+    let scope = ScopePresentation::new(
+        SelectionScopePresentation::IdeWindow,
+        digest_scope(connection.registration_id()),
+        "VS Code window".to_owned(),
+    )
+    .map_err(|_| ())?;
+    let repository =
+        RepositoryPresentation::new(prompt.repository, prompt.repository_label.clone())
+            .or_else(|_| {
+                RepositoryPresentation::new(prompt.repository, "Git repository".to_owned())
+            })
+            .map_err(|_| ())?;
+    let profile = prompt
+        .profiles
+        .iter()
+        .find(|profile| profile.id == selected.id)
+        .ok_or(())?;
+    let profile = ProfilePresentation::new(
+        profile.id.clone(),
+        profile.author.name().to_owned(),
+        Some(profile.author.email().to_owned()),
+    )
+    .map_err(|_| ())?;
+    let entry =
+        ProviderStatusEntry::new(scope, repository, Some(profile), ProtectionStatus::Verified)
+            .map_err(|_| ())?;
+    let snapshot = ProviderStatusSnapshot::new(
+        connection.registration_id(),
+        connection.provider_generation(),
+        vec![entry],
+    )
+    .map_err(|_| ())?;
+    connection
+        .send_status(snapshot, Instant::now())
+        .map_err(|_| ())
+}
+
+#[cfg(target_os = "linux")]
 fn waiter_from(work: ProviderWork) -> SelectionWaiter {
     SelectionWaiter {
         deadline: work.deadline,
-        active: work.active,
+        state: work.state,
         reply: work.reply,
     }
 }
@@ -504,12 +611,22 @@ fn waiter_from(work: ProviderWork) -> SelectionWaiter {
 #[cfg(target_os = "linux")]
 fn prune_waiters(waiters: &mut Vec<SelectionWaiter>, now: Instant) {
     waiters.retain(|waiter| {
-        if !waiter.active.load(Ordering::Acquire) {
+        if waiter.state.load(Ordering::Acquire) != WAITER_PENDING {
             return false;
         }
         if now >= waiter.deadline {
-            waiter.active.store(false, Ordering::Release);
-            let _ = waiter.reply.send(Err(SelectionFailure::TimedOut));
+            if waiter
+                .state
+                .compare_exchange(
+                    WAITER_PENDING,
+                    WAITER_CLAIMED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let _ = waiter.reply.send(Err(SelectionFailure::TimedOut));
+            }
             return false;
         }
         true
@@ -517,15 +634,53 @@ fn prune_waiters(waiters: &mut Vec<SelectionWaiter>, now: Instant) {
 }
 
 #[cfg(target_os = "linux")]
-fn complete_waiters(
-    waiters: &mut Vec<SelectionWaiter>,
-    result: &Result<SelectedProfile, SelectionFailure>,
-) {
+fn complete_waiters(waiters: &mut Vec<SelectionWaiter>, failure: SelectionFailure) {
     for waiter in waiters.drain(..) {
-        if waiter.active.swap(false, Ordering::AcqRel) {
-            let _ = waiter.reply.send(result.clone());
+        if waiter
+            .state
+            .compare_exchange(
+                WAITER_PENDING,
+                WAITER_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let _ = waiter.reply.send(Err(failure));
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn deliver_selection(waiters: &mut Vec<SelectionWaiter>, selected: &SelectedProfile) -> bool {
+    let (acknowledgement, acknowledged) = mpsc::channel();
+    let now = Instant::now();
+    let mut delivered = false;
+    for waiter in waiters.drain(..) {
+        if now >= waiter.deadline {
+            cancel_waiter(&waiter.state);
+            continue;
+        }
+        if waiter
+            .state
+            .compare_exchange(
+                WAITER_PENDING,
+                WAITER_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        let grant = SelectionGrant {
+            selected: selected.clone(),
+            acknowledgement: acknowledgement.clone(),
+        };
+        delivered |= waiter.reply.send(Ok(grant)).is_ok();
+    }
+    drop(acknowledgement);
+    delivered && acknowledged.recv_timeout(SELECTION_ACK_TIMEOUT).is_ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -562,6 +717,11 @@ fn make_prompt(
     selection_generation: Option<Generation>,
 ) -> Result<SelectionPrompt, ()> {
     let selection_generation = selection_generation.ok_or(())?;
+    let remaining = work.deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(());
+    }
+    let timeout_millis = u32::try_from(remaining.as_millis()).map_err(|_| ())?.max(1);
     let scope_digest = digest_scope(connection.registration_id());
     let scope = ScopePresentation::new(
         SelectionScopePresentation::IdeWindow,
@@ -592,7 +752,7 @@ fn make_prompt(
         repository,
         work.operation,
         profiles,
-        u32::try_from(SELECTION_TIMEOUT.as_millis()).map_err(|_| ())?,
+        timeout_millis,
     )
     .map_err(|_| ())
 }

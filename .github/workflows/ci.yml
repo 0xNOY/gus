@@ -117,6 +117,28 @@ jobs:
       - name: Build target-specific VSIX
         run: npm --prefix editors/vscode run package:vsix -- --target ${{ matrix.target }} --out "${{ runner.temp }}/gus-${{ matrix.target }}.vsix"
 
+      - name: Verify packaged native runtime
+        shell: bash
+        run: |
+          python3 - "${{ runner.temp }}/gus-${{ matrix.target }}.vsix" <<'PY'
+          import stat
+          import sys
+          import zipfile
+
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              for name in (
+                  "extension/bin/gus-broker",
+                  "extension/bin/gus-provider-bridge",
+                  "extension/dist/src/extension.js",
+                  "extension/package.json",
+              ):
+                  info = archive.getinfo(name)
+                  if name.startswith("extension/bin/"):
+                      mode = info.external_attr >> 16
+                      if not stat.S_ISREG(mode) or mode & 0o111 == 0:
+                          raise SystemExit(f"{name} is not a packaged executable")
+          PY
+
   native-platform:
     name: Native platform (${{ matrix.os }})
     strategy:

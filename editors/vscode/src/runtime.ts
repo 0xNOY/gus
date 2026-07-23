@@ -35,6 +35,7 @@ export interface ProviderRuntime {
 }
 
 const RECONNECT_DELAYS_MILLIS = [100, 250, 500, 1000, 2000] as const;
+const STABLE_CONNECTION_MILLIS = 5000;
 
 export function startProviderRuntime(
   options: ProviderRuntimeOptions,
@@ -43,6 +44,7 @@ export function startProviderRuntime(
   let disposed = false;
   let client: ProviderClient | undefined;
   let reconnectTimer: unknown;
+  let stabilityTimer: unknown;
   let reconnectAttempts = 0;
   let connectionGeneration = 0;
   let resolveReady: (() => void) | undefined;
@@ -80,7 +82,11 @@ export function startProviderRuntime(
       scheduler,
       onReady: () => {
         if (disposed || generation !== connectionGeneration) return;
-        reconnectAttempts = 0;
+        if (stabilityTimer !== undefined) scheduler.clearTimeout(stabilityTimer);
+        stabilityTimer = scheduler.setTimeout(() => {
+          stabilityTimer = undefined;
+          if (!disposed && generation === connectionGeneration) reconnectAttempts = 0;
+        }, STABLE_CONNECTION_MILLIS);
         resolveReady?.();
         resolveReady = undefined;
         rejectReady = undefined;
@@ -90,6 +96,10 @@ export function startProviderRuntime(
       },
       onFatal: (error) => {
         if (disposed || generation !== connectionGeneration) return;
+        if (stabilityTimer !== undefined) {
+          scheduler.clearTimeout(stabilityTimer);
+          stabilityTimer = undefined;
+        }
         client?.close();
         client = undefined;
         if (reconnectAttempts >= RECONNECT_DELAYS_MILLIS.length) {
@@ -137,6 +147,10 @@ export function startProviderRuntime(
       if (reconnectTimer !== undefined) {
         scheduler.clearTimeout(reconnectTimer);
         reconnectTimer = undefined;
+      }
+      if (stabilityTimer !== undefined) {
+        scheduler.clearTimeout(stabilityTimer);
+        stabilityTimer = undefined;
       }
       client?.close();
       options.statusBar.dispose();

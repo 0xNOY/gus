@@ -12,10 +12,10 @@ use std::{
 use gus_broker::{connect_published_provider, digest_unix_arguments, observe_linux_repository};
 use gus_ipc::{
     BrokerProviderMessage, BrokerShimMessage, Generation, OperationPresentation,
-    ProviderCapability, ProviderDecision, ProviderKind, ProviderRegistrationRequest,
-    ProviderRequestFrame, ProviderSelectionDecision, ResolveSelectionRequest, ShimRequest,
-    ShimRequestFrame, read_provider_response, read_shim_response, write_provider_request,
-    write_shim_request,
+    ProviderCapability, ProviderControlRequest, ProviderDecision, ProviderKind,
+    ProviderRegistrationRequest, ProviderRequest, ProviderRequestFrame, ProviderSelectionDecision,
+    ResolveSelectionRequest, ShimRequest, ShimRequestFrame, read_provider_response,
+    read_shim_response, write_provider_request, write_shim_request,
 };
 use gus_profile::ProfileId;
 use tempfile::TempDir;
@@ -176,6 +176,112 @@ fn concurrent_sibling_requests_share_one_prompt() {
 }
 
 #[test]
+fn concurrent_requests_for_different_repositories_do_not_share_a_prompt() {
+    if std::env::var_os("GUS_DAEMON_HELPER_ROLE").is_some() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let other_repository = fixture.create_repository("other-repository");
+    let mut broker = ChildGuard::spawn(
+        Command::new(env!("CARGO_BIN_EXE_gus-broker"))
+            .env("GUS_RUNTIME_DIR", fixture.runtime())
+            .env("GUS_PROFILE_STORE", fixture.profile_store())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    wait_for_path(&fixture.runtime().join("provider.current"));
+
+    let executable = std::env::current_exe().expect("test executable");
+    let ready = fixture.root().join("provider-ready");
+    let mut provider = ChildGuard::spawn(
+        Command::new(&executable)
+            .arg("--exact")
+            .arg("provider_helper")
+            .arg("--nocapture")
+            .env("GUS_DAEMON_HELPER_ROLE", "provider")
+            .env("GUS_RUNTIME_DIR", fixture.runtime())
+            .env("GUS_PROVIDER_READY", &ready)
+            .env("GUS_PROVIDER_DELAY_MILLIS", "200")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
+    wait_for_path(&ready);
+
+    let mut first = ChildGuard::spawn(&mut shim_helper_command(
+        &executable,
+        fixture.runtime(),
+        fixture.repository(),
+    ));
+    thread::sleep(Duration::from_millis(50));
+    let second = shim_helper_command(&executable, fixture.runtime(), &other_repository)
+        .env("GUS_EXPECT_PROVIDER_UNAVAILABLE", "1")
+        .status()
+        .expect("run incompatible shim");
+    assert!(
+        second.success(),
+        "incompatible shim helper failed: {second}"
+    );
+    assert!(first.wait().expect("wait for first shim").success());
+    assert!(provider.wait().expect("wait for provider").success());
+    broker.kill();
+}
+
+#[test]
+fn concurrent_requests_for_different_operations_do_not_share_a_prompt() {
+    if std::env::var_os("GUS_DAEMON_HELPER_ROLE").is_some() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut broker = ChildGuard::spawn(
+        Command::new(env!("CARGO_BIN_EXE_gus-broker"))
+            .env("GUS_RUNTIME_DIR", fixture.runtime())
+            .env("GUS_PROFILE_STORE", fixture.profile_store())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    wait_for_path(&fixture.runtime().join("provider.current"));
+
+    let executable = std::env::current_exe().expect("test executable");
+    let ready = fixture.root().join("provider-ready");
+    let mut provider = ChildGuard::spawn(
+        Command::new(&executable)
+            .arg("--exact")
+            .arg("provider_helper")
+            .arg("--nocapture")
+            .env("GUS_DAEMON_HELPER_ROLE", "provider")
+            .env("GUS_RUNTIME_DIR", fixture.runtime())
+            .env("GUS_PROVIDER_READY", &ready)
+            .env("GUS_PROVIDER_DELAY_MILLIS", "200")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
+    wait_for_path(&ready);
+
+    let mut first = ChildGuard::spawn(&mut shim_helper_command(
+        &executable,
+        fixture.runtime(),
+        fixture.repository(),
+    ));
+    thread::sleep(Duration::from_millis(50));
+    let second = shim_helper_command(&executable, fixture.runtime(), fixture.repository())
+        .env("GUS_SHIM_OPERATION", "push")
+        .env("GUS_EXPECT_PROVIDER_UNAVAILABLE", "1")
+        .status()
+        .expect("run incompatible shim");
+    assert!(
+        second.success(),
+        "incompatible shim helper failed: {second}"
+    );
+    assert!(first.wait().expect("wait for first shim").success());
+    assert!(provider.wait().expect("wait for provider").success());
+    broker.kill();
+}
+
+#[test]
 fn provider_helper() {
     if std::env::var_os("GUS_DAEMON_HELPER_ROLE").as_deref()
         != Some(std::ffi::OsStr::new("provider"))
@@ -188,7 +294,10 @@ fn provider_helper() {
     let registration = ProviderRegistrationRequest::new(
         ProviderKind::Vscode,
         "daemon-test-window".to_owned(),
-        vec![ProviderCapability::ProfileQuickPick],
+        vec![
+            ProviderCapability::ProfileQuickPick,
+            ProviderCapability::Status,
+        ],
     )
     .expect("registration");
     let registration =
@@ -198,6 +307,21 @@ fn provider_helper() {
     let BrokerProviderMessage::Registered(accepted) = accepted.message() else {
         panic!("unexpected registration response");
     };
+    let subscribe = ProviderRequestFrame::control(ProviderRequest::SubscribeStatus(
+        ProviderControlRequest::new(accepted.registration_id(), accepted.provider_generation()),
+    ))
+    .expect("status subscription");
+    write_provider_request(&mut stream, &subscribe).expect("write status subscription");
+    let subscription = read_provider_response(&mut stream).expect("read subscription response");
+    assert!(matches!(
+        subscription.message(),
+        BrokerProviderMessage::Acknowledged
+    ));
+    let status = read_provider_response(&mut stream).expect("read initial status");
+    assert!(matches!(
+        status.message(),
+        BrokerProviderMessage::StatusSnapshot(_)
+    ));
     fs::write(required_path("GUS_PROVIDER_READY"), b"ready").expect("publish provider readiness");
 
     let prompt = read_provider_response(&mut stream).expect("read selection prompt");
@@ -235,6 +359,19 @@ fn provider_helper() {
         acknowledgement.message(),
         BrokerProviderMessage::Acknowledged
     ));
+    let status = read_provider_response(&mut stream).expect("read selected status");
+    let BrokerProviderMessage::StatusSnapshot(status) = status.message() else {
+        panic!("expected selected status");
+    };
+    assert_eq!(status.entries().len(), 1);
+    assert_eq!(
+        status.entries()[0]
+            .selected_profile()
+            .expect("selected profile")
+            .profile_id()
+            .as_str(),
+        "alice"
+    );
 }
 
 #[test]
@@ -248,10 +385,14 @@ fn shim_helper() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let pid = std::num::NonZeroU32::new(std::process::id()).expect("positive PID");
     let repository = observe_linux_repository(pid).expect("repository evidence");
+    let operation = match std::env::var_os("GUS_SHIM_OPERATION").as_deref() {
+        Some(value) if value == std::ffi::OsStr::new("push") => OperationPresentation::Push,
+        _ => OperationPresentation::Commit,
+    };
     let request = ResolveSelectionRequest::new(
         digest_unix_arguments(&arguments),
         repository.identity(),
-        OperationPresentation::Commit,
+        operation,
         None,
     );
     let request =
@@ -356,6 +497,13 @@ email = "alice@example.com"
 
     fn repository(&self) -> &Path {
         &self.repository
+    }
+
+    fn create_repository(&self, name: &str) -> PathBuf {
+        let repository = self.root().join(name);
+        fs::create_dir(&repository).expect("repository directory");
+        fs::create_dir(repository.join(".git")).expect("Git metadata directory");
+        repository
     }
 }
 

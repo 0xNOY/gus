@@ -41,7 +41,7 @@ export interface ProviderClientOptions {
   transport: ProviderTransport;
   picker: ProfilePicker;
   scheduler: ProviderScheduler;
-  onRegistered?(): void;
+  onReady?(): void;
   onStatus(snapshot: ProviderStatusSnapshot): void;
   onFatal(error: Error): void;
 }
@@ -78,6 +78,7 @@ export class ProviderClient {
   #providerGeneration: string | undefined;
   #heartbeat: unknown;
   #closed = false;
+  #ready = false;
   #writeTail: Promise<void> = Promise.resolve();
   readonly #seenPrompts = new Set<string>();
   readonly #prompts = new Map<string, { abort: AbortController; timeout: unknown }>();
@@ -145,7 +146,6 @@ export class ProviderClient {
         if (this.#statusCapability) {
           this.#send(createProviderControlFrame({ type: "subscribe_status", body: control }));
         }
-        this.#options.onRegistered?.();
         return;
       }
       case "selection_prompt":
@@ -165,6 +165,10 @@ export class ProviderClient {
       case "status_snapshot":
         this.#requireControl(frame.message.body);
         this.#options.onStatus(frame.message.body);
+        if (!this.#ready) {
+          this.#ready = true;
+          this.#options.onReady?.();
+        }
         return;
       case "acknowledged":
         if (!this.#pendingControls.delete(frame.request_id)) {

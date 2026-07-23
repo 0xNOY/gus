@@ -11,7 +11,7 @@ import type {
   StatusPresentation,
 } from "./ui.js";
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel("GUS");
   context.subscriptions.push(output);
   context.subscriptions.push(vscode.commands.registerCommand(
@@ -63,8 +63,8 @@ export function activate(context: vscode.ExtensionContext): void {
         );
       },
     });
-    void runtime.ready.catch(() => {});
     context.subscriptions.push(runtime);
+    await runtime.ready;
   } catch (error) {
     const message = toError(error).message;
     output.appendLine(`Activation failed: ${message}`);

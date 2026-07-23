@@ -17,8 +17,8 @@ mod unix_runtime;
 
 #[cfg(target_os = "linux")]
 pub use linux_evidence::{
-    LinuxRepositoryEvidence, LinuxShimEvidence, RepositoryEvidenceError, digest_unix_arguments,
-    observe_linux_repository, observe_linux_shim,
+    LinuxRepositoryEvidence, LinuxRepositoryLease, LinuxShimEvidence, RepositoryEvidenceError,
+    digest_unix_arguments, observe_linux_repository, observe_linux_shim, retain_linux_repository,
 };
 pub use provider::{
     IssuedProviderPrompt, ProviderAdmission, ProviderAdmissionError, ProviderCommandFailure,

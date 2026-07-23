@@ -95,11 +95,13 @@ test("provider registers, subscribes, heartbeats, and answers one prompt", async
   const scheduler = new MemoryScheduler();
   const failures: Error[] = [];
   const statuses: unknown[] = [];
+  let readiness = 0;
   const client = new ProviderClient({
     registration: registration(),
     transport,
     scheduler,
     picker: { pick: async (prompt) => prompt.profiles[0] },
+    onReady: () => { readiness += 1; },
     onStatus: (status) => statuses.push(status),
     onFatal: (error) => failures.push(error),
   });
@@ -118,6 +120,16 @@ test("provider registers, subscribes, heartbeats, and answers one prompt", async
   }));
   await settle();
   assert.equal(decodeProviderRequest(transport.records[1]!).message.type, "subscribe_status");
+  assert.equal(readiness, 0, "registration alone is not broker routing readiness");
+  client.receive(brokerRecord("30000000-0000-4000-8000-000000000003", {
+    type: "status_snapshot",
+    body: {
+      registration_id: register.request_id,
+      provider_generation: "1",
+      entries: [],
+    },
+  }));
+  assert.equal(readiness, 1);
   scheduler.callback?.();
   await settle();
   assert.equal(decodeProviderRequest(transport.records[2]!).message.type, "heartbeat");
@@ -148,7 +160,7 @@ test("provider registers, subscribes, heartbeats, and answers one prompt", async
     },
   }));
   assert.deepEqual(failures, []);
-  assert.deepEqual(statuses, []);
+  assert.equal(statuses.length, 1);
 
   client.close();
   assert(transport.closed);
