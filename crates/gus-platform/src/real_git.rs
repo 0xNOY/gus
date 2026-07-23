@@ -1116,7 +1116,7 @@ fn run_macos_probe(
 
     let status = loop {
         if Instant::now() >= deadline {
-            terminate_macos_probe(&mut child, process_id)?;
+            cleanup_macos_probe_at_deadline(&mut child, process_id)?;
             return Err(RetainedExecError::ProbeTimedOut);
         }
         match macos_probe_has_exited(process_id) {
@@ -1156,6 +1156,19 @@ fn run_macos_probe(
         return Err(RetainedExecError::ProbeFailed);
     }
     Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_macos_probe_at_deadline(
+    child: &mut Child,
+    process_id: libc::pid_t,
+) -> Result<(), RetainedExecError> {
+    if macos_probe_has_exited(process_id)? {
+        finish_observed_macos_probe(child, process_id)?;
+        Ok(())
+    } else {
+        terminate_macos_probe(child, process_id)
+    }
 }
 
 #[cfg(target_os = "macos")]
