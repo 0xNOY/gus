@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -9,33 +9,33 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_core::{NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME, ProfileRequirement, RequirementReason};
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_platform::{CurrentSessionObserver, ExecutableExclusionSet, VerifiedRealGit};
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_profile::{Profile, ProfileId, ProfileSet};
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_shim::{ExplicitProfileAdmission, InitialRoute, LocalPolicyAdmission, ShimInvocation};
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const MAX_PROFILE_STORE_BYTES: u64 = 1024 * 1024;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const MAX_SELECTION_BYTES: usize = 128;
 
 fn main() -> ExitCode {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     {
         run_unix()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     {
         eprintln!("GUS_E_PLATFORM_UNSUPPORTED: the Git shim is not implemented on this platform");
         ExitCode::from(126)
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn run_unix() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.as_slice() == ["--gus-shim-probe"] {
@@ -68,18 +68,18 @@ fn run_unix() -> ExitCode {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn execute_git(admission: LocalPolicyAdmission) -> ExitCode {
     execute_git_arguments(admission.into_arguments(), &neutral_environment())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn execute_profiled_git(admission: ExplicitProfileAdmission) -> ExitCode {
     let (arguments, author, committer) = admission.into_execution();
     execute_git_arguments(arguments, &profile_environment(&author, &committer))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn execute_git_arguments(
     arguments: Vec<OsString>,
     environment: &[(OsString, OsString)],
@@ -109,7 +109,7 @@ fn execute_git_arguments(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn selected_profile() -> Result<Option<Profile>, String> {
     if let Some(raw_id) = std::env::var_os("GUS_PROFILE_ID") {
         let id = raw_id
@@ -138,7 +138,7 @@ fn selected_profile() -> Result<Option<Profile>, String> {
     Ok(Some(profile))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn load_profile_set() -> Result<ProfileSet, String> {
     let path = profile_store_path()?;
     let mut bytes = Vec::new();
@@ -174,7 +174,7 @@ fn load_profile_set() -> Result<ProfileSet, String> {
     Ok(profiles)
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn profile_by_id(profiles: &ProfileSet, id: &ProfileId) -> Result<Profile, String> {
     profiles
         .profiles
@@ -183,7 +183,7 @@ fn profile_by_id(profiles: &ProfileSet, id: &ProfileId) -> Result<Profile, Strin
         .ok_or_else(|| format!("profile '{id}' does not exist in the profile store"))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn profile_store_path() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("GUS_PROFILE_STORE") {
         let path = PathBuf::from(path);
@@ -206,7 +206,7 @@ fn profile_store_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "neither GUS_PROFILE_STORE, XDG_CONFIG_HOME, nor HOME is set".to_owned())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn selection_path(key: &str) -> Result<PathBuf, String> {
     let root = if let Some(root) = std::env::var_os("GUS_RUNTIME_DIR") {
         absolute_path("GUS_RUNTIME_DIR", root)?
@@ -222,7 +222,7 @@ fn selection_path(key: &str) -> Result<PathBuf, String> {
     Ok(selections.join(key))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn absolute_path(name: &str, value: OsString) -> Result<PathBuf, String> {
     let path = PathBuf::from(value);
     path.is_absolute()
@@ -230,7 +230,7 @@ fn absolute_path(name: &str, value: OsString) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("{name} must be an absolute path"))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn ensure_private_directory(path: &Path) -> Result<(), String> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
@@ -250,7 +250,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn read_session_selection(path: &Path) -> Result<Option<ProfileId>, String> {
     let file = match OpenOptions::new()
         .read(true)
@@ -281,7 +281,7 @@ fn read_session_selection(path: &Path) -> Result<Option<ProfileId>, String> {
         .map_err(|error| format!("{} contains an invalid profile ID: {error}", path.display()))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn write_session_selection(path: &Path, id: &ProfileId) -> Result<(), String> {
     let parent = path
         .parent()
@@ -317,7 +317,7 @@ fn write_session_selection(path: &Path, id: &ProfileId) -> Result<(), String> {
     result
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn validate_private_file(file: &File, path: &Path) -> Result<(), String> {
     let metadata = file
         .metadata()
@@ -333,7 +333,7 @@ fn validate_private_file(file: &File, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn prompt_for_profile(profiles: &ProfileSet) -> Result<ProfileId, String> {
     if profiles.profiles.is_empty() {
         return Err("the profile store contains no profiles".to_owned());
@@ -365,7 +365,7 @@ fn prompt_for_profile(profiles: &ProfileSet) -> Result<ProfileId, String> {
     resolve_prompt_response(profiles, &response)
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn resolve_prompt_response(profiles: &ProfileSet, response: &str) -> Result<ProfileId, String> {
     if let Ok(id) = ProfileId::try_from(response.to_owned()) {
         if profiles.profiles.contains_key(&id) {
@@ -383,7 +383,7 @@ fn resolve_prompt_response(profiles: &ProfileSet, response: &str) -> Result<Prof
     Err("the selected profile does not exist".to_owned())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn read_terminal_line(terminal: &mut File) -> Result<String, String> {
     let mut bytes = Vec::new();
     loop {
@@ -404,7 +404,7 @@ fn read_terminal_line(terminal: &mut File) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "the profile selection is not valid UTF-8".to_owned())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn selection_required(reason: &str, context: &str) -> ExitCode {
     eprintln!(
         "GUS_E_SELECTION_REQUIRED: {reason}; {context}, so Git was not started\nhint: run the command from an interactive terminal to select a profile"
@@ -412,7 +412,7 @@ fn selection_required(reason: &str, context: &str) -> ExitCode {
     ExitCode::from(125)
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn explicit_admission_error(error: &gus_shim::ExplicitProfileError) -> ExitCode {
     match error {
         gus_shim::ExplicitProfileError::ResolutionRequired => {
@@ -435,7 +435,7 @@ fn explicit_admission_error(error: &gus_shim::ExplicitProfileError) -> ExitCode 
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const fn reason_message(reason: RequirementReason) -> &'static str {
     match reason {
         RequirementReason::AuthorIdentity => "this Git operation needs an author identity",
@@ -466,7 +466,7 @@ const fn reason_message(reason: RequirementReason) -> &'static str {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const fn requirement_message(requirement: ProfileRequirement) -> &'static str {
     match requirement {
         ProfileRequirement::Deferred(reason)
@@ -476,7 +476,7 @@ const fn requirement_message(requirement: ProfileRequirement) -> &'static str {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn neutral_environment() -> Vec<(OsString, OsString)> {
     const REMOVED: &[&str] = &[
         "EMAIL",
@@ -524,7 +524,7 @@ fn neutral_environment() -> Vec<(OsString, OsString)> {
     environment
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn profile_environment(
     author: &gus_profile::PersonIdentity,
     committer: &gus_profile::PersonIdentity,
@@ -574,19 +574,22 @@ fn profile_environment(
     environment
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn launch_error(action: &str, error: &dyn std::error::Error) -> ExitCode {
     eprintln!("GUS_E_REAL_GIT: failed to {action}: {error}");
     ExitCode::from(126)
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn launch_message(message: &str) -> ExitCode {
     eprintln!("GUS_E_REAL_GIT: {message}");
     ExitCode::from(126)
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;

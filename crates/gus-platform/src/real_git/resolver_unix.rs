@@ -572,6 +572,18 @@ impl UnixResolver {
 }
 
 impl UnixResolutionLeaseSet {
+    #[cfg(target_os = "macos")]
+    pub(super) fn require_root_owned_direct_chain(&self) -> Result<(), RealGitArtifactError> {
+        if self.bindings.iter().any(|binding| {
+            binding.parent_snapshot.owner != 0
+                || binding.snapshot.owner != 0
+                || matches!(binding.kind, UnixBindingKind::SymbolicLink { .. })
+        }) {
+            return Err(RealGitArtifactError::UnsafePath);
+        }
+        Ok(())
+    }
+
     pub(super) const fn binding(&self) -> DiscoveryChainBinding {
         self.binding
     }

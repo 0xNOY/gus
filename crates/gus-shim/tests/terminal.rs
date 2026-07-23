@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "linux", target_os = "freebsd"))]
+#![cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 
 use std::{
     ffi::CStr,
@@ -19,6 +19,8 @@ fn shim() -> Command {
 
 fn system_git() -> Command {
     #[cfg(target_os = "linux")]
+    let path = "/usr/bin/git";
+    #[cfg(target_os = "macos")]
     let path = "/usr/bin/git";
     #[cfg(target_os = "freebsd")]
     let path = "/usr/local/bin/git";
@@ -196,7 +198,7 @@ fn pty_commit_child() {
     // SAFETY: this fresh process is a session leader without a controlling
     // terminal, and `slave` is a live terminal descriptor.
     assert_ne!(
-        unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) },
+        unsafe { libc::ioctl(slave.as_raw_fd(), libc::c_ulong::from(libc::TIOCSCTTY), 0,) },
         -1,
         "TIOCSCTTY failed: {}",
         std::io::Error::last_os_error()

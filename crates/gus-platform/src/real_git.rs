@@ -6,11 +6,20 @@ use std::{
 };
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use std::os::fd::OwnedFd;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::{
     collections::HashSet,
     convert::Infallible,
-    os::fd::OwnedFd,
     time::{Duration, Instant},
+};
+#[cfg(target_os = "macos")]
+use std::{
+    io::Read as _,
+    os::unix::process::CommandExt as _,
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    thread,
 };
 
 #[cfg(unix)]
@@ -28,7 +37,7 @@ use std::{ffi::c_void, mem::size_of, ptr};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_core::{GitSemanticRuleset, VerifiedGitSemantics};
 
 #[cfg(windows)]
@@ -326,7 +335,27 @@ pub struct VerifiedRealGit {
     semantics: VerifiedGitSemantics,
 }
 
+/// A root-owned fixed system Git admitted for macOS path execution.
+///
+/// macOS does not expose descriptor execution. This adapter therefore admits
+/// only `/usr/bin/git`, whose complete ancestor chain and artifact are
+/// root-owned and revalidated immediately before probe and exec.
+#[cfg(target_os = "macos")]
+pub struct VerifiedRealGit {
+    inspection: DiscoveryInspection,
+    exclusions: ExecutableExclusionSet,
+    expected_content_digest: [u8; 32],
+    semantics: VerifiedGitSemantics,
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl fmt::Debug for VerifiedRealGit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedRealGit([REDACTED])")
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl fmt::Debug for VerifiedRealGit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("VerifiedRealGit([REDACTED])")
@@ -353,9 +382,15 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static BEFORE_MACOS_PROBE_STATUS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const MAX_GIT_PROBE_OUTPUT: usize = 4096;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -396,13 +431,13 @@ impl Drop for ProbeProcess {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 struct EncodedCStringList {
     _storage: Vec<CString>,
     pointers: Vec<*const libc::c_char>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 impl EncodedCStringList {
     fn new(storage: Vec<CString>) -> Self {
         let mut pointers = storage
@@ -741,6 +776,19 @@ impl DiscoveryInspection {
         }
         self.chain.revalidate(&self.candidate.snapshot.file_key())
     }
+
+    #[cfg(target_os = "macos")]
+    fn revalidate_root_owned_direct(
+        &self,
+        exclusions: &ExecutableExclusionSet,
+    ) -> Result<(), RealGitArtifactError> {
+        self.revalidate(exclusions)?;
+        self.chain.require_root_owned_direct_chain()?;
+        if self.candidate.snapshot.owner != 0 {
+            return Err(RealGitArtifactError::UnsafePath);
+        }
+        self.revalidate(exclusions)
+    }
 }
 
 #[cfg(windows)]
@@ -909,7 +957,260 @@ impl VerifiedRealGit {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl VerifiedRealGit {
+    fn system_path() -> &'static Path {
+        Path::new("/usr/bin/git")
+    }
+
+    /// Inspects and probes the root-owned fixed macOS system Git.
+    ///
+    /// # Errors
+    ///
+    /// Returns fail-closed if the fixed path, owner, native image, retained
+    /// evidence, probe deadline, or Git semantics cannot be verified.
+    pub fn discover_system(exclusions: ExecutableExclusionSet) -> Result<Self, RetainedExecError> {
+        let inspection = DiscoveryInspection::inspect(Self::system_path(), &exclusions)?;
+        if inspection.candidate.inspected_path() != Self::system_path()
+            || inspection.candidate.snapshot.owner != 0
+        {
+            return Err(RetainedExecError::UntrustedSystemGit);
+        }
+        let expected_content_digest = inspection.candidate.content_digest();
+        revalidate_macos_execution(&inspection, &exclusions, expected_content_digest)?;
+        let semantics = require_supported_git(probe_macos_git(
+            &inspection,
+            &exclusions,
+            expected_content_digest,
+        )?)?;
+        Ok(Self {
+            inspection,
+            exclusions,
+            expected_content_digest,
+            semantics,
+        })
+    }
+
+    /// Returns the verified version semantics bound to the retained image.
+    #[must_use]
+    pub const fn semantics(&self) -> &VerifiedGitSemantics {
+        &self.semantics
+    }
+
+    /// Replaces the current process with the fixed root-owned Git path.
+    ///
+    /// # Errors
+    ///
+    /// Returns if inputs are invalid, evidence became stale, or `execve`
+    /// refused the fixed path.
+    pub fn exec(
+        self,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+    ) -> Result<Infallible, RetainedExecError> {
+        if arguments.is_empty() {
+            return Err(RetainedExecError::EmptyArguments);
+        }
+        let arguments = encode_arguments(arguments)?;
+        let environment = encode_environment(environment)?;
+        self.revalidate_for_execution()?;
+        let path = CString::new(Self::system_path().as_os_str().as_bytes())
+            .map_err(|_| RetainedExecError::InvalidArgument)?;
+        // SAFETY: the fixed path and both pointer arrays are NUL-terminated
+        // and backed by live CString storage. Success replaces this process.
+        unsafe { libc::execve(path.as_ptr(), arguments.as_ptr(), environment.as_ptr()) };
+        Err(last_retained_io_error())
+    }
+
+    fn revalidate_for_execution(&self) -> Result<(), RetainedExecError> {
+        revalidate_macos_execution(
+            &self.inspection,
+            &self.exclusions,
+            self.expected_content_digest,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_macos_git(
+    inspection: &DiscoveryInspection,
+    exclusions: &ExecutableExclusionSet,
+    expected_content_digest: [u8; 32],
+) -> Result<VerifiedGitSemantics, RetainedExecError> {
+    revalidate_macos_execution(inspection, exclusions, expected_content_digest)?;
+    let mut command = Command::new(VerifiedRealGit::system_path());
+    command
+        .arg("--version")
+        .env_clear()
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("HOME", "/")
+        .env("LC_ALL", "C");
+    let output = run_macos_probe(&mut command, GIT_PROBE_TIMEOUT, MAX_GIT_PROBE_OUTPUT)?;
+    revalidate_macos_execution(inspection, exclusions, expected_content_digest)?;
+    let output = std::str::from_utf8(&output).map_err(|_| RetainedExecError::InvalidGitProbe)?;
+    VerifiedGitSemantics::from_version_output(inspection.candidate.identity().digest(), output)
+        .map_err(|_| RetainedExecError::InvalidGitProbe)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_probe(
+    command: &mut Command,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<Vec<u8>, RetainedExecError> {
+    if timeout.is_zero() || output_limit == 0 {
+        return Err(RetainedExecError::InvalidGitProbe);
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(RetainedExecError::ProbeTimedOut)?;
+    let maximum_descriptor = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    if maximum_descriptor < 0 {
+        return Err(last_retained_io_error());
+    }
+    let maximum_descriptor = libc::c_int::try_from(maximum_descriptor)
+        .map_err(|_| RetainedExecError::InvalidGitProbe)?;
+    let read_limit = output_limit
+        .checked_add(1)
+        .ok_or(RetainedExecError::InvalidGitProbe)?;
+    let read_limit = u64::try_from(read_limit).map_err(|_| RetainedExecError::InvalidGitProbe)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    // SAFETY: after fork and before exec this closure performs only the
+    // async-signal-safe close(2) syscall over a precomputed integer range.
+    unsafe {
+        command.pre_exec(move || {
+            for descriptor in 3..maximum_descriptor {
+                libc::close(descriptor);
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| retained_io_error(&error))?;
+    let process_id =
+        libc::pid_t::try_from(child.id()).map_err(|_| RetainedExecError::ProbeFailed)?;
+    let stdout = child.stdout.take().ok_or(RetainedExecError::ProbeFailed)?;
+    let (output_sender, output_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout
+            .take(read_limit)
+            .read_to_end(&mut output)
+            .map(|_| output);
+        let _ = output_sender.send(result);
+    });
+
+    #[cfg(test)]
+    BEFORE_MACOS_PROBE_STATUS_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+
+    let status = loop {
+        if Instant::now() >= deadline {
+            terminate_macos_probe(&mut child, process_id)?;
+            return Err(RetainedExecError::ProbeTimedOut);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if Instant::now() >= deadline {
+                    kill_macos_probe_group(process_id)?;
+                    return Err(RetainedExecError::ProbeTimedOut);
+                }
+                kill_macos_probe_group(process_id)?;
+                break status;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                terminate_macos_probe(&mut child, process_id)?;
+                return Err(retained_io_error(&error));
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(RetainedExecError::ProbeTimedOut)?;
+    let output = output_receiver
+        .recv_timeout(remaining)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => RetainedExecError::ProbeTimedOut,
+            mpsc::RecvTimeoutError::Disconnected => RetainedExecError::ProbeFailed,
+        })?
+        .map_err(|error| retained_io_error(&error))?;
+    if Instant::now() >= deadline {
+        return Err(RetainedExecError::ProbeTimedOut);
+    }
+    if output.len() > output_limit {
+        return Err(RetainedExecError::ProbeOutputTooLarge);
+    }
+    if !status.success() {
+        return Err(RetainedExecError::ProbeFailed);
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_macos_probe(
+    child: &mut Child,
+    process_id: libc::pid_t,
+) -> Result<(), RetainedExecError> {
+    let group_result = kill_macos_probe_group(process_id);
+    let child_result = child.kill();
+    if group_result.is_err() && child_result.is_err() {
+        return group_result;
+    }
+    child.wait().map_err(|error| retained_io_error(&error))?;
+    group_result
+}
+
+#[cfg(target_os = "macos")]
+fn kill_macos_probe_group(process_id: libc::pid_t) -> Result<(), RetainedExecError> {
+    // SAFETY: the child was placed in a process group named by its positive
+    // PID, so the negated value targets that group.
+    if unsafe { libc::kill(-process_id, libc::SIGKILL) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(retained_io_error(&error));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn revalidate_macos_execution(
+    inspection: &DiscoveryInspection,
+    exclusions: &ExecutableExclusionSet,
+    expected_content_digest: [u8; 32],
+) -> Result<(), RetainedExecError> {
+    inspection.revalidate_root_owned_direct(exclusions)?;
+    if !inspection
+        .candidate
+        .matches_content_digest(expected_content_digest)
+    {
+        return Err(RetainedExecError::ContentMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn require_supported_git(
+    semantics: VerifiedGitSemantics,
+) -> Result<VerifiedGitSemantics, RetainedExecError> {
+    if semantics.ruleset() == GitSemanticRuleset::Unsupported {
+        Err(RetainedExecError::UnsupportedGitVersion)
+    } else {
+        Ok(semantics)
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn require_supported_git(
     semantics: VerifiedGitSemantics,
 ) -> Result<VerifiedGitSemantics, RetainedExecError> {
@@ -1141,7 +1442,7 @@ impl RetainedExecutable {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn encode_arguments(arguments: &[OsString]) -> Result<EncodedCStringList, RetainedExecError> {
     let encoded = arguments
         .iter()
@@ -1150,7 +1451,7 @@ fn encode_arguments(arguments: &[OsString]) -> Result<EncodedCStringList, Retain
     Ok(EncodedCStringList::new(encoded))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn encode_environment(
     environment: &[(OsString, OsString)],
 ) -> Result<EncodedCStringList, RetainedExecError> {
@@ -1362,7 +1663,7 @@ fn drain_probe_fd(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn retained_io_error(error: &io::Error) -> RetainedExecError {
     RetainedExecError::Io {
         kind: error.kind(),
@@ -1370,7 +1671,7 @@ fn retained_io_error(error: &io::Error) -> RetainedExecError {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn last_retained_io_error() -> RetainedExecError {
     retained_io_error(&io::Error::last_os_error())
 }
@@ -1416,7 +1717,7 @@ unsafe fn close_probe_fds_from_five() -> libc::c_int {
     0
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 #[cfg_attr(
     not(test),
     allow(
@@ -1428,7 +1729,7 @@ fn cstring_from_os(value: &std::ffi::OsStr) -> Result<CString, RetainedExecError
     CString::new(value.as_bytes()).map_err(|_| RetainedExecError::InvalidArgument)
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 #[cfg_attr(
     not(test),
     allow(
@@ -1665,7 +1966,7 @@ pub enum RealGitArtifactError {
 }
 
 /// Failure in the crate-internal retained-descriptor execution primitive.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -1733,6 +2034,17 @@ fn install_before_probe_collection_hook(hook: impl FnOnce() + 'static) {
         assert!(
             installed.borrow().is_none(),
             "only one pre-collection test hook may be installed per thread"
+        );
+        *installed.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn install_before_macos_probe_status_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_MACOS_PROBE_STATUS_HOOK.with(|installed| {
+        assert!(
+            installed.borrow().is_none(),
+            "only one macOS probe-status test hook may be installed per thread"
         );
         *installed.borrow_mut() = Some(Box::new(hook));
     });
@@ -3846,6 +4158,140 @@ mod tests {
     fn macos_device_ids_use_the_kernel_vnode_width() {
         assert_eq!(normalize_macos_device(0xffff_ffff_8000_0001), 0x8000_0001);
         assert_eq!(normalize_macos_device(0x7fff_ffff), 0x7fff_ffff);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_enforces_its_deadline_and_reaps_the_child() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("5");
+        let started = Instant::now();
+        assert_eq!(
+            run_macos_probe(&mut command, Duration::from_millis(30), 64)
+                .expect_err("sleeping probe must time out"),
+            RetainedExecError::ProbeTimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_rejects_success_observed_after_the_deadline() {
+        install_before_macos_probe_status_hook(|| {
+            thread::sleep(Duration::from_millis(30));
+        });
+        let mut command = Command::new("/usr/bin/true");
+        assert_eq!(
+            run_macos_probe(&mut command, Duration::from_millis(10), 64)
+                .expect_err("late success must time out"),
+            RetainedExecError::ProbeTimedOut
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_rejects_output_one_byte_over_the_limit() {
+        let mut command = Command::new("/usr/bin/yes");
+        assert_eq!(
+            run_macos_probe(&mut command, Duration::from_secs(1), 64)
+                .expect_err("oversized output must fail"),
+            RetainedExecError::ProbeOutputTooLarge
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_rejects_a_nonzero_exit() {
+        let mut command = Command::new("/usr/bin/false");
+        assert_eq!(
+            run_macos_probe(&mut command, Duration::from_secs(1), 64)
+                .expect_err("nonzero probe must fail"),
+            RetainedExecError::ProbeFailed
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_kills_a_descendant_holding_stdout() {
+        let mut command = macos_probe_fixture_command("descendant");
+        let started = Instant::now();
+        let output = run_macos_probe(&mut command, Duration::from_secs(1), 4096)
+            .expect("descendant must not keep probe output open");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            output
+                .windows(b"probe-child-ready".len())
+                .any(|window| { window == b"probe-child-ready" })
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_closes_ambient_inheritable_descriptors() {
+        let mut descriptors = [-1; 2];
+        // SAFETY: `descriptors` is exact writable storage for a new pipe.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let descriptor = descriptors[0];
+        // SAFETY: this test owns the descriptor and intentionally makes it
+        // inheritable to verify the probe child's close allowlist.
+        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_SETFD, 0) }, 0);
+
+        let mut command = macos_probe_fixture_command("descriptor");
+        command.env("GUS_TEST_INHERITABLE_FD", descriptor.to_string());
+        let result = run_macos_probe(&mut command, Duration::from_secs(1), 4096);
+
+        // SAFETY: both pipe descriptors are still owned by this test process.
+        unsafe {
+            libc::close(descriptors[0]);
+            libc::close(descriptors[1]);
+        }
+        let output = result.expect("ambient descriptor must be closed before exec");
+        assert!(
+            output
+                .windows(b"probe-fd-closed".len())
+                .any(|window| { window == b"probe-fd-closed" })
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_probe_fixture_command(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .arg("--exact")
+            .arg("real_git::tests::macos_probe_child_fixture")
+            .arg("--nocapture")
+            .env("GUS_MACOS_PROBE_FIXTURE", mode);
+        command
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_child_fixture() {
+        match std::env::var("GUS_MACOS_PROBE_FIXTURE").as_deref() {
+            Ok("descendant") => {
+                #[allow(
+                    clippy::zombie_processes,
+                    reason = "the parent probe supervisor owns and kills this process group"
+                )]
+                Command::new("/bin/sleep")
+                    .arg("5")
+                    .spawn()
+                    .expect("spawn stdout-holding descendant");
+                println!("probe-child-ready");
+            }
+            Ok("descriptor") => {
+                let descriptor = std::env::var("GUS_TEST_INHERITABLE_FD")
+                    .expect("inheritable descriptor number")
+                    .parse::<libc::c_int>()
+                    .expect("numeric inheritable descriptor");
+                // SAFETY: querying an arbitrary descriptor number is valid;
+                // EBADF proves that pre-exec cleanup closed the inherited FD.
+                assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                println!("probe-fd-closed");
+            }
+            _ => {}
+        }
     }
 
     #[cfg(target_os = "macos")]

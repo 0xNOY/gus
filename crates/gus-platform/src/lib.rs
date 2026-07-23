@@ -63,7 +63,7 @@ pub use real_git::{
 };
 #[cfg(any(unix, windows))]
 pub use real_git::{DiscoveryChainBinding, DiscoveryInspection};
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub use real_git::{RetainedExecError, VerifiedRealGit};
 
 const IDENTITY_DIGEST_BYTES: usize = 32;
