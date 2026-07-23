@@ -1122,7 +1122,7 @@ fn run_macos_probe(
         match macos_probe_has_exited(process_id) {
             Ok(true) => {
                 if Instant::now() >= deadline {
-                    terminate_macos_probe(&mut child, process_id)?;
+                    finish_observed_macos_probe(&mut child, process_id)?;
                     return Err(RetainedExecError::ProbeTimedOut);
                 }
                 let status = finish_observed_macos_probe(&mut child, process_id)?;
@@ -1199,7 +1199,20 @@ fn finish_observed_macos_probe(
 ) -> Result<std::process::ExitStatus, RetainedExecError> {
     let group_result = kill_macos_probe_group(process_id);
     let wait_result = child.wait().map_err(|error| retained_io_error(&error));
-    group_result?;
+    // Darwin reports EPERM when the WNOWAIT-retained zombie is the group's
+    // only remaining member. A live same-UID descendant remains signalable
+    // and makes the group kill succeed. This exception is safe only after
+    // waitid proved that the trusted probe leader has exited.
+    if !matches!(
+        &group_result,
+        Ok(())
+            | Err(RetainedExecError::Io {
+                raw_os_error: Some(libc::EPERM),
+                ..
+            })
+    ) {
+        group_result?;
+    }
     wait_result
 }
 
@@ -1222,8 +1235,8 @@ fn kill_macos_probe_group(process_id: libc::pid_t) -> Result<(), RetainedExecErr
     #[cfg(test)]
     if FORCE_MACOS_GROUP_KILL_ERROR.with(|force| force.replace(false)) {
         return Err(RetainedExecError::Io {
-            kind: io::ErrorKind::PermissionDenied,
-            raw_os_error: Some(libc::EPERM),
+            kind: io::ErrorKind::Other,
+            raw_os_error: Some(libc::EIO),
         });
     }
     // SAFETY: the child was placed in a process group named by its positive
@@ -4277,8 +4290,8 @@ mod tests {
             finish_observed_macos_probe(&mut child, process_id)
                 .expect_err("injected group-kill failure must be preserved"),
             RetainedExecError::Io {
-                kind: io::ErrorKind::PermissionDenied,
-                raw_os_error: Some(libc::EPERM),
+                kind: io::ErrorKind::Other,
+                raw_os_error: Some(libc::EIO),
             }
         );
 
