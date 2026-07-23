@@ -24,7 +24,9 @@ pub use provider_connection::{
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub use unix_endpoint::{UnixEndpointError, UnixProviderAcceptError, UnixProviderListener};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-pub use unix_runtime::{PublishedUnixProviderEndpoint, UnixRuntimeError};
+pub use unix_runtime::{
+    PublishedUnixProviderEndpoint, UnixRuntimeError, connect_published_provider,
+};
 
 use std::{
     collections::HashMap,

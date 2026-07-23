@@ -4,11 +4,13 @@ use std::{
     os::unix::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
         io::AsRawFd,
+        net::UnixStream,
     },
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use gus_platform::{AuthenticatedUnixStream, PeerAuthenticationError};
 use thiserror::Error;
 
 use crate::{
@@ -118,8 +120,71 @@ impl Drop for PublishedUnixProviderEndpoint {
     }
 }
 
+/// Discovers and authenticates the currently published Unix provider broker.
+///
+/// The discovery file and endpoint are accepted only below the owner-private
+/// runtime directory and must match the broker's generated-name grammar.
+/// Peer authentication completes before application framing is returned.
+///
+/// # Errors
+///
+/// Rejects unsafe or malformed publication state, connection failures, and
+/// unavailable or inconsistent kernel peer evidence.
+pub fn connect_published_provider(
+    runtime_directory: impl AsRef<Path>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<AuthenticatedUnixStream, UnixRuntimeError> {
+    let runtime_directory = validated_runtime_directory(runtime_directory.as_ref())?;
+    let endpoint = discover_published_endpoint(&runtime_directory)?;
+    let stream = UnixStream::connect(endpoint).map_err(io_error)?;
+    let authenticated = AuthenticatedUnixStream::authenticate_outgoing(stream)?;
+    authenticated
+        .set_read_timeout(Some(read_timeout))
+        .map_err(io_error)?;
+    authenticated
+        .set_write_timeout(Some(write_timeout))
+        .map_err(io_error)?;
+    Ok(authenticated)
+}
+
 fn validated_runtime_directory(path: &Path) -> Result<PathBuf, UnixRuntimeError> {
     validated_private_directory(path).map_err(|_| UnixRuntimeError::UnsafeRuntimeDirectory)
+}
+
+fn discover_published_endpoint(runtime_directory: &Path) -> Result<PathBuf, UnixRuntimeError> {
+    let discovery_path = runtime_directory.join(DISCOVERY_FILE);
+    let mut publication = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&discovery_path)
+        .map_err(|_| UnixRuntimeError::UnsafePublication)?;
+    validate_private_regular(&publication, &discovery_path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut publication)
+        .take(MAX_DISCOVERY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() as u64 > MAX_DISCOVERY_BYTES {
+        return Err(UnixRuntimeError::UnsafePublication);
+    }
+    let name = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.strip_suffix('\n'))
+        .filter(|name| valid_endpoint_name(name))
+        .ok_or(UnixRuntimeError::UnsafePublication)?;
+    let endpoint = runtime_directory.join(name);
+    let metadata =
+        fs::symlink_metadata(&endpoint).map_err(|_| UnixRuntimeError::UnsafePublication)?;
+    // SAFETY: `geteuid` has no preconditions and reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != effective_user
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err(UnixRuntimeError::UnsafePublication);
+    }
+    Ok(endpoint)
 }
 
 fn acquire_lock(runtime_directory: &Path) -> Result<File, UnixRuntimeError> {
@@ -304,13 +369,23 @@ pub enum UnixRuntimeError {
     #[error("provider runtime I/O failed: {0:?}")]
     Io(io::ErrorKind),
     #[error(transparent)]
+    PeerAuthentication(#[from] PeerAuthenticationError),
+    #[error(transparent)]
     Endpoint(#[from] UnixEndpointError),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::{fs::PermissionsExt as _, net::UnixListener};
+    use std::{
+        os::unix::{fs::PermissionsExt as _, net::UnixListener},
+        thread,
+    };
 
+    use gus_ipc::{
+        BrokerProviderMessage, Digest32, Generation, ProviderCapability, ProviderKind,
+        ProviderRegistrationRequest, ProviderRequestFrame, read_provider_response,
+        write_provider_request,
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -323,6 +398,64 @@ mod tests {
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700))
             .expect("private runtime");
         runtime
+    }
+
+    fn digest(value: u8) -> Digest32 {
+        Digest32::from_bytes([value; 32])
+    }
+
+    #[test]
+    fn connector_discovers_authenticates_and_registers_with_the_live_broker() {
+        let runtime = runtime();
+        let published = PublishedUnixProviderEndpoint::bind(
+            runtime.path(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .expect("publish endpoint");
+        let connector_runtime = runtime.path().to_owned();
+        let connector = thread::spawn(move || {
+            let mut stream = connect_published_provider(
+                connector_runtime,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+            .expect("discover and authenticate broker");
+            let registration = ProviderRequestFrame::registration(
+                ProviderRegistrationRequest::new(
+                    ProviderKind::Vscode,
+                    "window-1".into(),
+                    digest(1),
+                    vec![digest(2)],
+                    vec![ProviderCapability::ProfileQuickPick],
+                )
+                .expect("registration"),
+            )
+            .expect("registration frame");
+            write_provider_request(&mut stream, &registration).expect("write registration");
+            let response = read_provider_response(&mut stream).expect("read registration response");
+            assert_eq!(response.request_id(), registration.request_id());
+            assert!(matches!(
+                response.message(),
+                BrokerProviderMessage::Registered(_)
+            ));
+        });
+
+        let connection = published
+            .accept_registration()
+            .expect("accept provider")
+            .admit(
+                digest(1),
+                &[digest(2)],
+                Generation::new(7).expect("generation"),
+                15_000,
+            )
+            .expect("admit provider");
+        assert_eq!(
+            connection.provider_generation(),
+            Generation::new(7).expect("generation")
+        );
+        connector.join().expect("connector thread");
     }
 
     #[test]
