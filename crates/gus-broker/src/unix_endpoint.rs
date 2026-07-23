@@ -8,14 +8,13 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use gus_ipc::{Digest32, Generation};
 use gus_platform::{AuthenticatedUnixStream, PeerAuthenticationError};
 use thiserror::Error;
 
-use crate::{ProviderConnectionError, UnixProviderConnection};
+use crate::{PendingUnixProvider, ProviderConnectionError};
 
 /// Owner-private provider endpoint on Linux, macOS, or FreeBSD.
 ///
@@ -88,13 +87,7 @@ impl UnixProviderListener {
         })
     }
 
-    /// Accepts and authenticates one provider before application framing.
-    ///
-    /// # Errors
-    ///
-    /// Returns socket accept, native peer-authentication, or timeout setup
-    /// failures. No provider frame is read on failure.
-    pub fn accept(&self) -> Result<AuthenticatedUnixStream, UnixEndpointError> {
+    fn accept(&self) -> Result<AuthenticatedUnixStream, UnixEndpointError> {
         let (stream, _) = self
             .listener
             .accept()
@@ -109,31 +102,16 @@ impl UnixProviderListener {
         Ok(authenticated)
     }
 
-    /// Accepts, authenticates, and registers one provider connection.
+    /// Accepts, authenticates, and reads one untrusted provider registration.
     ///
     /// # Errors
     ///
-    /// Returns endpoint/authentication failures before registration, or a
-    /// connection error if the first application frame is not an admitted
-    /// registration or its response cannot be written.
-    pub fn accept_provider(
-        &self,
-        authenticated_host_instance: Digest32,
-        authorized_repositories: &[Digest32],
-        provider_generation: Generation,
-        heartbeat_interval_millis: u32,
-        now: Instant,
-    ) -> Result<UnixProviderConnection, UnixProviderAcceptError> {
+    /// Returns endpoint/authentication failures before framing, or a
+    /// connection error for a slow, malformed, or non-registration frame.
+    pub fn accept_registration(&self) -> Result<PendingUnixProvider, UnixProviderAcceptError> {
         let stream = self.accept()?;
-        UnixProviderConnection::accept(
-            stream,
-            authenticated_host_instance,
-            authorized_repositories,
-            provider_generation,
-            heartbeat_interval_millis,
-            now,
-        )
-        .map_err(UnixProviderAcceptError::Connection)
+        PendingUnixProvider::read(stream, self.read_timeout, self.write_timeout)
+            .map_err(UnixProviderAcceptError::Connection)
     }
 
     #[must_use]
@@ -176,9 +154,21 @@ fn validated_endpoint_path(path: &Path) -> Result<PathBuf, UnixEndpointError> {
     }
     let file_name = path.file_name().ok_or(UnixEndpointError::InvalidPath)?;
     let parent = path.parent().ok_or(UnixEndpointError::InvalidPath)?;
+    let parent = validated_private_directory(parent)?;
+    Ok(parent.join(file_name))
+}
+
+pub(crate) fn validated_private_directory(path: &Path) -> Result<PathBuf, UnixEndpointError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(UnixEndpointError::InvalidPath);
+    }
     // Resolve platform-owned aliases such as macOS `/var` once, then perform
     // all validation and binding through the resulting symlink-free path.
-    let parent = fs::canonicalize(parent).map_err(|error| UnixEndpointError::Io(error.kind()))?;
+    let parent = fs::canonicalize(path).map_err(|error| UnixEndpointError::Io(error.kind()))?;
     validate_ancestor_chain(&parent)?;
     let metadata =
         fs::symlink_metadata(&parent).map_err(|error| UnixEndpointError::Io(error.kind()))?;
@@ -187,10 +177,12 @@ fn validated_endpoint_path(path: &Path) -> Result<PathBuf, UnixEndpointError> {
     if !metadata.is_dir() || metadata.uid() != effective_user || metadata.mode() & 0o077 != 0 {
         return Err(UnixEndpointError::UnsafeParent);
     }
-    Ok(parent.join(file_name))
+    Ok(parent)
 }
 
 fn validate_ancestor_chain(path: &Path) -> Result<(), UnixEndpointError> {
+    // SAFETY: `geteuid` has no preconditions and reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
     let mut current = PathBuf::new();
     for component in path.components() {
         match component {
@@ -205,12 +197,18 @@ fn validate_ancestor_chain(path: &Path) -> Result<(), UnixEndpointError> {
         if !metadata.is_dir() {
             return Err(UnixEndpointError::UnsafeAncestor);
         }
-        let mode = metadata.mode();
-        if mode & 0o022 != 0 && !(metadata.uid() == 0 && mode & 0o1000 != 0) {
+        if !trusted_ancestor(metadata.uid(), metadata.mode(), effective_user) {
             return Err(UnixEndpointError::UnsafeAncestor);
         }
     }
     Ok(())
+}
+
+const fn trusted_ancestor(owner: u32, mode: u32, effective_user: u32) -> bool {
+    if owner != 0 && owner != effective_user {
+        return false;
+    }
+    mode & 0o022 == 0 || (owner == 0 && mode & 0o1000 != 0)
 }
 
 fn require_close_on_exec(listener: &UnixListener) -> Result<(), UnixEndpointError> {
@@ -258,11 +256,15 @@ pub enum UnixProviderAcceptError {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::net::UnixStream, thread};
+    use std::{
+        os::unix::net::{UnixListener, UnixStream},
+        thread,
+    };
 
     use gus_ipc::{
-        BrokerProviderMessage, ProviderCapability, ProviderKind, ProviderRegistrationRequest,
-        ProviderRequestFrame, read_provider_response, write_provider_request,
+        BrokerProviderMessage, Digest32, Generation, ProviderCapability, ProviderKind,
+        ProviderRegistrationRequest, ProviderRequestFrame, read_provider_response,
+        write_provider_request,
     };
     use tempfile::TempDir;
 
@@ -302,6 +304,25 @@ mod tests {
         ));
         drop(listener);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn drop_does_not_remove_a_replacement_socket() {
+        let runtime = private_runtime();
+        let path = runtime.path().join("provider.sock");
+        let listener =
+            UnixProviderListener::bind(&path, Duration::from_secs(1), Duration::from_secs(1))
+                .expect("bind private endpoint");
+        fs::remove_file(&path).expect("unlink original endpoint");
+        let replacement = UnixListener::bind(&path).expect("bind replacement endpoint");
+        drop(listener);
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("replacement remains")
+                .file_type()
+                .is_socket()
+        );
+        drop(replacement);
     }
 
     #[test]
@@ -346,6 +367,18 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_policy_rejects_every_third_party_owner() {
+        let effective_user = 1_000;
+        assert!(trusted_ancestor(0, 0o755, effective_user));
+        assert!(trusted_ancestor(0, 0o1777, effective_user));
+        assert!(trusted_ancestor(effective_user, 0o700, effective_user));
+        assert!(!trusted_ancestor(2_000, 0o755, effective_user));
+        assert!(!trusted_ancestor(2_000, 0o555, effective_user));
+        assert!(!trusted_ancestor(effective_user, 0o770, effective_user));
+        assert!(!trusted_ancestor(0, 0o777, effective_user));
+    }
+
+    #[test]
     fn accepted_provider_authenticates_and_registers_before_returning() {
         let runtime = private_runtime();
         let path = runtime.path().join("provider.sock");
@@ -376,14 +409,10 @@ mod tests {
             ));
         });
         let connection = listener
-            .accept_provider(
-                digest(1),
-                &[digest(2)],
-                generation(7),
-                15_000,
-                Instant::now(),
-            )
-            .expect("accept registered provider");
+            .accept_registration()
+            .expect("read provider registration")
+            .admit(digest(1), &[digest(2)], generation(7), 15_000)
+            .expect("admit registered provider");
         assert_eq!(connection.provider_generation(), generation(7));
         connector.join().expect("connector thread");
     }

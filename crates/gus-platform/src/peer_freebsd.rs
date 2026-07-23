@@ -125,6 +125,15 @@ impl AuthenticatedUnixStream {
         self.stream.set_write_timeout(timeout)
     }
 
+    /// Selects blocking or nonblocking application I/O after authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system socket error without transferring bytes.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
+    }
+
     fn require_connection_live(&self) -> io::Result<()> {
         self.peer_monitor.ensure_live().map_err(monitor_io_error)
     }

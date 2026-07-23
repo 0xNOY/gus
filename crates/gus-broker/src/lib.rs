@@ -10,6 +10,8 @@ mod provider;
 mod provider_connection;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 mod unix_endpoint;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+mod unix_runtime;
 
 pub use provider::{
     IssuedProviderPrompt, ProviderAdmission, ProviderAdmissionError, ProviderCommandFailure,
@@ -17,10 +19,12 @@ pub use provider::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub use provider_connection::{
-    ProviderConnectionError, SentProviderPrompt, UnixProviderConnection,
+    PendingUnixProvider, ProviderConnectionError, SentProviderPrompt, UnixProviderConnection,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub use unix_endpoint::{UnixEndpointError, UnixProviderAcceptError, UnixProviderListener};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+pub use unix_runtime::{PublishedUnixProviderEndpoint, UnixRuntimeError};
 
 use std::{
     collections::HashMap,
