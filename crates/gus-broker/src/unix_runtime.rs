@@ -20,8 +20,8 @@ const LOCK_FILE: &str = "provider.lock";
 const DISCOVERY_FILE: &str = "provider.current";
 const ENDPOINT_PREFIX: &str = "provider-";
 const ENDPOINT_SUFFIX: &str = ".sock";
-// 128 random bits keep the pathname within the smallest supported sockaddr_un
-// limit even below longer macOS temporary/runtime directory prefixes.
+// 128 random bits provide collision resistance while leaving room for normal
+// runtime-directory prefixes under the smallest supported sockaddr_un limit.
 const GENERATION_BYTES: usize = 16;
 const MAX_GENERATION_ATTEMPTS: usize = 16;
 const MAX_DISCOVERY_BYTES: u64 = 128;
@@ -317,8 +317,8 @@ mod tests {
 
     fn runtime() -> TempDir {
         let runtime = tempfile::Builder::new()
-            .prefix("gus-published-runtime-")
-            .tempdir()
+            .prefix("gpr-")
+            .tempdir_in("/tmp")
             .expect("temporary runtime");
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700))
             .expect("private runtime");

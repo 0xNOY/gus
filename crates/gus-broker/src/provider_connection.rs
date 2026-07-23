@@ -1056,10 +1056,10 @@ mod tests {
         let frame = ProviderResponseFrame::acknowledgement(registration().request_id())
             .expect("acknowledgement");
         let mut writer = ProgressingWriter {
-            delay: Duration::from_millis(12),
+            delay: Duration::from_millis(1),
             calls: 0,
         };
-        let error = write_response_absolute(&mut writer, &frame, Duration::from_millis(30))
+        let error = write_response_absolute(&mut writer, &frame, Duration::from_millis(100))
             .expect_err("progress cannot extend the frame deadline");
         assert_eq!(error, TransportError::Io(io::ErrorKind::TimedOut));
         assert!(writer.calls >= 2, "fixture must make partial progress");
