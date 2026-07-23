@@ -246,6 +246,12 @@ impl Write for AuthenticatedUnixStream {
     }
 }
 
+impl AsRawFd for AuthenticatedUnixStream {
+    fn as_raw_fd(&self) -> libc::c_int {
+        self.stream.as_raw_fd()
+    }
+}
+
 /// Failure to authenticate a native macOS IPC peer.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

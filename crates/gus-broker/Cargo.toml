@@ -10,6 +10,10 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "gus-provider-bridge"
+path = "src/provider_bridge.rs"
+
 [dependencies]
 gus-core = { path = "../gus-core" }
 gus-ipc = { path = "../gus-ipc" }
