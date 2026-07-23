@@ -3,7 +3,8 @@ use std::{
     io::{self, Read as _, Write as _},
     os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, Stdio},
+    thread,
     time::Duration,
 };
 
@@ -14,6 +15,8 @@ use gus_broker::connect_published_provider;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
+#[cfg(unix)]
+const BROKER_START_ATTEMPTS: usize = 100;
 
 #[cfg(unix)]
 fn main() -> ExitCode {
@@ -35,9 +38,36 @@ fn main() -> std::process::ExitCode {
 #[cfg(unix)]
 fn run() -> Result<(), BridgeError> {
     let runtime_directory = parse_runtime_directory(std::env::args_os())?;
-    let mut broker = connect_published_provider(runtime_directory, IO_TIMEOUT, IO_TIMEOUT)
-        .map_err(|_| BridgeError::BrokerUnavailable)?;
+    let mut broker = connect_or_start_broker(&runtime_directory)?;
     relay(&mut broker)
+}
+
+#[cfg(unix)]
+fn connect_or_start_broker(
+    runtime_directory: &Path,
+) -> Result<gus_platform::AuthenticatedUnixStream, BridgeError> {
+    if let Ok(stream) = connect_published_provider(runtime_directory, IO_TIMEOUT, IO_TIMEOUT) {
+        return Ok(stream);
+    }
+    let executable = std::env::current_exe().map_err(|_| BridgeError::BrokerUnavailable)?;
+    let broker = executable
+        .parent()
+        .map(|parent| parent.join("gus-broker"))
+        .ok_or(BridgeError::BrokerUnavailable)?;
+    Command::new(broker)
+        .env("GUS_RUNTIME_DIR", runtime_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| BridgeError::BrokerUnavailable)?;
+    for _ in 0..BROKER_START_ATTEMPTS {
+        if let Ok(stream) = connect_published_provider(runtime_directory, IO_TIMEOUT, IO_TIMEOUT) {
+            return Ok(stream);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(BridgeError::BrokerUnavailable)
 }
 
 #[cfg(unix)]

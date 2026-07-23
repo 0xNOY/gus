@@ -98,16 +98,17 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
 
-      - name: Build native provider bridge
-        run: cargo build --release -p gus-broker --bin gus-provider-bridge
+      - name: Build native provider runtime
+        run: cargo build --release -p gus-broker --bin gus-provider-bridge --bin gus-broker
 
       - name: Install extension dependencies
         run: npm --prefix editors/vscode ci
 
-      - name: Stage native provider bridge
+      - name: Stage native provider runtime
         run: |
           mkdir -p editors/vscode/bin
           cp target/release/gus-provider-bridge editors/vscode/bin/gus-provider-bridge
+          cp target/release/gus-broker editors/vscode/bin/gus-broker
 
       - name: Build target-specific VSIX
         run: npm --prefix editors/vscode run package:vsix -- --target ${{ matrix.target }} --out "${{ runner.temp }}/gus-${{ matrix.target }}.vsix"
