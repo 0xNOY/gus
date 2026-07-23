@@ -193,6 +193,14 @@ fn pty_commit_child() {
         .write(true)
         .open(slave_path)
         .expect("open PTY slave as controlling terminal");
+    // SAFETY: this fresh process is a session leader without a controlling
+    // terminal, and `slave` is a live terminal descriptor.
+    assert_ne!(
+        unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) },
+        -1,
+        "TIOCSCTTY failed: {}",
+        std::io::Error::last_os_error()
+    );
     for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
         // SAFETY: the source descriptor is live and each target is a standard descriptor.
         assert_ne!(unsafe { libc::dup2(slave.as_raw_fd(), descriptor) }, -1);
