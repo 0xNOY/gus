@@ -3,7 +3,7 @@
 use std::{
     ffi::CStr,
     fs,
-    io::Write as _,
+    io::{Read as _, Write as _},
     os::{
         fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
         unix::{fs::PermissionsExt as _, process::CommandExt as _},
@@ -156,9 +156,24 @@ fn run_commit_in_new_terminal(
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn PTY child");
+    drop(slave);
     writeln!(master, "{selection}").expect("send profile selection");
     let status = child.wait().expect("wait for PTY child");
-    assert!(status.success(), "PTY commit failed with {status}");
+    let mut transcript = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match master.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => transcript.extend_from_slice(&chunk[..read]),
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => panic!("read PTY transcript: {error}"),
+        }
+    }
+    assert!(
+        status.success(),
+        "PTY commit failed with {status}: {}",
+        String::from_utf8_lossy(&transcript)
+    );
 }
 
 #[test]
