@@ -1,11 +1,13 @@
 use std::{env, ffi::OsString, process::ExitCode};
 
 #[cfg(unix)]
+use gus_profile::{PersonIdentity, Profile, ProfileId, ProfileSet};
+#[cfg(unix)]
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
 use std::os::{
     fd::AsRawFd as _,
-    unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+    unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
 };
 #[cfg(unix)]
 use std::{
@@ -21,6 +23,8 @@ const OWNER_FILE: &str = ".gus-git-shim-owner-v1";
 const INSTALL_LOCK_FILE: &str = ".gus-git-shim-install.lock";
 #[cfg(unix)]
 const UPDATE_JOURNAL_FILE: &str = ".gus-git-shim-update-v1";
+#[cfg(unix)]
+const MAX_PROFILE_STORE_BYTES: u64 = 1024 * 1024;
 
 fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
@@ -35,16 +39,54 @@ fn main() -> ExitCode {
 
 fn run(arguments: &[OsString]) -> Result<(), String> {
     let Some(command) = arguments.first().and_then(|value| value.to_str()) else {
-        return Err("usage: gus <setup|doctor|uninstall-shim>".to_owned());
+        return Err(usage());
     };
     match command {
         "setup" => setup(&arguments[1..]),
         "doctor" if arguments.len() == 1 => doctor(),
         "uninstall-shim" if arguments.len() == 1 => uninstall(),
-        _ => Err(
-            "usage: gus <setup [--dry-run] [--target-dir PATH]|doctor|uninstall-shim>".to_owned(),
-        ),
+        "user" => user(&arguments[1..]),
+        _ => Err(usage()),
     }
+}
+
+fn usage() -> String {
+    "usage: gus <setup [--dry-run] [--target-dir PATH]|doctor|uninstall-shim|user <add|remove|list>>"
+        .to_owned()
+}
+
+fn user(arguments: &[OsString]) -> Result<(), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = arguments;
+        Err("profile management is not implemented on this platform yet".to_owned())
+    }
+
+    #[cfg(unix)]
+    {
+        let path = profile_store_path()?;
+        match arguments {
+            [command, id, name, email] if command == "add" => user_add(
+                &path,
+                os_string(id, "profile ID")?,
+                os_string(name, "name")?,
+                os_string(email, "email")?,
+            ),
+            [command, id] if command == "remove" => {
+                user_remove(&path, os_string(id, "profile ID")?)
+            }
+            [command] if command == "list" => user_list(&path),
+            _ => Err("usage: gus user <add <id> <name> <email>|remove <id>|list>".to_owned()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn os_string(value: &OsString, label: &str) -> Result<String, String> {
+    value
+        .clone()
+        .into_string()
+        .map_err(|_| format!("{label} must be valid UTF-8"))
 }
 
 fn setup(arguments: &[OsString]) -> Result<(), String> {
@@ -656,6 +698,252 @@ fn valid_digest(value: &str) -> bool {
 }
 
 #[cfg(unix)]
+fn profile_store_path() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("GUS_PROFILE_STORE") {
+        let path = PathBuf::from(path);
+        return path
+            .is_absolute()
+            .then_some(path)
+            .ok_or_else(|| "GUS_PROFILE_STORE must be an absolute path".to_owned());
+    }
+    if let Some(root) = env::var_os("XDG_CONFIG_HOME") {
+        let root = PathBuf::from(root);
+        return root
+            .is_absolute()
+            .then(|| root.join("gus/profiles.toml"))
+            .ok_or_else(|| "XDG_CONFIG_HOME must be an absolute path".to_owned());
+    }
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".config/gus/profiles.toml"))
+        .ok_or_else(|| "neither GUS_PROFILE_STORE, XDG_CONFIG_HOME, nor HOME is set".to_owned())
+}
+
+#[cfg(unix)]
+fn user_add(path: &Path, id: String, name: String, email: String) -> Result<(), String> {
+    let id = ProfileId::try_from(id).map_err(|error| error.to_string())?;
+    let person = PersonIdentity::new(name, email).map_err(|error| error.to_string())?;
+    let (_directory, _lock) = lock_profile_store(path)?;
+    let mut profiles = read_profile_store(path)?;
+    if profiles.profiles.contains_key(&id) {
+        return Err(format!("profile '{id}' already exists"));
+    }
+    profiles.generation = next_generation(profiles.generation)?;
+    profiles.profiles.insert(
+        id.clone(),
+        Profile {
+            id: id.clone(),
+            author: person.clone(),
+            committer: person,
+            signing: None,
+            ssh_transport: None,
+            http: None,
+            generation: 1,
+        },
+    );
+    write_profile_store(path, &profiles)?;
+    println!("Added GUS profile '{id}'");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn user_remove(path: &Path, id: String) -> Result<(), String> {
+    let id = ProfileId::try_from(id).map_err(|error| error.to_string())?;
+    let (_directory, _lock) = lock_profile_store(path)?;
+    let mut profiles = read_profile_store(path)?;
+    if profiles.profiles.remove(&id).is_none() {
+        return Err(format!("profile '{id}' does not exist"));
+    }
+    profiles.generation = next_generation(profiles.generation)?;
+    write_profile_store(path, &profiles)?;
+    println!("Removed GUS profile '{id}'");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn user_list(path: &Path) -> Result<(), String> {
+    let profiles = read_profile_store(path)?;
+    for (id, profile) in profiles.profiles {
+        println!(
+            "{id}\t{} <{}>",
+            profile.author.name(),
+            profile.author.email()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn next_generation(generation: u64) -> Result<u64, String> {
+    generation
+        .checked_add(1)
+        .ok_or_else(|| "profile store generation is exhausted".to_owned())
+}
+
+#[cfg(unix)]
+fn lock_profile_store(path: &Path) -> Result<(File, File), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    create_private_profile_directory(parent)?;
+    let directory = File::open(parent).map_err(|error| {
+        format!(
+            "cannot open profile directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let lock_path = parent.join(".profiles.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open profile lock {}: {error}", lock_path.display()))?;
+    validate_private_profile_file(&lock, &lock_path)?;
+    // SAFETY: `lock` is a live descriptor and `flock` has no pointer arguments.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "another GUS profile update is active for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((directory, lock))
+}
+
+#[cfg(unix)]
+fn create_private_profile_directory(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|error| {
+                format!(
+                    "cannot create profile directory {}: {error}",
+                    path.display()
+                )
+            })?;
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect profile directory {}: {error}",
+            path.display()
+        )
+    })?;
+    // SAFETY: `geteuid` has no preconditions and reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != effective_user || metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "profile directory {} must be owned by the current user and not group/world writable",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_profile_store(path: &Path) -> Result<ProfileSet, String> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProfileSet::default());
+        }
+        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
+    };
+    validate_private_profile_file(&file, path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_PROFILE_STORE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_PROFILE_STORE_BYTES {
+        return Err(format!("{} exceeds the 1 MiB limit", path.display()));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
+    let profiles: ProfileSet = toml::from_str(text)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+    profiles
+        .validate()
+        .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
+    Ok(profiles)
+}
+
+#[cfg(unix)]
+fn write_profile_store(path: &Path, profiles: &ProfileSet) -> Result<(), String> {
+    profiles
+        .validate()
+        .map_err(|error| format!("profile update is invalid: {error}"))?;
+    let contents = toml::to_string_pretty(profiles)
+        .map_err(|error| format!("cannot encode profile store: {error}"))?;
+    if contents.len() as u64 > MAX_PROFILE_STORE_BYTES {
+        return Err("profile store exceeds the 1 MiB limit".to_owned());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{} has no portable file name", path.display()))?;
+    let temporary = parent.join(format!(
+        ".{name}-{}-{}.tmp",
+        std::process::id(),
+        monotonic_suffix()?
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&temporary)
+        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
+    validate_private_profile_file(&file, &temporary)?;
+    let result = (|| {
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .map_err(|error| format!("cannot publish {}: {error}", path.display()))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("cannot sync profile directory: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn validate_private_profile_file(file: &File, path: &Path) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and reads process credentials.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != effective_user
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(format!(
+            "{} must be a private, singly linked file owned by the current user",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn read_checked_text(path: &Path, limit: u64) -> Result<String, String> {
     let file = open_checked_file(path, true)?;
     let mut bytes = Vec::new();
@@ -779,5 +1067,72 @@ mod tests {
             b"third party"
         );
         assert_eq!(fs::read(&staged).expect("read staged"), b"gus");
+    }
+
+    #[test]
+    fn profile_commands_round_trip_without_manual_file_editing() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("gus/profiles.toml");
+
+        user_add(
+            &path,
+            "work".to_owned(),
+            "Work User".to_owned(),
+            "work@example.test".to_owned(),
+        )
+        .expect("add profile");
+        let profiles = read_profile_store(&path).expect("read added profile");
+        assert_eq!(profiles.generation, 2);
+        let profile = profiles
+            .profiles
+            .get(&ProfileId::try_from("work".to_owned()).expect("profile id"))
+            .expect("stored profile");
+        assert_eq!(profile.author.name(), "Work User");
+        assert_eq!(profile.committer.email(), "work@example.test");
+        assert_eq!(
+            fs::metadata(&path).expect("profile metadata").mode() & 0o777,
+            0o600
+        );
+
+        assert!(
+            user_add(
+                &path,
+                "work".to_owned(),
+                "Other User".to_owned(),
+                "other@example.test".to_owned(),
+            )
+            .is_err()
+        );
+        user_remove(&path, "work".to_owned()).expect("remove profile");
+        let profiles = read_profile_store(&path).expect("read removed profile");
+        assert_eq!(profiles.generation, 3);
+        assert!(profiles.profiles.is_empty());
+        assert!(user_remove(&path, "work".to_owned()).is_err());
+    }
+
+    #[test]
+    fn profile_add_validates_identity_before_creating_the_store() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("gus/profiles.toml");
+        assert!(
+            user_add(
+                &path,
+                "bad id".to_owned(),
+                "Work User".to_owned(),
+                "work@example.test".to_owned(),
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+        assert!(
+            user_add(
+                &path,
+                "work".to_owned(),
+                "Work User".to_owned(),
+                "invalid-email".to_owned(),
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
     }
 }
