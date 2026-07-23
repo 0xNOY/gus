@@ -1,176 +1,88 @@
 # GUS: Git User Switcher
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+GUS は、同じ OS アカウントと Git リポジトリを複数人で利用するときに、別セッションの Git identity を誤って使う事故を防ぐためのツールです。
 
-## 概要
+現在はプレビュー版です。Linux、macOS、FreeBSD 向けのネイティブ Git シムと、ターミナルセッション単位のユーザー選択を実装しています。Windows と VS Code 統合は開発中です。
 
-GUSは、複数のGitアカウント（例：個人用、仕事用）を簡単に切り替えるためのコマンドラインツールです。
-ターミナルセッションごとに異なるGitユーザー設定を管理し、SSH鍵の自動切り替えもサポートします。
+## 現在利用できる機能
 
-### 主な機能
+- `.bashrc` や `.zshrc` を書き換えないネイティブ Git シム
+- commit など identity が必要な操作までユーザー選択を遅延
+- controlling TTY ごとに独立したユーザー選択
+- author / committer 情報の明示的な注入
+- 非対話環境で未選択の保護対象操作を拒否
+- identity が不要な Git 操作を選択なしで実行
+- Linux、macOS、FreeBSD での検証済み system Git 起動
 
-- 🔄 ターミナルセッション単位でのGitユーザー切り替え
-- 🔑 SSH鍵の自動生成と管理
-- 📁 ディレクトリベースの自動ユーザー切り替え
-- ⚠️ Gitコマンド実行時のユーザ選択強制
+SSH 鍵、HTTP credential、VS Code の自動導入、Windows 用シムはまだ利用者向けに完成していません。
 
 ## インストール
 
-### 前提条件
-
-- Rust と Cargo（[インストール方法](https://doc.rust-lang.org/cargo/getting-started/installation.html)）
-- Git
-
-### インストール手順
-
-1. Cargoを使用してGUS本体とGitシムをインストール:
-   ```sh
-   cargo install --git https://github.com/0xNOY/gus.git gus-shim --locked --force
-   ```
-
-2. Gitシムを既存のPATH上へ配置し、動作確認:
-   ```sh
-   gus setup
-   gus doctor
-   ```
-
-`gus setup`はShellコードを出力せず、`.bashrc`や`.zshrc`も変更しません。GUSのインストール先が実Gitより前のPATHにない場合は、安全に配置できないため失敗します。インストール直後に既存ShellやIDEが以前のGitを保持している場合だけ、新しいShellを開くかIDEを再起動してください。
-
-## 基本的な使い方
-
-### ユーザーの追加
+Rust 1.85 以降と Git が必要です。
 
 ```sh
-# 基本形式: gus add <id> <name> <email>
-gus add work "Work Name" work@example.com
-gus add personal "Personal Name" personal@example.com
+cargo install --git https://github.com/0xNOY/gus.git gus-shim --locked --force
+gus setup
+gus doctor
 ```
 
-- 初回実行時にSSH鍵が自動生成されます
-- 生成された公開鍵を取得:
-  ```sh
-  gus key work  # 公開鍵を表示
-  ```
+`gus setup` は GUS のインストール先に `git` シムを配置します。そのディレクトリが既存の実 Git より前の `PATH` にない場合は、安全に透過置換できないため失敗します。Shell コードの `eval` や rc ファイルの変更は行いません。
 
-### ユーザーの切り替え
+既に起動している Shell や IDE が以前の Git path を保持している場合は、一度だけ再起動してください。
+
+## ユーザーを登録する
 
 ```sh
-# 基本形式: gus set <id>
-gus set work     # 仕事用アカウントに切り替え
-gus set personal # 個人用アカウントに切り替え
+gus user add work "Work Name" work@example.com
+gus user add personal "Personal Name" personal@example.com
+gus user list
 ```
 
-### 現在のユーザー確認
+プロフィールは既定で `~/.config/gus/profiles.toml` に保存されます。`XDG_CONFIG_HOME` が設定されている場合は `$XDG_CONFIG_HOME/gus/profiles.toml` を使います。
+
+登録を削除するには次を実行します。
 
 ```sh
-gus current  # 現在のユーザー情報を表示
+gus user remove personal
 ```
 
-### ユーザー一覧の表示
+## Git を使う
+
+通常どおり `git` を実行します。
 
 ```sh
-gus list           # テーブル形式で表示
-gus list --simple  # シンプルな形式で表示
+git status
+git commit -m "message"
 ```
 
-## 高度な機能
+`git status` のように identity が不要な操作では選択を求めません。commit などで初めて identity が必要になると、controlling TTY にプロフィール一覧を表示します。選択結果はそのターミナルセッションだけで再利用され、別のターミナルへ暗黙に引き継がれません。
 
-### 自動切り替え機能
-
-特定のディレクトリに移動した際に、自動的にGitユーザーを切り替えることができます。
+TTY のない非対話環境では、未選択の保護対象操作を拒否します。自動化でプロフィールを明示する場合は、実行単位で `GUS_PROFILE_ID` を渡せます。
 
 ```sh
-# 自動切り替えの有効化
-gus auto-switch enable
-
-# パターンの追加
-gus auto-switch add "~/work/*" work
-gus auto-switch add "~/personal/*" personal
-
-# パターンの一覧表示
-gus auto-switch list
-
-# パターンの削除
-gus auto-switch remove "~/work/*"
-
-# 自動切り替えの無効化
-gus auto-switch disable
+GUS_PROFILE_ID=work git commit -m "automated change"
 ```
 
-### パターンの例
+この環境変数を共有 Shell の常設設定に入れないでください。セッション分離を迂回するため、対象プロセスだけに渡します。
 
-- `~/work/*` - 仕事用ディレクトリ
-- `~/personal/*` - 個人用ディレクトリ
-- `**/github.com/company/*` - 会社のGitHubリポジトリ
-- `~/{work,company}/*` - 複数ディレクトリの指定
+## 診断とアンインストール
 
-## 設定
-
-設定ファイルは `~/.config/gus/config.toml` に保存されます。
-
-```toml
-# デフォルト設定
-default_sshkey_dir = "~/.ssh"
-default_sshkey_type = "ed25519"
-default_sshkey_rounds = 100
-min_sshkey_passphrase_length = 10
-force_use_gus = true
-auto_switch_enabled = false
-
-# 自動切り替えパターン
-[[auto_switch_patterns]]
-pattern = "~/work/*"
-user_id = "work"
-
-[[auto_switch_patterns]]
-pattern = "~/personal/*"
-user_id = "personal"
+```sh
+gus doctor
+gus uninstall-shim
 ```
 
-## コマンドリファレンス
+`gus doctor` は現在 `PATH` 上で選ばれるシムの所有情報と内容を検証します。`gus uninstall-shim` は GUS が所有し、変更されていないことを確認できたシムだけを削除します。
 
-### 基本コマンド
+## 開発
 
-| コマンド | 説明 |
-|----------|------|
-| `gus add <id> <name> <email>` | 新しいユーザーを追加 |
-| `gus remove <id>` | ユーザーを削除 |
-| `gus set <id>` | 指定したユーザーに切り替え |
-| `gus current` | 現在のユーザーを表示 |
-| `gus list` | ユーザー一覧を表示 |
-| `gus key <id>` | 指定したユーザーの公開鍵を表示 |
+```sh
+cargo test --workspace
+npm --prefix editors/vscode test
+```
 
-### 自動切り替えコマンド
-
-| コマンド | 説明 |
-|----------|------|
-| `gus auto-switch enable` | 自動切り替えを有効化 |
-| `gus auto-switch disable` | 自動切り替えを無効化 |
-| `gus auto-switch add <pattern> <user_id>` | 自動切り替えパターンを追加 |
-| `gus auto-switch remove <pattern>` | 自動切り替えパターンを削除 |
-| `gus auto-switch list` | 自動切り替えパターンを一覧表示 |
-| `gus auto-switch check` | 現在のディレクトリで自動切り替えを確認 |
-
-## トラブルシューティング
-
-### よくある質問
-
-#### Q) Gitコマンド実行時のGUSの利用強制を無効化したい
-
-設定ファイルの `force_use_gus` を `false` に設定してください。
-
-#### Q) SSH鍵生成時のパスフレーズ最低長を変更したい
-
-設定ファイルの `min_sshkey_passphrase_length` を変更してください。
-
-## 貢献
-
-1. このリポジトリをフォーク
-2. 新しいブランチを作成 (`git checkout -b feature/amazing-feature`)
-3. 変更をコミット (`git commit -m 'Add some amazing feature'`)
-4. ブランチにプッシュ (`git push origin feature/amazing-feature`)
-5. プルリクエストを作成
+プラットフォーム固有のテストは GitHub Actions でも実行します。
 
 ## ライセンス
 
-このプロジェクトはMITライセンスの下で公開されています。詳細は[LICENSE](LICENSE)ファイルを参照してください。
+[MIT License](LICENSE)
