@@ -1008,9 +1008,13 @@ fn decoded_values_are_readable_without_reserializing_and_debug_is_redacted() {
     assert_eq!(accepted.heartbeat_interval_millis(), 15_000);
 
     let sensitive_profile = profile_id("sensitive-user");
-    let resolved =
-        gus_ipc::ResolvedSelection::new(sensitive_profile.clone(), generation(1), generation(2))
-            .expect("resolved selection");
+    let resolved = gus_ipc::ResolvedSelection::new(
+        sensitive_profile.clone(),
+        generation(1),
+        digest(8),
+        generation(2),
+    )
+    .expect("resolved selection");
     let status =
         gus_ipc::SelectionStatus::new(digest(3), Some(sensitive_profile.clone()), generation(2))
             .expect("selection status");

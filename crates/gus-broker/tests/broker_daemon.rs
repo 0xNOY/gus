@@ -9,9 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gus_broker::connect_published_provider;
+use gus_broker::{connect_published_provider, digest_unix_arguments, observe_linux_repository};
 use gus_ipc::{
-    BrokerProviderMessage, BrokerShimMessage, Digest32, Generation, OperationPresentation,
+    BrokerProviderMessage, BrokerShimMessage, Generation, OperationPresentation,
     ProviderCapability, ProviderDecision, ProviderKind, ProviderRegistrationRequest,
     ProviderRequestFrame, ProviderSelectionDecision, ResolveSelectionRequest, ShimRequest,
     ShimRequestFrame, read_provider_response, read_shim_response, write_provider_request,
@@ -60,6 +60,7 @@ fn ide_sibling_processes_complete_one_brokered_selection() {
         .arg("--nocapture")
         .env("GUS_DAEMON_HELPER_ROLE", "shim")
         .env("GUS_RUNTIME_DIR", fixture.runtime())
+        .current_dir(fixture.repository())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -113,6 +114,7 @@ fn a_different_ide_host_cannot_use_the_registered_provider() {
         .arg("--nocapture")
         .env("GUS_DAEMON_HELPER_ROLE", "foreign_host")
         .env("GUS_RUNTIME_DIR", fixture.runtime())
+        .current_dir(fixture.repository())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -120,6 +122,56 @@ fn a_different_ide_host_cannot_use_the_registered_provider() {
         .expect("run foreign host helper");
     assert!(status.success(), "foreign host helper failed: {status}");
     provider.kill();
+    broker.kill();
+}
+
+#[test]
+fn concurrent_sibling_requests_share_one_prompt() {
+    if std::env::var_os("GUS_DAEMON_HELPER_ROLE").is_some() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut broker = ChildGuard::spawn(
+        Command::new(env!("CARGO_BIN_EXE_gus-broker"))
+            .env("GUS_RUNTIME_DIR", fixture.runtime())
+            .env("GUS_PROFILE_STORE", fixture.profile_store())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    wait_for_path(&fixture.runtime().join("provider.current"));
+
+    let executable = std::env::current_exe().expect("test executable");
+    let ready = fixture.root().join("provider-ready");
+    let mut provider = ChildGuard::spawn(
+        Command::new(&executable)
+            .arg("--exact")
+            .arg("provider_helper")
+            .arg("--nocapture")
+            .env("GUS_DAEMON_HELPER_ROLE", "provider")
+            .env("GUS_RUNTIME_DIR", fixture.runtime())
+            .env("GUS_PROVIDER_READY", &ready)
+            .env("GUS_PROVIDER_DELAY_MILLIS", "200")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
+    wait_for_path(&ready);
+
+    let mut first_command =
+        shim_helper_command(&executable, fixture.runtime(), fixture.repository());
+    let mut second_command =
+        shim_helper_command(&executable, fixture.runtime(), fixture.repository());
+    let mut first = ChildGuard::spawn(&mut first_command);
+    let mut second = ChildGuard::spawn(&mut second_command);
+    let first_status = first.wait().expect("wait for first shim");
+    let second_status = second.wait().expect("wait for second shim");
+    assert!(first_status.success(), "first shim failed: {first_status}");
+    assert!(
+        second_status.success(),
+        "second shim failed: {second_status}"
+    );
+    assert!(provider.wait().expect("wait for provider").success());
     broker.kill();
 }
 
@@ -159,6 +211,15 @@ fn provider_helper() {
             .iter()
             .any(|profile| profile.profile_id() == &id)
     );
+    if let Some(delay) = std::env::var_os("GUS_PROVIDER_DELAY_MILLIS") {
+        thread::sleep(Duration::from_millis(
+            delay
+                .to_str()
+                .expect("UTF-8 delay")
+                .parse()
+                .expect("numeric delay"),
+        ));
+    }
     let decision = ProviderSelectionDecision::new(
         accepted.registration_id(),
         accepted.provider_generation(),
@@ -184,9 +245,12 @@ fn shim_helper() {
     let runtime = required_path("GUS_RUNTIME_DIR");
     let mut stream =
         connect_published_provider(runtime, IO_TIMEOUT, IO_TIMEOUT).expect("connect shim");
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let pid = std::num::NonZeroU32::new(std::process::id()).expect("positive PID");
+    let repository = observe_linux_repository(pid).expect("repository evidence");
     let request = ResolveSelectionRequest::new(
-        Digest32::from_bytes([4; 32]),
-        Digest32::from_bytes([3; 32]),
+        digest_unix_arguments(&arguments),
+        repository.identity(),
         OperationPresentation::Commit,
         None,
     );
@@ -235,6 +299,7 @@ struct Fixture {
     root: TempDir,
     runtime: PathBuf,
     profile_store: PathBuf,
+    repository: PathBuf,
 }
 
 impl Fixture {
@@ -244,6 +309,9 @@ impl Fixture {
         fs::create_dir(&runtime).expect("runtime directory");
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
             .expect("runtime permissions");
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).expect("repository directory");
+        fs::create_dir(repository.join(".git")).expect("Git metadata directory");
         let profile_store = root.path().join("profiles.toml");
         fs::write(
             &profile_store,
@@ -270,6 +338,7 @@ email = "alice@example.com"
             root,
             runtime,
             profile_store,
+            repository,
         }
     }
 
@@ -283,6 +352,10 @@ email = "alice@example.com"
 
     fn profile_store(&self) -> &Path {
         &self.profile_store
+    }
+
+    fn repository(&self) -> &Path {
+        &self.repository
     }
 }
 
@@ -328,4 +401,19 @@ fn wait_for_path(path: &Path) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn shim_helper_command(executable: &Path, runtime: &Path, repository: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg("--exact")
+        .arg("shim_helper")
+        .arg("--nocapture")
+        .env("GUS_DAEMON_HELPER_ROLE", "shim")
+        .env("GUS_RUNTIME_DIR", runtime)
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    command
 }

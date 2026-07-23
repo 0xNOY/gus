@@ -61,8 +61,13 @@ test("VS Code provider selects the identity used by a real shimmed commit", asyn
         async showQuickPick(items, _options, signal) {
           assert.equal(signal.aborted, false);
           assert.equal(items.length, 1);
-          assert.equal(items[0].profile.profile_id, "alice");
           prompts += 1;
+          if (prompts === 1) {
+            assert.equal(items[0].profile.display_name, "Alice Example");
+          } else {
+            assert.equal(items[0].profile.display_name, "Mallory Example");
+            await writeFile(profileStore, racedProfileToml, { mode: 0o600 });
+          }
           return items[0];
         },
       },
@@ -74,6 +79,7 @@ test("VS Code provider selects the identity used by a real shimmed commit", asyn
         fatal = error;
       },
     });
+    await runtime.ready;
 
     const commit = await run(
       shimPath,
@@ -97,6 +103,26 @@ test("VS Code provider selects the identity used by a real shimmed commit", asyn
       log.stdout.trimEnd().split("\0"),
       ["Alice Example", "alice@example.com", "Alice Example", "alice@example.com"],
     );
+
+    await writeFile(profileStore, replacementProfileToml, { mode: 0o600 });
+    const replaced = await runUnchecked(
+      shimPath,
+      ["commit", "--allow-empty", "-m", "replaced identity"],
+      {
+        cwd: repository,
+        env: environment,
+        detached: true,
+      },
+    );
+    assert.equal(replaced.signal, null);
+    assert.notEqual(replaced.code, 0, "same-generation profile replacement was accepted");
+    assert.match(replaced.stderr, /GUS_E_SELECTION_FAILED/u);
+    assert.equal(prompts, 2, "changed profile content must require a new confirmation");
+    const count = await run("git", ["rev-list", "--count", "HEAD"], {
+      cwd: repository,
+      env: environment,
+    });
+    assert.equal(count.stdout.trim(), "1");
   } finally {
     runtime?.dispose();
     broker.kill("SIGTERM");
@@ -127,6 +153,21 @@ async function waitForPath(path) {
 }
 
 async function run(executable, commandArguments, options) {
+  const result = await runUnchecked(executable, commandArguments, options);
+  assert.equal(
+    result.signal,
+    null,
+    `${executable} exited from ${result.signal ?? "no signal"}: ${result.stderr}`,
+  );
+  assert.equal(
+    result.code,
+    0,
+    `${executable} exited with ${String(result.code)}: ${result.stderr}`,
+  );
+  return result;
+}
+
+async function runUnchecked(executable, commandArguments, options) {
   const child = spawn(executable, commandArguments, {
     cwd: options.cwd,
     env: options.env,
@@ -145,9 +186,7 @@ async function run(executable, commandArguments, options) {
     stderr += chunk;
   });
   const { code, signal } = await onceExited(child);
-  assert.equal(signal, null, `${executable} exited from ${signal ?? "no signal"}: ${stderr}`);
-  assert.equal(code, 0, `${executable} exited with ${String(code)}: ${stderr}`);
-  return { stdout, stderr };
+  return { stdout, stderr, code, signal };
 }
 
 function onceExited(child) {
@@ -174,4 +213,36 @@ email = "alice@example.com"
 [profiles.alice.committer]
 name = "Alice Example"
 email = "alice@example.com"
+`;
+
+const replacementProfileToml = `version = 2
+generation = 1
+
+[profiles.alice]
+id = "alice"
+generation = 1
+
+[profiles.alice.author]
+name = "Mallory Example"
+email = "mallory@example.com"
+
+[profiles.alice.committer]
+name = "Mallory Example"
+email = "mallory@example.com"
+`;
+
+const racedProfileToml = `version = 2
+generation = 1
+
+[profiles.alice]
+id = "alice"
+generation = 1
+
+[profiles.alice.author]
+name = "Eve Example"
+email = "eve@example.com"
+
+[profiles.alice.committer]
+name = "Eve Example"
+email = "eve@example.com"
 `;

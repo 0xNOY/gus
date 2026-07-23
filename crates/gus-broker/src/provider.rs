@@ -281,17 +281,19 @@ impl ProviderSession {
         let outcome = match request.message() {
             ProviderRequest::Heartbeat(_) | ProviderRequest::SubscribeStatus(_) => {
                 self.correlation()?.validate_control(request)?;
+                let response = ProviderResponseFrame::acknowledgement(request.request_id())?;
                 match request.message() {
                     ProviderRequest::Heartbeat(_) => {
                         self.heartbeat_deadline = now
                             .checked_add(self.heartbeat_timeout)
                             .ok_or(ProviderSessionError::HeartbeatDeadlineOverflow)?;
+                        ProviderCommandOutcome::Acknowledged { response }
                     }
-                    ProviderRequest::SubscribeStatus(_) => self.status_subscribed = true,
+                    ProviderRequest::SubscribeStatus(_) => {
+                        self.status_subscribed = true;
+                        ProviderCommandOutcome::StatusSubscribed { response }
+                    }
                     _ => unreachable!("matched control roles"),
-                }
-                ProviderCommandOutcome::Acknowledged {
-                    response: ProviderResponseFrame::acknowledgement(request.request_id())?,
                 }
             }
             ProviderRequest::UpdateRepositories(_) => {
@@ -432,6 +434,9 @@ pub struct IssuedProviderPrompt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCommandOutcome {
     Acknowledged {
+        response: ProviderResponseFrame,
+    },
+    StatusSubscribed {
         response: ProviderResponseFrame,
     },
     MembershipUpdated {

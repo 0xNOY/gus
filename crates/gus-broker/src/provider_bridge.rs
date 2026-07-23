@@ -54,13 +54,16 @@ fn connect_or_start_broker(
         .parent()
         .map(|parent| parent.join("gus-broker"))
         .ok_or(BridgeError::BrokerUnavailable)?;
-    Command::new(broker)
+    let mut child = Command::new(broker)
         .env("GUS_RUNTIME_DIR", runtime_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| BridgeError::BrokerUnavailable)?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
     for _ in 0..BROKER_START_ATTEMPTS {
         if let Ok(stream) = connect_published_provider(runtime_directory, IO_TIMEOUT, IO_TIMEOUT) {
             return Ok(stream);

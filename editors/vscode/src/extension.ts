@@ -63,6 +63,7 @@ export function activate(context: vscode.ExtensionContext): void {
         );
       },
     });
+    void runtime.ready.catch(() => {});
     context.subscriptions.push(runtime);
   } catch (error) {
     const message = toError(error).message;

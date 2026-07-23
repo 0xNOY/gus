@@ -181,7 +181,7 @@ test("foreign registration response closes the provider", async () => {
   assert.match(failures[0]?.message ?? "", /registration response/u);
 });
 
-test("provider aborts an expired prompt without sending a stale decision", async () => {
+test("provider cancels before the broker deadline and ignores a stale picker result", async () => {
   const transport = new MemoryTransport();
   const scheduler = new MemoryScheduler();
   let pickerSignal: AbortSignal | undefined;
@@ -229,7 +229,10 @@ test("provider aborts an expired prompt without sending a stale decision", async
   assert(pickerSignal?.aborted);
   resolvePicker?.(undefined);
   await settle();
-  assert.equal(transport.records.length, 2, "only register and status subscription are sent");
+  assert.equal(transport.records.length, 3);
+  const cancellation = decodeProviderRequest(transport.records[2]!);
+  assert.equal(cancellation.message.type, "selection_decision");
+  assert.equal(cancellation.message.body.decision.result, "cancelled");
 });
 
 test("provider presents repositories authorized by the authenticated broker", async () => {

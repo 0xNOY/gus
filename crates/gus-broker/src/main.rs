@@ -18,13 +18,14 @@ use std::{
 #[cfg(target_os = "linux")]
 use gus_broker::{
     PendingUnixClient, ProviderCommandOutcome, PublishedUnixProviderEndpoint,
-    UnixProviderConnection,
+    UnixProviderConnection, observe_linux_shim,
 };
 #[cfg(target_os = "linux")]
 use gus_ipc::{
     BrokerError, BrokerShimMessage, Digest32, ErrorCode, ErrorDetail, ErrorPhase, Generation,
-    ProfilePresentation, ProviderDecision, RepositoryPresentation, RequestId, ResolvedSelection,
-    ScopePresentation, SelectionPrompt, SelectionScopePresentation, ShimRequest, ShimResponseFrame,
+    ProfilePresentation, ProviderDecision, ProviderStatusSnapshot, RepositoryPresentation,
+    RequestId, ResolvedSelection, ScopePresentation, SelectionPrompt, SelectionScopePresentation,
+    ShimRequest, ShimResponseFrame,
 };
 #[cfg(target_os = "linux")]
 use gus_platform::{ProcessIdentity, observe_process_parent};
@@ -41,6 +42,8 @@ const SELECTION_TIMEOUT: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL_MILLIS: u32 = 30_000;
 #[cfg(target_os = "linux")]
 const MAX_PROFILE_STORE_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_PROVIDER_WORK: usize = 64;
 
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
@@ -88,7 +91,7 @@ fn run_linux() -> Result<std::convert::Infallible, String> {
                 ) else {
                     continue;
                 };
-                let (sender, receiver) = mpsc::channel();
+                let (sender, receiver) = mpsc::sync_channel(MAX_PROVIDER_WORK);
                 let alive = Arc::new(AtomicBool::new(true));
                 registry
                     .lock()
@@ -117,23 +120,28 @@ fn run_linux() -> Result<std::convert::Infallible, String> {
 #[derive(Clone)]
 struct ProviderHandle {
     anchor: ProcessIdentity,
-    sender: mpsc::Sender<ProviderWork>,
+    sender: mpsc::SyncSender<ProviderWork>,
     alive: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
 struct ProviderWork {
     repository: Digest32,
+    repository_label: String,
     operation: gus_ipc::OperationPresentation,
     profiles: Vec<Profile>,
     explicit_profile: Option<ProfileId>,
+    deadline: Instant,
+    active: Arc<AtomicBool>,
     reply: mpsc::SyncSender<Result<SelectedProfile, SelectionFailure>>,
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
 struct SelectedProfile {
     id: ProfileId,
     profile_generation: u64,
+    profile_digest: Digest32,
     session_generation: u64,
 }
 
@@ -141,6 +149,13 @@ struct SelectedProfile {
 struct PendingPrompt {
     request_id: gus_ipc::RequestId,
     profiles: Vec<Profile>,
+    waiters: Vec<SelectionWaiter>,
+}
+
+#[cfg(target_os = "linux")]
+struct SelectionWaiter {
+    deadline: Instant,
+    active: Arc<AtomicBool>,
     reply: mpsc::SyncSender<Result<SelectedProfile, SelectionFailure>>,
 }
 
@@ -153,6 +168,7 @@ enum SelectionFailure {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 fn handle_shim(
     shim: gus_broker::PendingUnixShimRequest,
     registry: &Arc<Mutex<Vec<ProviderHandle>>>,
@@ -162,7 +178,6 @@ fn handle_shim(
         respond_error(shim, request_id, ErrorCode::GusEInternal);
         return;
     };
-    let repository = request.repository_identity();
     let operation = request.operation();
     let explicit_profile = request.explicit_profile().cloned();
     let Ok((observed, anchor)) = observe_process_parent(shim.peer_identity().pid()) else {
@@ -173,6 +188,18 @@ fn handle_shim(
         respond_error(shim, request_id, ErrorCode::GusEProviderUnavailable);
         return;
     }
+    let Ok(evidence) = observe_linux_shim(shim.peer_identity()) else {
+        respond_error(shim, request_id, ErrorCode::GusEShimUnverified);
+        return;
+    };
+    if evidence.repository().identity() != request.repository_identity()
+        || evidence.plan_digest() != request.plan_digest()
+    {
+        respond_error(shim, request_id, ErrorCode::GusEShimUnverified);
+        return;
+    }
+    let repository = evidence.repository().identity();
+    let repository_label = evidence.repository().label().to_owned();
     let Ok(profile_set) = load_profile_set() else {
         respond_error(shim, request_id, ErrorCode::GusEProfileInvalid);
         return;
@@ -196,53 +223,87 @@ fn handle_shim(
         return;
     }
     let (reply, result) = mpsc::sync_channel(1);
+    let active = Arc::new(AtomicBool::new(true));
+    let deadline = Instant::now() + SELECTION_TIMEOUT;
     let mut reply = Some(reply);
     let mut sent = false;
     for provider in providers {
         let work = ProviderWork {
             repository,
+            repository_label: repository_label.clone(),
             operation,
             profiles: profiles.clone(),
             explicit_profile: explicit_profile.clone(),
+            deadline,
+            active: Arc::clone(&active),
             reply: reply
                 .take()
                 .expect("reply is retained until one send succeeds"),
         };
-        match provider.sender.send(work) {
+        match provider.sender.try_send(work) {
             Ok(()) => {
                 sent = true;
                 break;
             }
-            Err(error) => reply = Some(error.0.reply),
+            Err(mpsc::TrySendError::Disconnected(work)) => reply = Some(work.reply),
+            Err(mpsc::TrySendError::Full(_)) => {
+                active.store(false, Ordering::Release);
+                respond_error(shim, request_id, ErrorCode::GusEBrokerCapacity);
+                return;
+            }
         }
     }
     if !sent {
         respond_error(shim, request_id, ErrorCode::GusEProviderUnavailable);
         return;
     }
-    let selected = match result.recv_timeout(SELECTION_TIMEOUT + IO_TIMEOUT) {
-        Ok(Ok(selected)) => selected,
-        Ok(Err(SelectionFailure::Cancelled)) => {
-            respond_error(shim, request_id, ErrorCode::GusESelectionCancelled);
+    let selected = loop {
+        if !shim.peer_is_live() {
+            active.store(false, Ordering::Release);
             return;
         }
-        Ok(Err(SelectionFailure::TimedOut)) | Err(mpsc::RecvTimeoutError::Timeout) => {
+        let now = Instant::now();
+        if now >= deadline {
+            active.store(false, Ordering::Release);
             respond_error(shim, request_id, ErrorCode::GusESelectionTimeout);
             return;
         }
-        Ok(Err(SelectionFailure::Unavailable)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-            respond_error(shim, request_id, ErrorCode::GusEProviderUnavailable);
-            return;
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(50));
+        match result.recv_timeout(wait) {
+            Ok(Ok(selected)) => break selected,
+            Ok(Err(SelectionFailure::Cancelled)) => {
+                active.store(false, Ordering::Release);
+                respond_error(shim, request_id, ErrorCode::GusESelectionCancelled);
+                return;
+            }
+            Ok(Err(SelectionFailure::TimedOut)) => {
+                active.store(false, Ordering::Release);
+                respond_error(shim, request_id, ErrorCode::GusESelectionTimeout);
+                return;
+            }
+            Ok(Err(SelectionFailure::Unavailable)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                active.store(false, Ordering::Release);
+                respond_error(shim, request_id, ErrorCode::GusEProviderUnavailable);
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
+    active.store(false, Ordering::Release);
     let Ok(profile_generation) = Generation::new(selected.profile_generation) else {
         return;
     };
     let Ok(session_generation) = Generation::new(selected.session_generation) else {
         return;
     };
-    let Ok(resolved) = ResolvedSelection::new(selected.id, profile_generation, session_generation)
-    else {
+    let Ok(resolved) = ResolvedSelection::new(
+        selected.id,
+        profile_generation,
+        selected.profile_digest,
+        session_generation,
+    ) else {
         return;
     };
     let Ok(response) =
@@ -288,13 +349,29 @@ fn provider_loop(
             break;
         }
         match connection.try_handle_next(&repositories) {
+            Ok(Some(ProviderCommandOutcome::StatusSubscribed { .. })) => {
+                let Ok(snapshot) = ProviderStatusSnapshot::new(
+                    connection.registration_id(),
+                    connection.provider_generation(),
+                    Vec::new(),
+                ) else {
+                    break;
+                };
+                if connection.send_status(snapshot, Instant::now()).is_err() {
+                    break;
+                }
+            }
             Ok(Some(ProviderCommandOutcome::SelectionDecided { response, decision })) => {
-                let Some(prompt) = pending.take() else {
+                let Some(mut prompt) = pending.take() else {
                     break;
                 };
                 if response.request_id() != prompt.request_id {
-                    let _ = prompt.reply.send(Err(SelectionFailure::Unavailable));
+                    complete_waiters(&mut prompt.waiters, &Err(SelectionFailure::Unavailable));
                     break;
+                }
+                prune_waiters(&mut prompt.waiters, Instant::now());
+                if prompt.waiters.is_empty() {
+                    continue;
                 }
                 let result = match decision {
                     ProviderDecision::Selected(id) => prompt
@@ -303,9 +380,12 @@ fn provider_loop(
                         .find(|profile| profile.id == id)
                         .and_then(|profile| {
                             let session_generation = next_generation(&generations).ok()?.get();
+                            let profile_digest =
+                                Digest32::from_bytes(profile.content_digest().ok()?);
                             Some(SelectedProfile {
                                 id,
                                 profile_generation: profile.generation,
+                                profile_digest,
                                 session_generation,
                             })
                         })
@@ -314,77 +394,138 @@ fn provider_loop(
                     ProviderDecision::Unavailable => Err(SelectionFailure::Unavailable),
                 };
                 if let Ok(value) = &result {
-                    selected = Some(SelectedProfile {
-                        id: value.id.clone(),
-                        profile_generation: value.profile_generation,
-                        session_generation: value.session_generation,
-                    });
+                    selected = Some(value.clone());
                 }
-                let _ = prompt.reply.send(result);
+                complete_waiters(&mut prompt.waiters, &result);
             }
             Ok(Some(_) | None) => {}
             Err(_) => break,
         }
-        if pending.is_none() {
-            match receiver.try_recv() {
-                Ok(work) => {
-                    if let Some(selection) = resolve_existing_selection(&work, selected.as_ref()) {
-                        let _ = work.reply.send(Ok(selection));
-                        continue;
+        loop {
+            let work = match receiver.try_recv() {
+                Ok(work) => work,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(prompt) = pending.as_mut() {
+                        complete_waiters(&mut prompt.waiters, &Err(SelectionFailure::Unavailable));
                     }
-                    repositories.clear();
-                    repositories.push(work.repository);
-                    let Ok(membership_generation) = next_generation(&generations) else {
-                        let _ = work.reply.send(Err(SelectionFailure::Unavailable));
-                        break;
-                    };
-                    if connection
-                        .replace_authorized_repositories(
-                            &repositories,
-                            membership_generation,
-                            Instant::now(),
-                        )
-                        .is_err()
-                    {
-                        let _ = work.reply.send(Err(SelectionFailure::Unavailable));
-                        break;
-                    }
-                    let Ok(prompt) =
-                        make_prompt(&connection, &work, next_generation(&generations).ok())
-                    else {
-                        let _ = work.reply.send(Err(SelectionFailure::Unavailable));
-                        continue;
-                    };
-                    if let Ok(sent) = connection.send_prompt(prompt, Instant::now()) {
-                        pending = Some(PendingPrompt {
-                            request_id: sent.request_id,
-                            profiles: work.profiles,
-                            reply: work.reply,
-                        });
-                    } else {
-                        let _ = work.reply.send(Err(SelectionFailure::Unavailable));
-                        break;
-                    }
+                    let _ = connection.shutdown();
+                    return;
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+            if !work.active.load(Ordering::Acquire) || Instant::now() >= work.deadline {
+                let _ = work.reply.send(Err(SelectionFailure::TimedOut));
+                continue;
+            }
+            if let Some(selection) = resolve_existing_selection(&work, selected.as_ref()) {
+                let _ = work.reply.send(Ok(selection));
+                continue;
+            }
+            if let Some(prompt) = pending.as_mut() {
+                if prompt.profiles == work.profiles {
+                    prompt.waiters.push(waiter_from(work));
+                } else {
+                    let _ = work.reply.send(Err(SelectionFailure::Unavailable));
+                }
+                continue;
+            }
+            match start_prompt(&mut connection, &mut repositories, work, &generations) {
+                Ok(prompt) => pending = Some(prompt),
+                Err(work) => {
+                    let _ = work.reply.send(Err(SelectionFailure::Unavailable));
+                    break;
+                }
             }
         }
-        if let Some(prompt) = pending.as_ref() {
+        if let Some(prompt) = pending.as_mut() {
+            prune_waiters(&mut prompt.waiters, Instant::now());
+            if prompt.waiters.is_empty() {
+                let _ = connection.abandon_prompt(prompt.request_id);
+                pending = None;
+                continue;
+            }
             let expired = connection
                 .expire_prompts(Instant::now())
                 .is_ok_and(|expired| expired.contains(&prompt.request_id));
             if expired {
-                let prompt = pending.take().expect("pending prompt exists");
-                let _ = prompt.reply.send(Err(SelectionFailure::TimedOut));
+                let mut prompt = pending.take().expect("pending prompt exists");
+                complete_waiters(&mut prompt.waiters, &Err(SelectionFailure::TimedOut));
             }
         }
         thread::sleep(Duration::from_millis(10));
     }
-    if let Some(prompt) = pending.take() {
-        let _ = prompt.reply.send(Err(SelectionFailure::Unavailable));
+    if let Some(mut prompt) = pending.take() {
+        complete_waiters(&mut prompt.waiters, &Err(SelectionFailure::Unavailable));
     }
     let _ = connection.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+fn start_prompt(
+    connection: &mut UnixProviderConnection,
+    repositories: &mut Vec<Digest32>,
+    work: ProviderWork,
+    generations: &AtomicU64,
+) -> Result<PendingPrompt, Box<ProviderWork>> {
+    repositories.clear();
+    repositories.push(work.repository);
+    let Ok(membership_generation) = next_generation(generations) else {
+        return Err(Box::new(work));
+    };
+    if connection
+        .replace_authorized_repositories(repositories, membership_generation, Instant::now())
+        .is_err()
+    {
+        return Err(Box::new(work));
+    }
+    let Ok(prompt) = make_prompt(connection, &work, next_generation(generations).ok()) else {
+        return Err(Box::new(work));
+    };
+    let Ok(sent) = connection.send_prompt(prompt, Instant::now()) else {
+        return Err(Box::new(work));
+    };
+    let profiles = work.profiles.clone();
+    Ok(PendingPrompt {
+        request_id: sent.request_id,
+        profiles,
+        waiters: vec![waiter_from(work)],
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn waiter_from(work: ProviderWork) -> SelectionWaiter {
+    SelectionWaiter {
+        deadline: work.deadline,
+        active: work.active,
+        reply: work.reply,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prune_waiters(waiters: &mut Vec<SelectionWaiter>, now: Instant) {
+    waiters.retain(|waiter| {
+        if !waiter.active.load(Ordering::Acquire) {
+            return false;
+        }
+        if now >= waiter.deadline {
+            waiter.active.store(false, Ordering::Release);
+            let _ = waiter.reply.send(Err(SelectionFailure::TimedOut));
+            return false;
+        }
+        true
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn complete_waiters(
+    waiters: &mut Vec<SelectionWaiter>,
+    result: &Result<SelectedProfile, SelectionFailure>,
+) {
+    for waiter in waiters.drain(..) {
+        if waiter.active.swap(false, Ordering::AcqRel) {
+            let _ = waiter.reply.send(result.clone());
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -392,19 +533,26 @@ fn resolve_existing_selection(
     work: &ProviderWork,
     selected: Option<&SelectedProfile>,
 ) -> Option<SelectedProfile> {
-    let requested = work
-        .explicit_profile
-        .as_ref()
-        .or_else(|| selected.map(|value| &value.id))?;
+    if let Some(requested) = work.explicit_profile.as_ref() {
+        let profile = work
+            .profiles
+            .iter()
+            .find(|profile| &profile.id == requested)?;
+        return Some(SelectedProfile {
+            id: profile.id.clone(),
+            profile_generation: profile.generation,
+            profile_digest: Digest32::from_bytes(profile.content_digest().ok()?),
+            session_generation: selected.map_or(1, |value| value.session_generation),
+        });
+    }
+    let selected = selected?;
     let profile = work
         .profiles
         .iter()
-        .find(|profile| &profile.id == requested)?;
-    Some(SelectedProfile {
-        id: profile.id.clone(),
-        profile_generation: profile.generation,
-        session_generation: selected.map_or(1, |value| value.session_generation),
-    })
+        .find(|profile| profile.id == selected.id)?;
+    let digest = Digest32::from_bytes(profile.content_digest().ok()?);
+    (profile.generation == selected.profile_generation && digest == selected.profile_digest)
+        .then(|| selected.clone())
 }
 
 #[cfg(target_os = "linux")]
@@ -421,7 +569,8 @@ fn make_prompt(
         "VS Code window".to_owned(),
     )
     .map_err(|_| ())?;
-    let repository = RepositoryPresentation::new(work.repository, "Git repository".to_owned())
+    let repository = RepositoryPresentation::new(work.repository, work.repository_label.clone())
+        .or_else(|_| RepositoryPresentation::new(work.repository, "Git repository".to_owned()))
         .map_err(|_| ())?;
     let profiles = work
         .profiles

@@ -14,7 +14,7 @@
     },
     {
       "direction": "shim_response",
-      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"resolved","body":{"profile_id":"work","profile_generation":"18446744073709551615","session_generation":"10"}}}
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"resolved","body":{"profile_id":"work","profile_generation":"18446744073709551615","profile_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session_generation":"10"}}}
     },
     {
       "direction": "shim_response",
@@ -88,7 +88,7 @@
     },
     {
       "direction": "shim_response",
-      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"resolved","body":{"profile_id":"work","profile_generation":9007199254740992,"session_generation":"10"}}}
+      "payload": {"protocol_version":1,"message_family":"shim_response","request_id":"10000000-0000-4000-8000-000000000001","message":{"type":"resolved","body":{"profile_id":"work","profile_generation":9007199254740992,"profile_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session_generation":"10"}}}
     },
     {
       "direction": "provider_request",

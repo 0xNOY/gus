@@ -94,6 +94,15 @@ impl PendingUnixShimRequest {
         &self.request
     }
 
+    /// Rechecks that the authenticated shim process is still the same live
+    /// process rather than relying on its reusable numeric PID.
+    #[must_use]
+    pub fn peer_is_live(&self) -> bool {
+        gus_platform::NativeProcessObserver::new(self.peer.pid())
+            .observe()
+            .is_ok_and(|observed| observed == self.peer)
+    }
+
     /// Sends the single response correlated to this request.
     ///
     /// # Errors
@@ -378,6 +387,21 @@ impl UnixProviderConnection {
         self.state
             .session
             .expire_prompts(now)
+            .map_err(ProviderConnectionError::session)
+    }
+
+    /// Abandons one prompt after all broker-side waiters have disappeared.
+    ///
+    /// # Errors
+    ///
+    /// Returns a terminal session error after the connection has closed.
+    pub fn abandon_prompt(
+        &mut self,
+        request_id: RequestId,
+    ) -> Result<bool, ProviderConnectionError> {
+        self.state
+            .session
+            .abandon_prompt(request_id)
             .map_err(ProviderConnectionError::session)
     }
 
@@ -681,6 +705,7 @@ fn remaining(deadline: Instant) -> Result<Duration, TransportError> {
 fn outcome_response(outcome: &ProviderCommandOutcome) -> &ProviderResponseFrame {
     match outcome {
         ProviderCommandOutcome::Acknowledged { response }
+        | ProviderCommandOutcome::StatusSubscribed { response }
         | ProviderCommandOutcome::MembershipUpdated { response, .. }
         | ProviderCommandOutcome::SelectionDecided { response, .. }
         | ProviderCommandOutcome::Unregistered { response, .. } => response,
@@ -696,6 +721,7 @@ fn outcome_revoked_prompt_ids(outcome: &ProviderCommandOutcome) -> &[RequestId] 
             revoked_prompt_ids, ..
         } => revoked_prompt_ids,
         ProviderCommandOutcome::Acknowledged { .. }
+        | ProviderCommandOutcome::StatusSubscribed { .. }
         | ProviderCommandOutcome::SelectionDecided { .. } => &[],
     }
 }

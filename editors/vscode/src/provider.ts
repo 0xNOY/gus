@@ -41,6 +41,7 @@ export interface ProviderClientOptions {
   transport: ProviderTransport;
   picker: ProfilePicker;
   scheduler: ProviderScheduler;
+  onRegistered?(): void;
   onStatus(snapshot: ProviderStatusSnapshot): void;
   onFatal(error: Error): void;
 }
@@ -144,6 +145,7 @@ export class ProviderClient {
         if (this.#statusCapability) {
           this.#send(createProviderControlFrame({ type: "subscribe_status", body: control }));
         }
+        this.#options.onRegistered?.();
         return;
       }
       case "selection_prompt":
@@ -181,9 +183,20 @@ export class ProviderClient {
       return;
     }
     const abort = new AbortController();
+    const timeoutHeadroom = Math.min(
+      1000,
+      Math.max(50, Math.floor(prompt.body.timeout_millis / 10)),
+    );
     const timeout = this.#options.scheduler.setTimeout(() => {
-      if (this.#prompts.delete(frame.request_id)) abort.abort();
-    }, prompt.body.timeout_millis);
+      if (!this.#prompts.delete(frame.request_id)) return;
+      abort.abort();
+      if (this.#closed) return;
+      try {
+        this.#send(createProviderSelectionResponseFrame(frame, { result: "cancelled" }));
+      } catch (error) {
+        this.#fail(toError(error));
+      }
+    }, Math.max(1, prompt.body.timeout_millis - timeoutHeadroom));
     this.#prompts.set(frame.request_id, { abort, timeout });
     let decision: ProviderDecision;
     try {

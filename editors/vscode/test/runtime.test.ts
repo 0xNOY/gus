@@ -7,6 +7,7 @@ import type {
   ProviderStatusSnapshot,
 } from "../src/ipc.js";
 import type { ProviderClient } from "../src/provider.js";
+import type { ProviderScheduler } from "../src/provider.js";
 import { startProviderRuntime } from "../src/runtime.js";
 import type { StatusPresentation } from "../src/ui.js";
 
@@ -29,10 +30,32 @@ class FakeStatusBar {
   }
 }
 
-test("runtime wires status, fatal state, and disposal exactly once", () => {
+class FakeScheduler implements ProviderScheduler {
+  timeoutCallback: (() => void) | undefined;
+  timeoutCleared = false;
+
+  setInterval(): unknown {
+    return 1;
+  }
+
+  clearInterval(): void {}
+
+  setTimeout(callback: () => void): unknown {
+    this.timeoutCallback = callback;
+    return 2;
+  }
+
+  clearTimeout(): void {
+    this.timeoutCleared = true;
+    this.timeoutCallback = undefined;
+  }
+}
+
+test("runtime reconnects after a provider failure and disposes exactly once", async () => {
   const statusBar = new FakeStatusBar();
   const fatals: Error[] = [];
-  let bridgeOptions: ProviderBridgeOptions | undefined;
+  const scheduler = new FakeScheduler();
+  const bridges: ProviderBridgeOptions[] = [];
   let closes = 0;
   const runtime = startProviderRuntime({
     bridgePath: "/opt/gus/bin/gus-provider-bridge",
@@ -40,27 +63,35 @@ test("runtime wires status, fatal state, and disposal exactly once", () => {
     registration: REGISTRATION,
     quickPickWindow: { showQuickPick: async () => undefined },
     statusBar,
+    scheduler,
     onFatal: (error) => fatals.push(error),
   }, (options) => {
-    bridgeOptions = options;
+    bridges.push(options);
     return { close: () => { closes += 1; } } as ProviderClient;
   });
 
+  bridges[0]?.onReady?.();
+  await runtime.ready;
   const snapshot: ProviderStatusSnapshot = {
     registration_id: "10000000-0000-4000-8000-000000000001",
     provider_generation: "1",
     entries: [],
   };
-  bridgeOptions?.onStatus(snapshot);
+  bridges[0]?.onStatus(snapshot);
   assert.equal(statusBar.presentations.at(-1)?.text, "$(person) GUS: Select on protected operation");
 
-  bridgeOptions?.onFatal(new Error("connection failed"));
-  assert.equal(statusBar.presentations.at(-1)?.text, "$(error) GUS: Provider unavailable");
-  assert.equal(fatals.length, 1);
+  bridges[0]?.onFatal(new Error("connection failed"));
+  assert.equal(statusBar.presentations.at(-1)?.text, "$(sync~spin) GUS: Reconnecting");
+  assert.equal(fatals.length, 0);
+  scheduler.timeoutCallback?.();
+  assert.equal(bridges.length, 2);
+  bridges[1]?.onReady?.();
+  bridges[1]?.onStatus(snapshot);
+  assert.equal(statusBar.presentations.at(-1)?.text, "$(person) GUS: Select on protected operation");
 
   runtime.dispose();
   runtime.dispose();
-  assert.equal(closes, 1);
+  assert.equal(closes, 2);
   assert.equal(statusBar.disposals, 1);
 });
 

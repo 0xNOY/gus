@@ -802,6 +802,7 @@ impl Validate for BrokerShimMessage {
 pub struct ResolvedSelection {
     profile_id: ProfileId,
     profile_generation: Generation,
+    profile_digest: Digest32,
     session_generation: Generation,
 }
 
@@ -814,11 +815,13 @@ impl ResolvedSelection {
     pub fn new(
         profile_id: ProfileId,
         profile_generation: Generation,
+        profile_digest: Digest32,
         session_generation: Generation,
     ) -> Result<Self, ProtocolError> {
         let response = Self {
             profile_id,
             profile_generation,
+            profile_digest,
             session_generation,
         };
         response.validate()?;
@@ -833,6 +836,11 @@ impl ResolvedSelection {
     #[must_use]
     pub const fn profile_generation(&self) -> Generation {
         self.profile_generation
+    }
+
+    #[must_use]
+    pub const fn profile_digest(&self) -> Digest32 {
+        self.profile_digest
     }
 
     #[must_use]
@@ -853,6 +861,7 @@ impl fmt::Debug for ResolvedSelection {
             .debug_struct("ResolvedSelection")
             .field("profile_id", &"<redacted>")
             .field("profile_generation", &self.profile_generation)
+            .field("profile_digest", &self.profile_digest)
             .field("session_generation", &self.session_generation)
             .finish()
     }

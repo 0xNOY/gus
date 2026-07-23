@@ -102,6 +102,7 @@ export type ProviderControlMessage = Exclude<
 export interface ResolvedSelection {
   profile_id: ProfileId;
   profile_generation: Generation;
+  profile_digest: Digest32;
   session_generation: Generation;
 }
 
@@ -864,9 +865,15 @@ function isShimResponse(value: unknown): value is BrokerShimMessage {
   switch (value.type) {
     case "resolved":
       return (
-        hasExactKeys(value.body, ["profile_id", "profile_generation", "session_generation"]) &&
+        hasExactKeys(value.body, [
+          "profile_id",
+          "profile_generation",
+          "profile_digest",
+          "session_generation",
+        ]) &&
         isProfileId(value.body.profile_id) &&
         isGeneration(value.body.profile_generation) &&
+        isDigest(value.body.profile_digest) &&
         isGeneration(value.body.session_generation)
       );
     case "cleared":

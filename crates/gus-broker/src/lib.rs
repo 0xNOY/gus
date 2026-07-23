@@ -5,6 +5,8 @@
 //! process handles. The state machines then prevent adapters from accidentally
 //! treating a multi-process HTTP credential flow as a single-use capability.
 
+#[cfg(target_os = "linux")]
+mod linux_evidence;
 mod provider;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 mod provider_connection;
@@ -13,6 +15,11 @@ mod unix_endpoint;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 mod unix_runtime;
 
+#[cfg(target_os = "linux")]
+pub use linux_evidence::{
+    LinuxRepositoryEvidence, LinuxShimEvidence, RepositoryEvidenceError, digest_unix_arguments,
+    observe_linux_repository, observe_linux_shim,
+};
 pub use provider::{
     IssuedProviderPrompt, ProviderAdmission, ProviderAdmissionError, ProviderCommandFailure,
     ProviderCommandOutcome, ProviderMembershipAdmission, ProviderSession, ProviderSessionError,

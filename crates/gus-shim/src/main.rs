@@ -12,13 +12,13 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use gus_broker::connect_published_provider;
+use gus_broker::{connect_published_provider, digest_unix_arguments, observe_linux_repository};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_core::{NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME, ProfileRequirement, RequirementReason};
 #[cfg(target_os = "linux")]
 use gus_ipc::{
-    BrokerShimMessage, Digest32, ResolveSelectionRequest, ShimRequest, ShimRequestFrame,
-    read_shim_response, write_shim_request,
+    BrokerShimMessage, ResolveSelectionRequest, ShimRequest, ShimRequestFrame, read_shim_response,
+    write_shim_request,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_platform::{CurrentSessionObserver, ExecutableExclusionSet, VerifiedRealGit};
@@ -29,8 +29,6 @@ use gus_shim::{
     ExplicitProfileAdmission, InitialRoute, LocalPolicyAdmission, OperationPresentation,
     ShimInvocation,
 };
-#[cfg(target_os = "linux")]
-use sha2::{Digest as _, Sha256};
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const MAX_PROFILE_STORE_BYTES: u64 = 1024 * 1024;
@@ -175,9 +173,13 @@ fn broker_selected_profile(
     else {
         return Ok(None);
     };
-    let repository_identity = repository_identity()?;
+    let pid = std::num::NonZeroU32::new(std::process::id())
+        .ok_or_else(|| "the shim process ID is invalid".to_owned())?;
+    let repository_identity = observe_linux_repository(pid)
+        .map_err(|error| format!("cannot establish repository identity: {error}"))?
+        .identity();
     let request = ResolveSelectionRequest::new(
-        invocation_digest(arguments),
+        digest_unix_arguments(arguments),
         repository_identity,
         operation,
         None,
@@ -197,6 +199,15 @@ fn broker_selected_profile(
             if profile.generation != resolved.profile_generation().get() {
                 return Err(
                     "the selected profile changed while the broker was prompting".to_owned(),
+                );
+            }
+            let digest = profile
+                .content_digest()
+                .map_err(|error| format!("cannot bind the selected profile: {error}"))?;
+            if digest != *resolved.profile_digest().as_bytes() {
+                return Err(
+                    "the selected profile content changed while the broker was prompting"
+                        .to_owned(),
                 );
             }
             Ok(Some(profile))
@@ -223,45 +234,6 @@ fn broker_runtime_directory() -> Result<PathBuf, String> {
     Ok(PathBuf::from(format!("/tmp/gus-{}", unsafe {
         libc::geteuid()
     })))
-}
-
-#[cfg(target_os = "linux")]
-fn invocation_digest(arguments: &[OsString]) -> Digest32 {
-    let mut digest = Sha256::new();
-    digest.update(b"gus.shim-plan.v1\0");
-    for argument in arguments {
-        use std::os::unix::ffi::OsStrExt as _;
-        let bytes = argument.as_os_str().as_bytes();
-        digest.update((bytes.len() as u64).to_le_bytes());
-        digest.update(bytes);
-    }
-    Digest32::from_bytes(digest.finalize().into())
-}
-
-#[cfg(target_os = "linux")]
-fn repository_identity() -> Result<Digest32, String> {
-    let mut directory = std::env::current_dir()
-        .map_err(|error| format!("cannot inspect the working tree: {error}"))?;
-    loop {
-        let git = directory.join(".git");
-        match fs::symlink_metadata(&git) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!("{} must not be a symbolic link", git.display()));
-            }
-            Ok(metadata) => {
-                let mut digest = Sha256::new();
-                digest.update(b"gus.repository-file.v1\0");
-                digest.update(metadata.dev().to_le_bytes());
-                digest.update(metadata.ino().to_le_bytes());
-                return Ok(Digest32::from_bytes(digest.finalize().into()));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("cannot inspect {}: {error}", git.display())),
-        }
-        if !directory.pop() {
-            return Err("the working directory is not inside a Git repository".to_owned());
-        }
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]

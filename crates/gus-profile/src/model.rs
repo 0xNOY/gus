@@ -787,6 +787,25 @@ impl Profile {
         Ok(())
     }
 
+    /// Computes a versioned digest of the complete serialized profile.
+    ///
+    /// The digest binds a broker prompt to the exact profile snapshot later
+    /// consumed by the shim, including identity, signing, and transport
+    /// configuration. It is correlation evidence, not a secret or signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error if the in-memory profile cannot be
+    /// represented by the canonical JSON serializer.
+    pub fn content_digest(&self) -> Result<[u8; 32], serde_json::Error> {
+        let encoded = serde_json::to_vec(self)?;
+        let mut digest = Sha256::new();
+        digest.update(b"gus.profile-content.v1\0");
+        digest.update((encoded.len() as u64).to_le_bytes());
+        digest.update(encoded);
+        Ok(digest.finalize().into())
+    }
+
     /// Selects and seals the exact profile/backend binding for one endpoint.
     ///
     /// # Errors
@@ -1330,5 +1349,19 @@ email = "committer@example.test"
             .expect("matching binding")
             .digest();
         assert_ne!(selected.digest(), backend_digest);
+    }
+
+    #[test]
+    fn profile_content_digest_changes_without_a_generation_change() {
+        let original = profile(id("digest"));
+        let mut replacement = original.clone();
+        replacement.author =
+            PersonIdentity::new("Replacement".into(), "replacement@example.test".into())
+                .expect("replacement identity");
+        assert_eq!(original.generation, replacement.generation);
+        assert_ne!(
+            original.content_digest().expect("original digest"),
+            replacement.content_digest().expect("replacement digest")
+        );
     }
 }
