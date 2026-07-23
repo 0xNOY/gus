@@ -1,5 +1,7 @@
 use std::process::ExitCode;
 
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::{
     ffi::OsString,
@@ -7,7 +9,6 @@ use std::{
     io::{Read as _, Write as _},
     os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 #[cfg(target_os = "linux")]
@@ -147,6 +148,8 @@ fn selected_profile(
         if let Some(profile) = broker_selected_profile(arguments, operation)? {
             return Ok(Some(profile));
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (arguments, operation);
         return Ok(None);
     };
     let profiles = load_profile_set()?;
