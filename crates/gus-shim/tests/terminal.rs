@@ -10,6 +10,7 @@ use std::{
     },
     path::Path,
     process::{Command, Stdio},
+    thread,
 };
 
 fn shim() -> Command {
@@ -158,17 +159,21 @@ fn run_commit_in_new_terminal(
         .expect("spawn PTY child");
     drop(slave);
     writeln!(master, "{selection}").expect("send profile selection");
-    let status = child.wait().expect("wait for PTY child");
-    let mut transcript = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    loop {
-        match master.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => transcript.extend_from_slice(&chunk[..read]),
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-            Err(error) => panic!("read PTY transcript: {error}"),
+    let reader = thread::spawn(move || {
+        let mut transcript = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match master.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => transcript.extend_from_slice(&chunk[..read]),
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("read PTY transcript: {error}"),
+            }
         }
-    }
+        transcript
+    });
+    let status = child.wait().expect("wait for PTY child");
+    let transcript = reader.join().expect("PTY transcript reader");
     assert!(
         status.success(),
         "PTY commit failed with {status}: {}",
