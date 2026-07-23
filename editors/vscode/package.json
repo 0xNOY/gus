@@ -1,14 +1,41 @@
 {
-  "name": "gus-vscode",
+  "name": "gus",
+  "displayName": "GUS - Git User Switcher",
+  "description": "Selects the correct Git identity for each protected IDE session.",
+  "publisher": "0xnoy",
   "version": "0.2.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/0xNOY/gus.git"
+  },
   "private": true,
   "type": "module",
+  "main": "./dist/src/extension.js",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "categories": [
+    "SCM Providers"
+  ],
+  "files": [
+    "dist/src/**",
+    "bin/**",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/vscode": "^1.100.0",
     "typescript": "^5.9.0"
   }
 }
