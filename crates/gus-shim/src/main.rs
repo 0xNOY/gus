@@ -7,21 +7,36 @@ use std::{
     io::{Read as _, Write as _},
     os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use gus_broker::connect_published_provider;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_core::{NEUTRAL_REFLOG_EMAIL, NEUTRAL_REFLOG_NAME, ProfileRequirement, RequirementReason};
+#[cfg(target_os = "linux")]
+use gus_ipc::{
+    BrokerShimMessage, Digest32, ResolveSelectionRequest, ShimRequest, ShimRequestFrame,
+    read_shim_response, write_shim_request,
+};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_platform::{CurrentSessionObserver, ExecutableExclusionSet, VerifiedRealGit};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use gus_profile::{Profile, ProfileId, ProfileSet};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-use gus_shim::{ExplicitProfileAdmission, InitialRoute, LocalPolicyAdmission, ShimInvocation};
+use gus_shim::{
+    ExplicitProfileAdmission, InitialRoute, LocalPolicyAdmission, OperationPresentation,
+    ShimInvocation,
+};
+#[cfg(target_os = "linux")]
+use sha2::{Digest as _, Sha256};
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const MAX_PROFILE_STORE_BYTES: u64 = 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const MAX_SELECTION_BYTES: usize = 128;
+#[cfg(target_os = "linux")]
+const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(65);
 
 fn main() -> ExitCode {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
@@ -44,20 +59,22 @@ fn run_unix() -> ExitCode {
     }
     match ShimInvocation::parse(&arguments).route() {
         InitialRoute::Forward(admission) => execute_git(admission),
-        InitialRoute::Resolve(required) => match selected_profile() {
-            Ok(Some(profile)) => match required.select_explicit_profile(&profile) {
-                Ok(admission) => execute_profiled_git(admission),
-                Err(error) => explicit_admission_error(&error),
-            },
-            Ok(None) => selection_required(
-                requirement_message(required.invocation().profile_requirement()),
-                "no explicit profile was selected",
-            ),
-            Err(error) => {
-                eprintln!("GUS_E_SELECTION_FAILED: {error}; Git was not started");
-                ExitCode::from(125)
+        InitialRoute::Resolve(required) => {
+            match selected_profile(&arguments, required.presentation()) {
+                Ok(Some(profile)) => match required.select_explicit_profile(&profile) {
+                    Ok(admission) => execute_profiled_git(admission),
+                    Err(error) => explicit_admission_error(&error),
+                },
+                Ok(None) => selection_required(
+                    requirement_message(required.invocation().profile_requirement()),
+                    "no explicit profile was selected",
+                ),
+                Err(error) => {
+                    eprintln!("GUS_E_SELECTION_FAILED: {error}; Git was not started");
+                    ExitCode::from(125)
+                }
             }
-        },
+        }
         InitialRoute::Reject(rejection) => {
             eprintln!(
                 "GUS_E_POLICY_REJECTED: {}; Git was not started",
@@ -110,7 +127,10 @@ fn execute_git_arguments(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-fn selected_profile() -> Result<Option<Profile>, String> {
+fn selected_profile(
+    arguments: &[OsString],
+    operation: OperationPresentation,
+) -> Result<Option<Profile>, String> {
     if let Some(raw_id) = std::env::var_os("GUS_PROFILE_ID") {
         let id = raw_id
             .into_string()
@@ -123,6 +143,10 @@ fn selected_profile() -> Result<Option<Profile>, String> {
         .observe()
         .map_err(|error| format!("cannot establish the terminal session: {error}"))?;
     let Some(terminal) = observation.terminal_session() else {
+        #[cfg(target_os = "linux")]
+        if let Some(profile) = broker_selected_profile(arguments, operation)? {
+            return Ok(Some(profile));
+        }
         return Ok(None);
     };
     let profiles = load_profile_set()?;
@@ -136,6 +160,105 @@ fn selected_profile() -> Result<Option<Profile>, String> {
     let profile = profile_by_id(&profiles, &id)?;
     write_session_selection(&selection_path, &id)?;
     Ok(Some(profile))
+}
+
+#[cfg(target_os = "linux")]
+fn broker_selected_profile(
+    arguments: &[OsString],
+    operation: OperationPresentation,
+) -> Result<Option<Profile>, String> {
+    let runtime = broker_runtime_directory()?;
+    let Ok(mut broker) = connect_published_provider(&runtime, BROKER_IO_TIMEOUT, BROKER_IO_TIMEOUT)
+    else {
+        return Ok(None);
+    };
+    let repository_identity = repository_identity()?;
+    let request = ResolveSelectionRequest::new(
+        invocation_digest(arguments),
+        repository_identity,
+        operation,
+        None,
+    );
+    let frame = ShimRequestFrame::request(ShimRequest::ResolveSelection(request))
+        .map_err(|error| format!("cannot build the broker request: {error}"))?;
+    write_shim_request(&mut broker, &frame)
+        .map_err(|error| format!("cannot send the broker request: {error}"))?;
+    let response = read_shim_response(&mut broker)
+        .map_err(|error| format!("cannot receive the broker response: {error}"))?;
+    if response.request_id() != frame.request_id() {
+        return Err("the broker returned an uncorrelated response".to_owned());
+    }
+    match response.into_message() {
+        BrokerShimMessage::Resolved(resolved) => {
+            let profile = profile_by_id(&load_profile_set()?, resolved.profile_id())?;
+            if profile.generation != resolved.profile_generation().get() {
+                return Err(
+                    "the selected profile changed while the broker was prompting".to_owned(),
+                );
+            }
+            Ok(Some(profile))
+        }
+        BrokerShimMessage::Error(error) => Err(format!(
+            "the broker rejected selection with {:?}",
+            error.code()
+        )),
+        BrokerShimMessage::Cleared { .. } | BrokerShimMessage::Status(_) => {
+            Err("the broker returned the wrong response role".to_owned())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn broker_runtime_directory() -> Result<PathBuf, String> {
+    if let Some(root) = std::env::var_os("GUS_RUNTIME_DIR") {
+        return absolute_path("GUS_RUNTIME_DIR", root);
+    }
+    if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return absolute_path("XDG_RUNTIME_DIR", root).map(|root| root.join("gus"));
+    }
+    // SAFETY: `geteuid` has no preconditions.
+    Ok(PathBuf::from(format!("/tmp/gus-{}", unsafe {
+        libc::geteuid()
+    })))
+}
+
+#[cfg(target_os = "linux")]
+fn invocation_digest(arguments: &[OsString]) -> Digest32 {
+    let mut digest = Sha256::new();
+    digest.update(b"gus.shim-plan.v1\0");
+    for argument in arguments {
+        use std::os::unix::ffi::OsStrExt as _;
+        let bytes = argument.as_os_str().as_bytes();
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Digest32::from_bytes(digest.finalize().into())
+}
+
+#[cfg(target_os = "linux")]
+fn repository_identity() -> Result<Digest32, String> {
+    let mut directory = std::env::current_dir()
+        .map_err(|error| format!("cannot inspect the working tree: {error}"))?;
+    loop {
+        let git = directory.join(".git");
+        match fs::symlink_metadata(&git) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("{} must not be a symbolic link", git.display()));
+            }
+            Ok(metadata) => {
+                let mut digest = Sha256::new();
+                digest.update(b"gus.repository-file.v1\0");
+                digest.update(metadata.dev().to_le_bytes());
+                digest.update(metadata.ino().to_le_bytes());
+                return Ok(Digest32::from_bytes(digest.finalize().into()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {}: {error}", git.display())),
+        }
+        if !directory.pop() {
+            return Err("the working directory is not inside a Git repository".to_owned());
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]

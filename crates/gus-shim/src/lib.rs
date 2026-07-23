@@ -114,6 +114,12 @@ impl ResolutionRequired {
         &self.invocation
     }
 
+    /// Returns the display-only operation category.
+    #[must_use]
+    pub fn presentation(&self) -> OperationPresentation {
+        operation_presentation(self.invocation.operation())
+    }
+
     /// Starts one snapshot capture and consumes this request instance.
     ///
     /// # Errors

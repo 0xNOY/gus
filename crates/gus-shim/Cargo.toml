@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+gus-broker = { path = "../gus-broker" }
 gus-core = { path = "../gus-core" }
 gus-ipc = { path = "../gus-ipc" }
 gus-platform = { path = "../gus-platform" }
