@@ -68,6 +68,50 @@ jobs:
       - name: Test VS Code extension
         run: npm --prefix editors/vscode test
 
+  vscode-vsix:
+    name: VS Code VSIX (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: macos-15
+            target: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Build native provider bridge
+        run: cargo build --release -p gus-broker --bin gus-provider-bridge
+
+      - name: Install extension dependencies
+        run: npm --prefix editors/vscode ci
+
+      - name: Stage native provider bridge
+        run: |
+          mkdir -p editors/vscode/bin
+          cp target/release/gus-provider-bridge editors/vscode/bin/gus-provider-bridge
+
+      - name: Build target-specific VSIX
+        run: npm --prefix editors/vscode run package:vsix -- --target ${{ matrix.target }} --out "${{ runner.temp }}/gus-${{ matrix.target }}.vsix"
+
   native-platform:
     name: Native platform (${{ matrix.os }})
     strategy:
