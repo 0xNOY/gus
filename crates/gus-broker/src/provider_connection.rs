@@ -6,8 +6,8 @@ use std::{
 use gus_ipc::{
     Digest32, FRAME_HEADER_BYTES, Generation, MAX_FRAME_BYTES, ProviderRequest,
     ProviderRequestFrame, ProviderResponseFrame, ProviderStatusSnapshot, RequestId,
-    SelectionPrompt, TransportError, decode_frame_length, decode_provider_request,
-    encode_provider_response,
+    SelectionPrompt, ShimRequestFrame, ShimResponseFrame, TransportError, decode_frame_length,
+    decode_provider_request, decode_shim_request, encode_provider_response, encode_shim_response,
 };
 use gus_platform::{AuthenticatedUnixStream, ProcessIdentity};
 use thiserror::Error;
@@ -28,6 +28,86 @@ pub struct PendingUnixProvider {
     registration: ProviderRequestFrame,
     frame_read_timeout: Duration,
     frame_write_timeout: Duration,
+}
+
+/// The first authenticated application request accepted by the broker.
+pub enum PendingUnixClient {
+    Provider(PendingUnixProvider),
+    Shim(PendingUnixShimRequest),
+}
+
+/// One authenticated shim request awaiting its correlated broker response.
+pub struct PendingUnixShimRequest {
+    stream: AuthenticatedUnixStream,
+    peer: ProcessIdentity,
+    request: ShimRequestFrame,
+    frame_write_timeout: Duration,
+}
+
+impl PendingUnixClient {
+    /// Reads and classifies the first bounded frame after peer authentication.
+    ///
+    /// # Errors
+    ///
+    /// Rejects slow, malformed, unsupported, or unexpected first frames.
+    pub(crate) fn read(
+        mut stream: AuthenticatedUnixStream,
+        frame_read_timeout: Duration,
+        frame_write_timeout: Duration,
+    ) -> Result<Self, ProviderConnectionError> {
+        let peer = stream.peer_identity();
+        let record = read_record_absolute(&mut stream, frame_read_timeout)
+            .map_err(ProviderConnectionError::transport)?;
+        if let Ok(registration) = decode_provider_request(&record) {
+            if !matches!(registration.message(), ProviderRequest::Register(_)) {
+                return Err(ProviderConnectionError::transport(
+                    gus_ipc::ProtocolError::InvalidMessageRole.into(),
+                ));
+            }
+            return Ok(Self::Provider(PendingUnixProvider {
+                stream,
+                peer,
+                registration,
+                frame_read_timeout,
+                frame_write_timeout,
+            }));
+        }
+        let request = decode_shim_request(&record)
+            .map_err(|source| ProviderConnectionError::transport(source.into()))?;
+        Ok(Self::Shim(PendingUnixShimRequest {
+            stream,
+            peer,
+            request,
+            frame_write_timeout,
+        }))
+    }
+}
+
+impl PendingUnixShimRequest {
+    #[must_use]
+    pub const fn peer_identity(&self) -> ProcessIdentity {
+        self.peer
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &ShimRequestFrame {
+        &self.request
+    }
+
+    /// Sends the single response correlated to this request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mismatched request ID, invalid response, or failed write.
+    pub fn respond(mut self, response: &ShimResponseFrame) -> Result<(), ProviderConnectionError> {
+        if response.request_id() != self.request.request_id() {
+            return Err(ProviderConnectionError::transport(
+                gus_ipc::ProtocolError::InvalidMessageRole.into(),
+            ));
+        }
+        write_shim_response_absolute(&mut self.stream, response, self.frame_write_timeout)
+            .map_err(ProviderConnectionError::transport)
+    }
 }
 
 impl std::fmt::Debug for PendingUnixProvider {
@@ -495,6 +575,35 @@ fn write_response_absolute(
     timeout: Duration,
 ) -> Result<(), TransportError> {
     let record = encode_provider_response(frame)?;
+    let deadline = deadline_after(Instant::now(), timeout)?;
+    let mut remaining_record = record.as_slice();
+    while !remaining_record.is_empty() {
+        let timeout = remaining(deadline)?;
+        stream.set_deadline_write_timeout(Some(timeout))?;
+        match stream.write(remaining_record) {
+            Ok(0) => return Err(TransportError::Io(io::ErrorKind::WriteZero)),
+            Ok(written) => remaining_record = &remaining_record[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(TransportError::Io(io::ErrorKind::TimedOut));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        remaining(deadline)?;
+    }
+    Ok(())
+}
+
+fn write_shim_response_absolute(
+    stream: &mut impl DeadlineWriter,
+    frame: &ShimResponseFrame,
+    timeout: Duration,
+) -> Result<(), TransportError> {
+    let record = encode_shim_response(frame)?;
     let deadline = deadline_after(Instant::now(), timeout)?;
     let mut remaining_record = record.as_slice();
     while !remaining_record.is_empty() {

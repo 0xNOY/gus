@@ -14,8 +14,8 @@ use gus_platform::{AuthenticatedUnixStream, PeerAuthenticationError};
 use thiserror::Error;
 
 use crate::{
-    PendingUnixProvider, UnixEndpointError, UnixProviderAcceptError, UnixProviderListener,
-    unix_endpoint::validated_private_directory,
+    PendingUnixClient, PendingUnixProvider, UnixEndpointError, UnixProviderAcceptError,
+    UnixProviderListener, unix_endpoint::validated_private_directory,
 };
 
 const LOCK_FILE: &str = "provider.lock";
@@ -92,6 +92,15 @@ impl PublishedUnixProviderEndpoint {
     /// See [`UnixProviderListener::accept_registration`].
     pub fn accept_registration(&self) -> Result<PendingUnixProvider, UnixProviderAcceptError> {
         self.listener.accept_registration()
+    }
+
+    /// Accepts one authenticated shim or provider connection.
+    ///
+    /// # Errors
+    ///
+    /// See [`UnixProviderListener::accept_client`].
+    pub fn accept_client(&self) -> Result<PendingUnixClient, UnixProviderAcceptError> {
+        self.listener.accept_client()
     }
 }
 

@@ -19,7 +19,8 @@ pub use provider::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub use provider_connection::{
-    PendingUnixProvider, ProviderConnectionError, SentProviderPrompt, UnixProviderConnection,
+    PendingUnixClient, PendingUnixProvider, PendingUnixShimRequest, ProviderConnectionError,
+    SentProviderPrompt, UnixProviderConnection,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub use unix_endpoint::{UnixEndpointError, UnixProviderAcceptError, UnixProviderListener};

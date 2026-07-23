@@ -14,7 +14,7 @@ use std::{
 use gus_platform::{AuthenticatedUnixStream, PeerAuthenticationError};
 use thiserror::Error;
 
-use crate::{PendingUnixProvider, ProviderConnectionError};
+use crate::{PendingUnixClient, PendingUnixProvider, ProviderConnectionError};
 
 /// Owner-private provider endpoint on Linux, macOS, or FreeBSD.
 ///
@@ -100,6 +100,18 @@ impl UnixProviderListener {
             .set_write_timeout(Some(self.write_timeout))
             .map_err(|error| UnixEndpointError::Io(error.kind()))?;
         Ok(authenticated)
+    }
+
+    /// Accepts, authenticates, and classifies one shim or provider connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns endpoint/authentication failures before framing, or a
+    /// connection error for a slow, malformed, or unexpected first frame.
+    pub fn accept_client(&self) -> Result<PendingUnixClient, UnixProviderAcceptError> {
+        let stream = self.accept()?;
+        PendingUnixClient::read(stream, self.read_timeout, self.write_timeout)
+            .map_err(UnixProviderAcceptError::Connection)
     }
 
     /// Accepts, authenticates, and reads one untrusted provider registration.

@@ -490,6 +490,23 @@ impl NativeProcessObserver {
     }
 }
 
+/// Observes a live Linux process and its immediate parent as stable identities.
+///
+/// The child is sampled before and after the parent observation so callers can
+/// bind the result back to an authenticated IPC peer without trusting a
+/// numeric PID or a caller-supplied session identifier.
+///
+/// # Errors
+///
+/// Fails closed when either process cannot be observed or the parent relation
+/// changes during observation.
+#[cfg(target_os = "linux")]
+pub fn observe_process_parent(
+    pid: NonZeroU32,
+) -> Result<(ProcessIdentity, ProcessIdentity), ObservationError> {
+    linux::observe_process_parent(pid)
+}
+
 /// Bounded native resource consulted during observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

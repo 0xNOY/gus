@@ -125,6 +125,30 @@ pub(super) fn observe_process(pid: NonZeroU32) -> Result<ProcessIdentity, Observ
     ))
 }
 
+pub(super) fn observe_process_parent(
+    pid: NonZeroU32,
+) -> Result<(ProcessIdentity, ProcessIdentity), ObservationError> {
+    let child_first = observe_process(pid)?;
+    let stat_path = format!("/proc/{pid}/stat");
+    let first = normalize_process_recheck(read_proc_stat(
+        Path::new(&stat_path),
+        ObservationResource::ProcessAncestry,
+    ))?;
+    let parent_pid = first.parent_pid.ok_or(ObservationError::Malformed {
+        resource: ObservationResource::ProcessAncestry,
+    })?;
+    let parent = observe_process(parent_pid)?;
+    let second = normalize_process_recheck(read_proc_stat(
+        Path::new(&stat_path),
+        ObservationResource::ProcessAncestry,
+    ))?;
+    let child_second = observe_process(pid)?;
+    if first != second || child_first != child_second || second.parent_pid != Some(parent.pid()) {
+        return Err(ObservationError::ProcessChanged);
+    }
+    Ok((child_first, parent))
+}
+
 struct ProcessLivenessHandle(OwnedFd);
 
 impl ProcessLivenessHandle {
