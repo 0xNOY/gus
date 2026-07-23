@@ -6,10 +6,16 @@
 //! treating a multi-process HTTP credential flow as a single-use capability.
 
 mod provider;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+mod provider_connection;
 
 pub use provider::{
     IssuedProviderPrompt, ProviderAdmission, ProviderAdmissionError, ProviderCommandFailure,
     ProviderCommandOutcome, ProviderMembershipAdmission, ProviderSession, ProviderSessionError,
+};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+pub use provider_connection::{
+    ProviderConnectionError, SentProviderPrompt, UnixProviderConnection,
 };
 
 use std::{
