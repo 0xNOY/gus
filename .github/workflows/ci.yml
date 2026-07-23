@@ -68,6 +68,12 @@ jobs:
       - name: Test VS Code extension
         run: npm --prefix editors/vscode test
 
+      - name: Test native VS Code selection end to end
+        run: |
+          cargo +stable build -p gus-broker --bin gus-broker --bin gus-provider-bridge
+          cargo +stable build -p gus-shim --bin gus-git-shim
+          npm --prefix editors/vscode run test:native-e2e
+
   vscode-vsix:
     name: VS Code VSIX (${{ matrix.target }})
     strategy:
